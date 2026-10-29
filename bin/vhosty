@@ -1,0 +1,1090 @@
+#!/usr/bin/env bash
+#
+# vhosty: Herd for your tailnet.
+# Every folder becomes a private HTTPS site on your own domain,
+# reachable from any device on your Tailscale network.
+#
+#   vhosty setup      first-time setup (domain, DNS, Caddy, PHP-FPM, services)
+#   vhosty help       everything else
+#
+# https://github.com/zacksmash/vhosty
+#
+# Written for the bash that ships with macOS (3.2), so no bash 4+ features.
+
+set -euo pipefail
+
+VHOSTY_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Locations
+# ---------------------------------------------------------------------------
+VHOSTY_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+if [ -n "${SUDO_USER:-}" ]; then
+  VHOSTY_HOME_DIR="$(eval echo "~$SUDO_USER")"
+else
+  VHOSTY_HOME_DIR="${HOME:-$(eval echo "~$VHOSTY_USER")}"
+fi
+VHOSTY_DIR="${VHOSTY_DIR:-$VHOSTY_HOME_DIR/.vhosty}"
+
+CONFIG_FILE="$VHOSTY_DIR/config"
+SECRETS_FILE="$VHOSTY_DIR/.env"
+BIN_DIR="$VHOSTY_DIR/bin"
+CADDY_BIN="$BIN_DIR/caddy"
+FPM_BIN="$BIN_DIR/php-fpm"
+CADDYFILE="$VHOSTY_DIR/Caddyfile"
+FPM_CONF="$VHOSTY_DIR/php-fpm.conf"
+LOG_DIR="$VHOSTY_DIR/logs"
+RUN_DIR="$VHOSTY_DIR/run"
+CADDY_LOG="$LOG_DIR/caddy.log"
+FPM_LOG="$LOG_DIR/php-fpm.log"
+
+DAEMON_DIR="${VHOSTY_DAEMON_DIR:-/Library/LaunchDaemons}"
+LABEL_CADDY="link.vhosty.caddy"
+LABEL_FPM="link.vhosty.php-fpm"
+
+CADDY_CERTS="$VHOSTY_HOME_DIR/Library/Application Support/Caddy/certificates"
+CF_API="https://api.cloudflare.com/client/v4"
+PHP_DOWNLOADS="https://dl.static-php.dev/static-php-cli/bulk"
+
+# Defaults; ~/.vhosty/config overrides them
+VHOSTY_DOMAIN=""
+VHOSTY_PARKED=""          # colon-separated folders
+VHOSTY_PHP="on"           # on | off
+VHOSTY_FPM_PORT="9000"
+
+FAILED=0
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+if [ -t 1 ]; then
+  B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  B=""; G=""; R=""; Y=""; D=""; N=""
+fi
+
+ok()    { printf "  %s✓%s %s\n" "$G" "$N" "$*"; }
+bad()   { printf "  %s✗%s %s\n" "$R" "$N" "$*"; FAILED=1; }
+warn()  { printf "  %s!%s %s\n" "$Y" "$N" "$*"; }
+info()  { printf "  %s%s%s\n" "$D" "$*" "$N"; }
+step()  { printf "\n%s→ %s%s\n" "$B" "$*" "$N"; }
+head_() { printf "\n%s%s%s\n" "$B" "$*" "$N"; }
+die()   { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
+
+# Prompts read from the terminal, so they work even when stdin is a pipe.
+# With no terminal at all (scripts, CI), they fall back to the default.
+has_tty() { { : </dev/tty; } 2>/dev/null; }
+
+ask() { # ask "Question" default -> echoes answer
+  local q="$1" def="${2:-}" a=""
+  if ! has_tty; then printf '%s' "$def"; return 0; fi
+  if [ -n "$def" ]; then
+    printf "%s [%s]: " "$q" "$def" >/dev/tty
+  else
+    printf "%s: " "$q" >/dev/tty
+  fi
+  IFS= read -r a </dev/tty || true
+  [ -n "$a" ] || a="$def"
+  printf '%s' "$a"
+}
+
+ask_secret() {
+  local a=""
+  has_tty || return 0
+  printf "%s: " "$1" >/dev/tty
+  IFS= read -rs a </dev/tty || true
+  printf "\n" >/dev/tty
+  printf '%s' "$a"
+}
+
+confirm() { # confirm "Question" [Y|N default]
+  local def="${2:-Y}" a="" hint="[Y/n]"
+  [ "$def" = "N" ] && hint="[y/N]"
+  [ "${VHOSTY_YES:-}" = "1" ] && return 0
+  if ! has_tty; then [ "$def" = "Y" ]; return; fi
+  printf "%s %s " "$1" "$hint" >/dev/tty
+  IFS= read -r a </dev/tty || true
+  [ -n "$a" ] || a="$def"
+  case "$a" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+}
+
+need_config() {
+  [ -f "$CONFIG_FILE" ] && [ -n "$VHOSTY_DOMAIN" ] || die "vhosty isn't set up yet. Run: vhosty setup"
+}
+
+save_config() {
+  mkdir -p "$VHOSTY_DIR"
+  cat >"$CONFIG_FILE" <<EOF
+# vhosty config. After editing, run: vhosty rebuild
+VHOSTY_DOMAIN="$VHOSTY_DOMAIN"
+VHOSTY_PARKED="$VHOSTY_PARKED"
+VHOSTY_PHP="$VHOSTY_PHP"
+VHOSTY_FPM_PORT="$VHOSTY_FPM_PORT"
+EOF
+}
+
+load_token() {
+  CF_API_TOKEN="${CF_API_TOKEN:-}"
+  local f
+  # Second path: the hand-built layout (~/.vhosty/caddy/.env) from before `vhosty setup`
+  for f in "$SECRETS_FILE" "$VHOSTY_DIR/caddy/.env"; do
+    if [ -z "$CF_API_TOKEN" ] && [ -f "$f" ]; then
+      CF_API_TOKEN="$(sed -n 's/^CF_API_TOKEN=//p' "$f" | head -1)"
+    fi
+  done
+}
+
+save_token() {
+  mkdir -p "$VHOSTY_DIR"
+  ( umask 077; printf 'CF_API_TOKEN=%s\n' "$1" >"$SECRETS_FILE" )
+  chmod 600 "$SECRETS_FILE"
+}
+
+php_enabled() { [ "$VHOSTY_PHP" = "on" ]; }
+
+# Number of labels in the domain = which {labels.N} holds the site name.
+# vhosty.link → 2, box.example.com → 3
+domain_depth() { printf '%s' "$VHOSTY_DOMAIN" | awk -F. '{print NF}'; }
+
+parked_list() { printf '%s\n' "$VHOSTY_PARKED" | tr ':' '\n' | sed '/^$/d'; }
+
+# ---------------------------------------------------------------------------
+# System helpers
+# ---------------------------------------------------------------------------
+is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+
+arch_name() { # caddy-style arch name
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    arm64|aarch64) echo arm64 ;;
+    *) die "Unsupported CPU: $(uname -m)" ;;
+  esac
+}
+
+tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then
+    echo tailscale
+  elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    echo /Applications/Tailscale.app/Contents/MacOS/Tailscale
+  fi
+}
+
+ts_ip() {
+  local t
+  t="$(tailscale_bin)"
+  if [ -n "$t" ]; then "$t" ip -4 2>/dev/null | head -1 || true; fi
+}
+
+is_tailscale_ip() { # 100.64.0.0/10
+  local second
+  case "$1" in 100.*) ;; *) return 1 ;; esac
+  second="$(printf '%s' "$1" | cut -d. -f2)"
+  [ "$second" -ge 64 ] 2>/dev/null && [ "$second" -le 127 ]
+}
+
+port_owner() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true
+}
+
+# Read one value out of JSON. Path uses dots: result.0.id
+json_get() {
+  local path="$1" input
+  input="$(cat)"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$input" | jq -r ".$(printf '%s' "$path" | sed -E 's/\.([0-9]+)/[\1]/g') | if . == null then empty else . end" 2>/dev/null
+  elif command -v plutil >/dev/null 2>&1; then
+    printf '%s' "$input" | plutil -extract "$path" raw -o - - 2>/dev/null || true
+  else
+    die "Need jq or plutil to read API responses"
+  fi
+}
+
+download() { # download URL DEST
+  curl -fSL --progress-bar --retry 2 -o "$2" "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Cloudflare
+# ---------------------------------------------------------------------------
+cf() { # cf METHOD PATH [JSON]
+  local method="$1" path="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -sS -X "$method" "$CF_API/$path" \
+      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+      --data "$body"
+  else
+    curl -sS -X "$method" "$CF_API/$path" -H "Authorization: Bearer $CF_API_TOKEN"
+  fi
+}
+
+cf_ok() { [ "$(printf '%s' "$1" | json_get success)" = "true" ]; }
+
+cf_error() { printf '%s' "$1" | json_get errors.0.message; }
+
+cf_verify_token() {
+  local r
+  r="$(cf GET user/tokens/verify)" || return 1
+  cf_ok "$r"
+}
+
+# Finds the Cloudflare zone for the domain: vhosty.link, or example.com for box.example.com
+cf_zone_id() {
+  local candidate="$VHOSTY_DOMAIN" r id
+  while [ "$(printf '%s' "$candidate" | awk -F. '{print NF}')" -ge 2 ]; do
+    r="$(cf GET "zones?name=$candidate")"
+    id="$(printf '%s' "$r" | json_get result.0.id)"
+    if [ -n "$id" ]; then
+      echo "$id"
+      return 0
+    fi
+    candidate="${candidate#*.}"
+  done
+  return 1
+}
+
+# Creates or updates the *.domain A record → this machine's Tailscale IP, DNS only
+dns_sync() {
+  local ip zone name r rid current proxied body
+  ip="$(ts_ip)"
+  [ -n "$ip" ] || die "Couldn't get this machine's Tailscale IP. Is Tailscale running?"
+  load_token
+  [ -n "$CF_API_TOKEN" ] || die "No Cloudflare token. Run: vhosty setup"
+
+  zone="$(cf_zone_id)" || die "No Cloudflare zone found for $VHOSTY_DOMAIN. Is the domain added to Cloudflare, and does the token have Zone → Read?"
+  name="*.$VHOSTY_DOMAIN"
+  body="{\"type\":\"A\",\"name\":\"$name\",\"content\":\"$ip\",\"ttl\":1,\"proxied\":false,\"comment\":\"vhosty\"}"
+
+  r="$(cf GET "zones/$zone/dns_records?type=A&name=%2A.$VHOSTY_DOMAIN")"
+  rid="$(printf '%s' "$r" | json_get result.0.id)"
+
+  if [ -z "$rid" ]; then
+    r="$(cf POST "zones/$zone/dns_records" "$body")"
+    cf_ok "$r" || die "Couldn't create $name: $(cf_error "$r")"
+    ok "created $name → $ip (DNS only)"
+    return 0
+  fi
+
+  current="$(printf '%s' "$r" | json_get result.0.content)"
+  proxied="$(printf '%s' "$r" | json_get result.0.proxied)"
+  if [ "$current" = "$ip" ] && [ "$proxied" = "false" ]; then
+    ok "$name → $ip (already correct)"
+    return 0
+  fi
+
+  if ! is_tailscale_ip "$current"; then
+    warn "$name currently points to $current, which isn't a Tailscale address."
+    if [ "$(domain_depth)" -eq 2 ]; then
+      warn "Something else (a staging server?) may rely on it. Consider a subdomain instead, like box.$VHOSTY_DOMAIN."
+    else
+      warn "Something else (a staging server?) may rely on it. Consider a different subdomain for vhosty."
+    fi
+    confirm "Point $name at this machine anyway?" N || die "Left $name unchanged."
+  fi
+
+  r="$(cf PUT "zones/$zone/dns_records/$rid" "$body")"
+  cf_ok "$r" || die "Couldn't update $name: $(cf_error "$r")"
+  if [ "$proxied" = "true" ]; then
+    ok "updated $name → $ip and turned off Cloudflare's proxy (it causes 525 errors)"
+  else
+    ok "updated $name → $ip"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Downloads
+# ---------------------------------------------------------------------------
+install_caddy() {
+  local os arch url tmp
+  os="darwin"; is_macos || os="linux"
+  arch="$(arch_name)"
+  url="https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare"
+  mkdir -p "$BIN_DIR"
+  tmp="$(mktemp)"
+  info "downloading Caddy with the Cloudflare DNS plugin ($os/$arch)"
+  download "$url" "$tmp" || die "Caddy download failed"
+  chmod +x "$tmp"
+  xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
+  "$tmp" list-modules 2>/dev/null | grep -q dns.providers.cloudflare \
+    || die "Downloaded Caddy is missing the Cloudflare plugin, or doesn't run on this macOS version"
+  mv "$tmp" "$CADDY_BIN"
+  ok "Caddy $("$CADDY_BIN" version | awk '{print $1}')"
+}
+
+php_cli_minor() {
+  command -v php >/dev/null 2>&1 || return 0
+  php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true
+}
+
+# Picks the newest static PHP-FPM build for a minor version (8.5 → php-8.5.x)
+php_fpm_file() {
+  local minor="$1" arch listing
+  case "$(arch_name)" in amd64) arch="x86_64" ;; arm64) arch="aarch64" ;; esac
+  listing="$(curl -fsSL "$PHP_DOWNLOADS/")" || die "Couldn't reach $PHP_DOWNLOADS"
+  printf '%s' "$listing" \
+    | grep -oE "php-${minor//./\\.}\.[0-9]+-fpm-macos-${arch}\.tar\.gz" \
+    | sort -u | awk -F- '{split($2,v,"."); printf "%d %s\n", v[3], $0}' \
+    | sort -n | tail -1 | cut -d' ' -f2
+}
+
+install_php_fpm() {
+  local minor="${1:-}" file tmp found
+  is_macos || die "Automatic PHP-FPM download is macOS-only for now"
+  [ -n "$minor" ] || minor="$(php_cli_minor)"
+  [ -n "$minor" ] || minor="8.4"
+  file="$(php_fpm_file "$minor")"
+  [ -n "$file" ] || die "No PHP $minor FPM build for this Mac at $PHP_DOWNLOADS. Try: vhosty update php <version>"
+  info "downloading $file"
+  tmp="$(mktemp -d)"
+  download "$PHP_DOWNLOADS/$file" "$tmp/php.tar.gz" || die "PHP-FPM download failed"
+  tar -xzf "$tmp/php.tar.gz" -C "$tmp"
+  found="$(find "$tmp" -type f -name php-fpm | head -1)"
+  [ -n "$found" ] || die "$file didn't contain a php-fpm binary"
+  mkdir -p "$BIN_DIR"
+  chmod +x "$found"
+  xattr -d com.apple.quarantine "$found" 2>/dev/null || true
+  mv "$found" "$FPM_BIN"
+  rm -rf "$tmp"
+  ok "$("$FPM_BIN" -v 2>/dev/null | head -1)"
+}
+
+# ---------------------------------------------------------------------------
+# Generated config
+# ---------------------------------------------------------------------------
+write_caddyfile() {
+  local depth i=0 dir
+  depth="$(domain_depth)"
+  {
+    cat <<EOF
+# Generated by vhosty. Don't edit: change ~/.vhosty/config, then run \`vhosty rebuild\`.
+*.$VHOSTY_DOMAIN {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+	}
+
+	# Ports: 5173.$VHOSTY_DOMAIN → localhost:5173 (Vite and other dev servers)
+	@port header_regexp port Host ^(\d+)\.
+	handle @port {
+		reverse_proxy localhost:{re.port.1}
+	}
+EOF
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      if php_enabled; then
+        cat <<EOF
+
+	# Parked: $dir (PHP, e.g. Laravel)
+	@php$i file {
+		root "$dir/{labels.$depth}/public"
+		try_files index.php
+	}
+	handle @php$i {
+		root * "$dir/{labels.$depth}/public"
+		php_fastcgi 127.0.0.1:$VHOSTY_FPM_PORT
+		file_server
+	}
+EOF
+      fi
+      cat <<EOF
+
+	# Parked: $dir (static: index.html at the folder root)
+	@static$i file {
+		root "$dir/{labels.$depth}"
+		try_files index.html
+	}
+	handle @static$i {
+		root * "$dir/{labels.$depth}"
+		file_server
+	}
+EOF
+      i=$((i + 1))
+    done <<EOF
+$(parked_list)
+EOF
+    cat <<EOF
+
+	handle {
+		respond "vhosty: no site found for {host}" 404
+	}
+}
+EOF
+  } >"$CADDYFILE"
+}
+
+write_fpm_conf() {
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  cat >"$FPM_CONF" <<EOF
+; Generated by vhosty. Change ~/.vhosty/config, then run \`vhosty rebuild\`.
+[global]
+pid = $RUN_DIR/php-fpm.pid
+error_log = $FPM_LOG
+daemonize = no
+
+[www]
+listen = 127.0.0.1:$VHOSTY_FPM_PORT
+pm = dynamic
+pm.max_children = 10
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 4
+catch_workers_output = yes
+clear_env = no
+php_admin_value[memory_limit] = 512M
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# launchd
+# ---------------------------------------------------------------------------
+plist_for() { echo "$DAEMON_DIR/$1.plist"; }
+is_loaded() { sudo launchctl print "system/$1" >/dev/null 2>&1; }
+
+svc_field() {
+  sudo launchctl print "system/$1" 2>/dev/null \
+    | awk -F'= ' -v key="$2" '$0 ~ "^\t" key " = " {print $2; exit}' || true
+}
+
+all_labels() {
+  if php_enabled; then echo "$LABEL_FPM $LABEL_CADDY"; else echo "$LABEL_CADDY"; fi
+}
+
+svc_labels() {
+  case "${1:-all}" in
+    caddy)           echo "$LABEL_CADDY" ;;
+    php-fpm|fpm|php) php_enabled || die "PHP is turned off in ~/.vhosty/config"; echo "$LABEL_FPM" ;;
+    all)             all_labels ;;
+    *) die "Unknown service '$1' (use caddy, php-fpm, or all)" ;;
+  esac
+}
+
+write_plist() { # write_plist LABEL WORKDIR LOG ARGS...
+  local label="$1" workdir="$2" log="$3" args="" a dest
+  shift 3
+  for a in "$@"; do
+    args="$args    <string>$a</string>
+"
+  done
+  dest="$(plist_for "$label")"
+  sudo tee "$dest" >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>UserName</key><string>$VHOSTY_USER</string>
+  <key>WorkingDirectory</key><string>$workdir</string>
+  <key>ProgramArguments</key>
+  <array>
+$args  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>HOME</key><string>$VHOSTY_HOME_DIR</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$log</string>
+  <key>StandardErrorPath</key><string>$log</string>
+</dict>
+</plist>
+EOF
+  sudo chown root:wheel "$dest"
+  sudo chmod 644 "$dest"
+}
+
+install_services() {
+  local l
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  for l in $LABEL_FPM $LABEL_CADDY; do
+    if is_loaded "$l"; then sudo launchctl bootout "system/$l" 2>/dev/null || true; fi
+  done
+  sleep 1
+  if php_enabled; then
+    write_plist "$LABEL_FPM" "$VHOSTY_DIR" "$FPM_LOG" "$FPM_BIN" -y "$FPM_CONF"
+    sudo launchctl bootstrap system "$(plist_for "$LABEL_FPM")"
+    ok "started $LABEL_FPM"
+  elif [ -f "$(plist_for "$LABEL_FPM")" ]; then
+    sudo rm -f "$(plist_for "$LABEL_FPM")"
+  fi
+  write_plist "$LABEL_CADDY" "$VHOSTY_DIR" "$CADDY_LOG" \
+    "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE"
+  sudo launchctl bootstrap system "$(plist_for "$LABEL_CADDY")"
+  ok "started $LABEL_CADDY"
+}
+
+restart_label() {
+  if is_loaded "$1"; then
+    sudo launchctl kickstart -k "system/$1"
+  else
+    sudo launchctl bootstrap system "$(plist_for "$1")"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: setup
+# ---------------------------------------------------------------------------
+cmd_setup() {
+  local domain="" token="" park="" php="" yes=0 ip o
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --domain) domain="$2"; shift 2 ;;
+      --token)  token="$2"; shift 2 ;;
+      --park)   park="$2"; shift 2 ;;
+      --no-php) php="off"; shift ;;
+      --php)    php="on"; shift ;;
+      -y|--yes) yes=1; shift ;;
+      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--token T] [--park DIR] [--no-php] [--yes]" ;;
+    esac
+  done
+  [ "$yes" = "1" ] && export VHOSTY_YES=1
+
+  is_macos || die "vhosty setup supports macOS only for now (launchd services)"
+  load_config
+
+  printf "%svhosty setup%s\n" "$B" "$N"
+
+  step "Checking this machine"
+  ip="$(ts_ip)"
+  [ -n "$ip" ] || die "Tailscale isn't running, or its CLI wasn't found. Install and sign in first: https://tailscale.com/download"
+  ok "Tailscale IP: $ip"
+  o="$(port_owner 443)"
+  if [ -n "$o" ] && [ "$o" != "caddy" ]; then
+    warn "port 443 is in use by: $o"
+    warn "Herd and Valet use 443. Stop them, or vhosty's Caddy can't start."
+    confirm "Continue anyway?" N || exit 1
+  fi
+
+  step "Domain"
+  info "A domain whose DNS is on Cloudflare. vhosty points *.domain at this machine."
+  info "Already using the domain's wildcard for something else? Use a subdomain, like box.example.com."
+  [ -n "$domain" ] || domain="$(ask "Domain" "$VHOSTY_DOMAIN")"
+  domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^\*\.##; s#/.*$##')"
+  printf '%s' "$domain" | grep -qE '^[a-z0-9-]+(\.[a-z0-9-]+)+$' || die "'$domain' doesn't look like a domain"
+  VHOSTY_DOMAIN="$domain"
+
+  step "Cloudflare API token"
+  load_token
+  if [ -n "$token" ]; then
+    CF_API_TOKEN="$token"
+  elif [ -n "$CF_API_TOKEN" ] && confirm "Use the saved token?" Y; then
+    :
+  else
+    info "Create one at dash.cloudflare.com → My Profile → API Tokens → 'Edit zone DNS'."
+    info "It needs Zone → Read and DNS → Edit for $VHOSTY_DOMAIN."
+    CF_API_TOKEN="$(ask_secret "Token")"
+  fi
+  [ -n "$CF_API_TOKEN" ] || die "A token is required"
+  cf_verify_token || die "Cloudflare rejected that token"
+  save_token "$CF_API_TOKEN"
+  ok "token is valid (saved to $SECRETS_FILE, readable only by you)"
+
+  step "Parked folders"
+  info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
+  [ -n "$park" ] || park="$(ask "Folder to park" "${VHOSTY_PARKED:-$VHOSTY_HOME_DIR/Sites}")"
+  park="$(eval echo "$park")"
+  [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
+  park="$(cd "$park" && pwd)"
+  case ":$VHOSTY_PARKED:" in
+    *":$park:"*) ;;
+    *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
+  esac
+  ok "parked $park"
+
+  step "PHP"
+  if [ -z "$php" ]; then
+    if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
+  fi
+  VHOSTY_PHP="$php"
+  save_config
+
+  step "Downloading"
+  if [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then
+    ok "Caddy already installed ($("$CADDY_BIN" version | awk '{print $1}'))"
+  else
+    install_caddy
+  fi
+  if php_enabled; then
+    if [ -x "$FPM_BIN" ]; then ok "PHP-FPM already installed ($("$FPM_BIN" -v 2>/dev/null | head -1 | awk '{print $2}'))"; else install_php_fpm; fi
+  fi
+
+  step "DNS"
+  dns_sync
+
+  step "Config"
+  write_caddyfile
+  php_enabled && write_fpm_conf
+  "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" >/dev/null 2>&1 \
+    || die "Generated Caddyfile didn't validate. Run: vhosty validate"
+  ok "wrote $CADDYFILE"
+
+  step "Services (asks for your password)"
+  sudo -v
+  install_services
+
+  step "Waiting for the certificate"
+  local n=0
+  while [ $n -lt 45 ]; do
+    if find "$CADDY_CERTS" -name "wildcard_.$VHOSTY_DOMAIN.crt" 2>/dev/null | grep -q .; then
+      ok "got a certificate for *.$VHOSTY_DOMAIN"
+      break
+    fi
+    sleep 2; n=$((n + 1))
+  done
+  [ $n -lt 45 ] || warn "no certificate yet. Check: vhosty logs caddy"
+
+  printf "\n%sDone.%s Folders in %s are live at https://<folder>.%s\n" "$G" "$N" "$park" "$VHOSTY_DOMAIN"
+  printf "Dev servers on a port are at https://<port>.%s (e.g. 5173 for Vite).\n" "$VHOSTY_DOMAIN"
+  printf "Run %svhosty doctor%s any time to check everything.\n" "$B" "$N"
+}
+
+# ---------------------------------------------------------------------------
+# Commands: parked folders
+# ---------------------------------------------------------------------------
+cmd_park() {
+  need_config
+  local dir="${1:-$PWD}"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || die "No such folder: ${1:-$PWD}"
+  case ":$VHOSTY_PARKED:" in
+    *":$dir:"*) warn "$dir is already parked"; return 0 ;;
+  esac
+  VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$dir"
+  save_config
+  ok "parked $dir"
+  cmd_rebuild
+}
+
+cmd_unpark() {
+  need_config
+  local dir="${1:-$PWD}" new="" d
+  dir="$(cd "$dir" 2>/dev/null && pwd || echo "$dir")"
+  case ":$VHOSTY_PARKED:" in
+    *":$dir:"*) ;;
+    *) die "$dir isn't parked. Run: vhosty parked" ;;
+  esac
+  while IFS= read -r d; do
+    [ "$d" = "$dir" ] || new="${new:+$new:}$d"
+  done <<EOF
+$(parked_list)
+EOF
+  VHOSTY_PARKED="$new"
+  save_config
+  ok "unparked $dir"
+  cmd_rebuild
+}
+
+cmd_parked() {
+  need_config
+  [ -n "$VHOSTY_PARKED" ] || { info "Nothing parked. Run: vhosty park <folder>"; return 0; }
+  parked_list | sed 's/^/  /'
+}
+
+cmd_rebuild() {
+  need_config
+  write_caddyfile
+  php_enabled && write_fpm_conf
+  ok "regenerated config"
+  if [ -f "$(plist_for "$LABEL_CADDY")" ]; then
+    cmd_validate caddy >/dev/null || { cmd_validate caddy; die "Not restarting. Fix the errors above."; }
+    restart_label "$LABEL_CADDY"
+    ok "restarted Caddy"
+    if php_enabled && [ -f "$(plist_for "$LABEL_FPM")" ]; then restart_label "$LABEL_FPM"; ok "restarted PHP-FPM"; fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: services
+# ---------------------------------------------------------------------------
+need_installed() {
+  [ -f "$(plist_for "$LABEL_CADDY")" ] || die "Services aren't installed. Run: vhosty setup"
+}
+
+cmd_start() {
+  need_config; need_installed
+  local l
+  svc_labels "${1:-all}" >/dev/null
+  for l in $(svc_labels "${1:-all}"); do
+    if is_loaded "$l"; then sudo launchctl kickstart "system/$l"; else sudo launchctl bootstrap system "$(plist_for "$l")"; fi
+    ok "started $l"
+  done
+}
+
+cmd_stop() {
+  need_config
+  local l
+  svc_labels "${1:-all}" >/dev/null
+  for l in $(svc_labels "${1:-all}"); do
+    if is_loaded "$l"; then
+      sudo launchctl bootout "system/$l" 2>/dev/null || true
+      ok "stopped $l"
+    else
+      warn "$l isn't running"
+    fi
+  done
+}
+
+cmd_restart() {
+  need_config; need_installed
+  local l
+  svc_labels "${1:-all}" >/dev/null
+  for l in $(svc_labels "${1:-all}"); do
+    if [ "$l" = "$LABEL_CADDY" ]; then cmd_validate caddy >/dev/null || { cmd_validate caddy; die "Not restarting Caddy."; }; fi
+    if [ "$l" = "$LABEL_FPM" ]; then cmd_validate php-fpm >/dev/null || { cmd_validate php-fpm; die "Not restarting PHP-FPM."; }; fi
+    restart_label "$l"
+    ok "restarted $l"
+  done
+}
+
+cmd_status() {
+  need_config
+  sudo -v
+  local ip l s p o
+  ip="$(ts_ip)"
+  printf "%svhosty%s  *.%s  →  %s\n" "$B" "$N" "$VHOSTY_DOMAIN" "${ip:-tailscale not running}"
+  head_ "Services"
+  for l in $(all_labels); do
+    s="$(svc_field "$l" state)"
+    p="$(svc_field "$l" pid)"
+    if [ "$s" = "running" ]; then ok "$l running (pid $p)"
+    elif [ -n "$s" ]; then bad "$l $s (see: vhosty logs)"
+    else bad "$l not loaded (run: vhosty start)"; fi
+  done
+  head_ "Ports"
+  o="$(port_owner 443)"; if [ -n "$o" ]; then ok "443 → $o"; else bad "nothing listening on 443"; fi
+  if php_enabled; then
+    o="$(port_owner "$VHOSTY_FPM_PORT")"
+    if [ -n "$o" ]; then ok "$VHOSTY_FPM_PORT → $o"; else bad "nothing listening on $VHOSTY_FPM_PORT"; fi
+  fi
+  echo
+}
+
+# ---------------------------------------------------------------------------
+# Commands: logs
+# ---------------------------------------------------------------------------
+log_files() {
+  case "${1:-all}" in
+    caddy)           echo "$CADDY_LOG" ;;
+    php-fpm|fpm|php) echo "$FPM_LOG" ;;
+    all)             echo "$CADDY_LOG $FPM_LOG" ;;
+    *) die "Unknown log '$1' (use caddy, php-fpm, or all)" ;;
+  esac
+}
+
+existing_logs() {
+  local f
+  for f in $(log_files "${1:-all}"); do
+    if [ -f "$f" ]; then echo "$f"; fi
+  done
+}
+
+cmd_logs() {
+  local files
+  log_files "${1:-all}" >/dev/null
+  files="$(existing_logs "${1:-all}")"
+  [ -n "$files" ] || die "No log files yet"
+  # shellcheck disable=SC2086
+  tail -n "${2:-100}" $files
+}
+
+cmd_tail() {
+  local files
+  log_files "${1:-all}" >/dev/null
+  files="$(existing_logs "${1:-all}")"
+  [ -n "$files" ] || die "No log files yet"
+  # shellcheck disable=SC2086
+  tail -n 30 -f $files
+}
+
+# ---------------------------------------------------------------------------
+# Commands: sites
+# ---------------------------------------------------------------------------
+cmd_sites() {
+  need_config
+  local dir p name re='^[A-Za-z0-9-]+$'
+  [ -n "$VHOSTY_PARKED" ] || die "Nothing parked. Run: vhosty park <folder>"
+  while IFS= read -r dir; do
+    head_ "$dir"
+    for p in "$dir"/*/; do
+      [ -d "$p" ] || continue
+      name="$(basename "$p")"
+      if ! [[ $name =~ $re ]]; then
+        info "$name (not a valid hostname: use letters, numbers, dashes)"
+      elif php_enabled && [ -f "$p/public/index.php" ]; then
+        printf "  https://%s.%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN"
+      elif [ -f "$p/index.html" ]; then
+        printf "  https://%s.%s  %s(static)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$N"
+      else
+        info "$name (no public/index.php or index.html)"
+      fi
+    done
+  done <<EOF
+$(parked_list)
+EOF
+  echo
+}
+
+site_url() {
+  need_config
+  local name="${1:-}"
+  [ -n "$name" ] || name="$(basename "$PWD")"
+  echo "https://$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]').$VHOSTY_DOMAIN"
+}
+
+cmd_open() {
+  local u
+  u="$(site_url "${1:-}")"
+  open "$u"
+  ok "opened $u"
+}
+
+cmd_url() {
+  local u
+  u="$(site_url "${1:-}")"
+  echo "$u"
+  if printf %s "$u" | pbcopy 2>/dev/null; then info "(copied to clipboard)"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: config
+# ---------------------------------------------------------------------------
+cmd_validate() {
+  local target="${1:-all}" rc=0
+  if [ "$target" = "all" ] || [ "$target" = "caddy" ]; then
+    if "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" >/dev/null 2>&1; then
+      ok "Caddyfile is valid"
+    else
+      bad "Caddyfile has errors:"
+      "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" 2>&1 \
+        | grep -iE 'error' | tail -5 | sed 's/^/      /' || true
+      rc=1
+    fi
+  fi
+  if { [ "$target" = "all" ] && php_enabled; } || [ "$target" = "php-fpm" ]; then
+    if "$FPM_BIN" -t -y "$FPM_CONF" >/dev/null 2>&1; then
+      ok "php-fpm.conf is valid"
+    else
+      bad "php-fpm.conf has errors:"
+      "$FPM_BIN" -t -y "$FPM_CONF" 2>&1 | tail -5 | sed 's/^/      /' || true
+      rc=1
+    fi
+  fi
+  return $rc
+}
+
+cmd_edit() {
+  need_config
+  case "${1:-config}" in
+    config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
+    env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; restart_label "$LABEL_CADDY"; ok "restarted Caddy" ;;
+    *) die "Unknown file '$1' (use config or env)" ;;
+  esac
+}
+
+cmd_cert() {
+  need_config
+  local crt
+  crt="$(find "$CADDY_CERTS" -name "wildcard_.$VHOSTY_DOMAIN.crt" 2>/dev/null | head -1 || true)"
+  if [ -z "$crt" ]; then
+    bad "No certificate for *.$VHOSTY_DOMAIN yet (check: vhosty logs caddy)"
+    return 1
+  fi
+  ok "certificate for *.$VHOSTY_DOMAIN"
+  openssl x509 -in "$crt" -noout -issuer -enddate 2>/dev/null | sed 's/^/      /'
+}
+
+cmd_dns() {
+  need_config
+  case "${1:-sync}" in
+    sync) dns_sync ;;
+    *) die "Usage: vhosty dns sync" ;;
+  esac
+}
+
+cmd_update() {
+  need_config
+  case "${1:-all}" in
+    caddy) install_caddy ;;
+    php|php-fpm) php_enabled || die "PHP is turned off"; install_php_fpm "${2:-}" ;;
+    all) install_caddy; if php_enabled; then install_php_fpm; fi ;;
+    *) die "Usage: vhosty update [caddy|php [8.x]]" ;;
+  esac
+  if [ -f "$(plist_for "$LABEL_CADDY")" ]; then cmd_restart all; fi
+}
+
+cmd_paths() {
+  cat <<EOF
+  vhosty dir    $VHOSTY_DIR
+  Config        $CONFIG_FILE
+  Token         $SECRETS_FILE
+  Caddyfile     $CADDYFILE
+  php-fpm.conf  $FPM_CONF
+  Binaries      $BIN_DIR
+  Logs          $LOG_DIR
+  Services      $(plist_for "$LABEL_CADDY")
+                $(plist_for "$LABEL_FPM")
+  Certificates  $CADDY_CERTS
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Command: doctor
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  need_config
+  FAILED=0
+  sudo -v
+  local ip probe resolved l s code o
+  ip="$(ts_ip)"
+  probe="vhosty-doctor.$VHOSTY_DOMAIN"
+  printf "%svhosty doctor%s  (*.%s)\n" "$B" "$N" "$VHOSTY_DOMAIN"
+
+  head_ "Network"
+  if [ -n "$ip" ]; then ok "Tailscale IP: $ip"; else bad "Tailscale isn't running, or its CLI wasn't found"; fi
+  resolved="$(dig +short "$probe" A 2>/dev/null | tail -1 || true)"
+  if [ -z "$resolved" ]; then
+    bad "*.$VHOSTY_DOMAIN doesn't resolve. Run: vhosty dns sync"
+  elif [ -n "$ip" ] && [ "$resolved" != "$ip" ]; then
+    bad "*.$VHOSTY_DOMAIN resolves to $resolved, expected $ip. Run: vhosty dns sync"
+  else
+    ok "*.$VHOSTY_DOMAIN resolves to $resolved"
+  fi
+
+  head_ "Caddy"
+  if [ -x "$CADDY_BIN" ]; then ok "binary: $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}')"; else bad "Caddy missing. Run: vhosty update caddy"; fi
+  if "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then ok "Cloudflare DNS plugin"; else bad "Caddy is missing the Cloudflare plugin. Run: vhosty update caddy"; fi
+  if [ -s "$SECRETS_FILE" ]; then ok "token file present"; else bad "Missing $SECRETS_FILE. Run: vhosty setup"; fi
+  cmd_validate caddy || true
+  cmd_cert || true
+
+  if php_enabled; then
+    head_ "PHP-FPM"
+    if [ -x "$FPM_BIN" ]; then ok "binary: $("$FPM_BIN" -v 2>/dev/null | head -1)"; else bad "php-fpm missing. Run: vhosty update php"; fi
+    cmd_validate php-fpm || true
+  fi
+
+  head_ "Services"
+  for l in $(all_labels); do
+    s="$(svc_field "$l" state)"
+    if [ "$s" = "running" ]; then ok "$l running"
+    elif [ -f "$(plist_for "$l")" ]; then bad "$l ${s:-not loaded}. Run: vhosty start"
+    else bad "$l not installed. Run: vhosty setup"; fi
+  done
+  o="$(port_owner 443)"; if [ -n "$o" ]; then ok "443 → $o"; else bad "nothing listening on 443"; fi
+  if php_enabled; then
+    o="$(port_owner "$VHOSTY_FPM_PORT")"
+    if [ -n "$o" ]; then ok "$VHOSTY_FPM_PORT → $o"; else bad "nothing listening on $VHOSTY_FPM_PORT"; fi
+  fi
+
+  head_ "End to end"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$probe/" 2>/dev/null || true)"
+  if [ -n "$code" ] && [ "$code" != "000" ]; then
+    ok "https://$probe answered with HTTP $code"
+  else
+    bad "Couldn't reach https://$probe (TLS or connection failed)"
+  fi
+
+  echo
+  if [ "$FAILED" = "0" ]; then
+    printf "%sAll good.%s\n" "$G" "$N"
+  else
+    printf "%sSome checks failed. See above.%s\n" "$R" "$N"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Command: uninstall
+# ---------------------------------------------------------------------------
+cmd_uninstall() {
+  local l
+  confirm "Stop and remove the vhosty services? (~/.vhosty and your DNS record stay)" N || { info "Cancelled."; return 0; }
+  for l in $LABEL_CADDY $LABEL_FPM; do
+    if is_loaded "$l"; then sudo launchctl bootout "system/$l" 2>/dev/null || true; fi
+    if [ -f "$(plist_for "$l")" ]; then sudo rm -f "$(plist_for "$l")"; ok "removed $l"; fi
+  done
+  info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record in Cloudflare."
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${B}vhosty${N} $VHOSTY_VERSION: Herd for your tailnet
+
+${B}Setup${N}
+  vhosty setup [--domain D] [--token T] [--park DIR] [--no-php] [--yes]
+  vhosty uninstall                   Remove the services (keeps your files)
+
+${B}Sites${N}
+  vhosty park [dir]                  Serve every folder in dir (default: current)
+  vhosty unpark [dir]                Stop serving a parked folder
+  vhosty parked                      List parked folders
+  vhosty sites                       List sites and their URLs
+  vhosty open [site|port]            Open in the browser (default: current folder)
+  vhosty url  [site|port]            Print the URL and copy it
+
+${B}Services${N}
+  vhosty start   [caddy|php-fpm]     Start services (default: all)
+  vhosty stop    [caddy|php-fpm]     Stop services
+  vhosty restart [caddy|php-fpm]     Validate config, then restart
+  vhosty status                      Service state, PIDs, and ports
+  vhosty logs [caddy|php-fpm] [N]    Show the last N log lines (default 100)
+  vhosty tail [caddy|php-fpm]        Follow logs live
+
+${B}Config${N}
+  vhosty edit [config|env]           Edit settings or the token, then apply
+  vhosty rebuild                     Regenerate the Caddyfile and restart
+  vhosty dns sync                    Point *.domain at this machine's Tailscale IP
+  vhosty update [caddy|php [8.x]]    Re-download Caddy or PHP-FPM
+  vhosty validate                    Check the generated config
+  vhosty cert                        Show the wildcard certificate and expiry
+  vhosty doctor                      Check DNS, certs, services, and HTTPS end to end
+  vhosty ip | domain | paths         Quick lookups
+  vhosty version
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"
+  if [ $# -gt 0 ]; then shift; fi
+  load_config
+
+  case "$cmd" in
+    setup)              cmd_setup "$@" ;;
+    park|link)          cmd_park "${1:-}" ;;
+    unpark|unlink)      cmd_unpark "${1:-}" ;;
+    parked)             cmd_parked ;;
+    sites|ls)           cmd_sites ;;
+    open)               cmd_open "${1:-}" ;;
+    url)                cmd_url "${1:-}" ;;
+    start|stop|restart) "cmd_$cmd" "${1:-all}" ;;
+    status|st)          cmd_status ;;
+    logs|log)           cmd_logs "${1:-all}" "${2:-100}" ;;
+    tail|follow)        cmd_tail "${1:-all}" ;;
+    edit)               cmd_edit "${1:-config}" ;;
+    rebuild)            cmd_rebuild ;;
+    dns)                cmd_dns "${1:-sync}" ;;
+    update)             cmd_update "${1:-all}" "${2:-}" ;;
+    validate|check)     need_config; cmd_validate "${1:-all}" ;;
+    cert|certs)         cmd_cert ;;
+    doctor|dr)          cmd_doctor ;;
+    ip)                 local ip; ip="$(ts_ip)"; [ -n "$ip" ] || die "Tailscale isn't running"; echo "$ip" ;;
+    domain)             need_config; echo "$VHOSTY_DOMAIN" ;;
+    paths)              cmd_paths ;;
+    uninstall)          cmd_uninstall ;;
+    version|-v|--version) echo "vhosty $VHOSTY_VERSION" ;;
+    help|-h|--help)     usage ;;
+    *) die "Unknown command '$cmd'. Run: vhosty help" ;;
+  esac
+}
+
+main "$@"

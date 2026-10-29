@@ -33,6 +33,31 @@ Only trust localhost, not `*`. In production, requests never come from
 
 ## 2. Vite: hot reload through the proxy
 
+Install [vite-plugin-vhosty](https://github.com/zacksmash/vite-plugin-vhosty):
+
+```bash
+npm i -D vite-plugin-vhosty
+```
+
+```js
+import vhosty from 'vite-plugin-vhosty';
+
+export default defineConfig({
+    plugins: [
+        vhosty(), // must come before laravel()
+        laravel({ input: ['resources/css/app.css', 'resources/js/app.js'], refresh: true }),
+        vue(),
+    ],
+});
+```
+
+The plugin reads your domain from `~/.vhosty/config`, picks a free port, and serves
+Vite at `https://<port>.<domain>` with hot reload. It needs no `.env` changes, and it does
+nothing on machines without vhosty, so teammates aren't affected.
+
+<details>
+<summary>Without the plugin</summary>
+
 Add these to your `.env` only. Don't commit them:
 
 ```dotenv
@@ -75,21 +100,16 @@ export default defineConfig(({ mode }) => {
 });
 ```
 
-Each setting does one job:
+Use `env.APP_URL` from `loadEnv`, not `process.env.APP_URL`. `process.env` doesn't
+include your `.env` file.
 
-- `origin` makes the Laravel plugin write `https://5173.<domain>` into `public/hot`.
-- `hmr` sends hot reload over a secure WebSocket through Caddy.
-- `allowedHosts` and `cors` stop Vite from rejecting requests made under the new name.
-- `host: '127.0.0.1'` keeps Vite off the network. Caddy is the only way in.
-
-Use `env.APP_URL` from `loadEnv`, not `process.env.APP_URL`. `process.env`
-doesn't include your `.env` file.
+</details>
 
 ### Several projects at once
 
-Give each project its own Vite port (`DEV_VITE_PORT=5174`,
-`DEV_PROXY_HOST=5174.<domain>`, and so on). Port subdomains need no
-configuration, so any port works.
+The plugin takes the next free port for each project (5173, 5174, and so on) and
+prints the matching URL on startup. Without the plugin, give each project its own
+`DEV_VITE_PORT` and `DEV_PROXY_HOST`.
 
 ### No hot reload needed?
 

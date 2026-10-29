@@ -98,9 +98,10 @@ Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
 Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
 (`artisan serve`).
 
-**Laravel + Vite:** see [docs/laravel-vite.md](docs/laravel-vite.md) for the
-`.env`-only Vite config, which leaves teammates' setups alone, and fixes for
-mixed content.
+**Vite:** add [vite-plugin-vhosty](https://github.com/zacksmash/vite-plugin-vhosty)
+(`npm i -D vite-plugin-vhosty`) for HTTPS and hot reload at `https://<port>.<domain>`,
+with no config. Laravel setup and mixed-content fixes are in
+[docs/laravel-vite.md](docs/laravel-vite.md).
 
 ## Files
 

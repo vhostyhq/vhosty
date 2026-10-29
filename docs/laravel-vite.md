@@ -33,14 +33,14 @@ Only trust localhost, not `*`. In production, requests never come from
 
 ## 2. Vite: hot reload through the proxy
 
-Install [vite-plugin-vhosty](https://github.com/zacksmash/vite-plugin-vhosty):
+Install [@vhosty/vite-plugin](https://github.com/zacksmash/vite-plugin-vhosty):
 
 ```bash
-npm i -D vite-plugin-vhosty
+npm i -D @vhosty/vite-plugin
 ```
 
 ```js
-import vhosty from 'vite-plugin-vhosty';
+import vhosty from '@vhosty/vite-plugin';
 
 export default defineConfig({
     plugins: [

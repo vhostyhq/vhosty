@@ -3,13 +3,13 @@
 # Installs the vhosty CLI into ~/.vhosty and puts it on your PATH.
 #
 #   From a clone:   ./install.sh
-#   From the web:   curl -fsSL https://raw.githubusercontent.com/zacksmash/vhosty/main/install.sh | bash
+#   From the web:   curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | bash
 #
 # Then run: vhosty setup
 
 set -euo pipefail
 
-REPO="${VHOSTY_REPO:-zacksmash/vhosty}"
+REPO="${VHOSTY_REPO:-vhostyhq/vhosty}"
 REF="${VHOSTY_REF:-main}"
 VHOSTY_DIR="${VHOSTY_DIR:-$HOME/.vhosty}"
 LINK="/usr/local/bin/vhosty"

@@ -7,7 +7,7 @@
 #   vhosty setup      first-time setup (domain, DNS, Caddy, PHP-FPM, services)
 #   vhosty help       everything else
 #
-# https://github.com/zacksmash/vhosty
+# https://github.com/vhostyhq/vhosty
 #
 # Written for the bash that ships with macOS (3.2), so no bash 4+ features.
 

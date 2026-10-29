@@ -44,7 +44,7 @@ static PHP-FPM build that matches your `php -v`.
 ## Install
 
 ```bash
-git clone https://github.com/zacksmash/vhosty.git
+git clone https://github.com/vhostyhq/vhosty.git
 cd vhosty && ./install.sh
 vhosty setup
 ```
@@ -52,7 +52,7 @@ vhosty setup
 Once the repo is public, this one-liner will work too:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zacksmash/vhosty/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | bash
 ```
 
 `vhosty setup` asks for your domain, token, and the folder to park, then:
@@ -98,7 +98,7 @@ Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
 Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
 (`artisan serve`).
 
-**Vite:** add [@vhosty/vite-plugin](https://github.com/zacksmash/vite-plugin-vhosty)
+**Vite:** add [@vhosty/vite-plugin](https://github.com/vhostyhq/vite-plugin)
 (`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
 with no config. Laravel setup and mixed-content fixes are in
 [docs/laravel-vite.md](docs/laravel-vite.md).

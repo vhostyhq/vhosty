@@ -105,7 +105,7 @@ fpath=(~/.vhosty/completions $fpath)   # before compinit
 | `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
-| `vhosty logs` / `vhosty tail` | Recent logs, or follow them live |
+| `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
 | `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
 | `vhosty prune` | Remove configs for sites whose folder is gone, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
@@ -223,13 +223,19 @@ that isn't.
 ├── bin/                   vhosty, caddy, php (the CLI shim)
 ├── completions/           zsh completion
 ├── run/                   sockets
-└── logs/                  caddy.log, php-<version>.log
+└── logs/                  caddy.log, php-<version>.log, rotated copies (*.log.1.gz …)
 ```
 
 Services: `~/.config/systemd/user/vhosty-caddy.service` and `vhosty-php@.service`
 on Linux; `/Library/LaunchDaemons/link.vhosty.*.plist` on macOS.
 
 Edit `config` or `php.ini` by hand if you like, then run `vhosty rebuild`.
+
+Logs are rotated once they pass `VHOSTY_LOG_MAX_MB` (default 10): the current
+file is compressed to `<name>.log.1.gz` and the newest `VHOSTY_LOG_KEEP` (default
+5) copies are kept. On Linux a daily systemd timer (`vhosty-logs.timer`) does it;
+on macOS it happens whenever vhosty sets up the services. `vhosty logs rotate
+--force` rotates now. The services keep running throughout.
 
 ## After a reboot
 

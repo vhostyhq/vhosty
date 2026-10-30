@@ -106,7 +106,10 @@ _vhosty() {
   fi
 
   case "${words[2]}" in
-    start|stop|restart|logs|log|tail) _vhosty_services ;;
+    start|stop|restart|tail) _vhosty_services ;;
+    logs|log)
+      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'actions:action:(rotate)'
+      elif [ "${words[3]}" = "rotate" ]; then _values 'option' --force; fi ;;
     edit)          _values 'file' config php env ;;
     validate)      _values 'config' caddy php ;;
     dns)           _values 'action' sync ;;

@@ -9,15 +9,20 @@
 #
 # https://github.com/vhostyhq/vhosty
 #
+# Runs on Linux (systemd user services) and macOS (launchd).
 # Written for the bash that ships with macOS (3.2), so no bash 4+ features.
 
 set -euo pipefail
 
-VHOSTY_VERSION="0.1.0"
+VHOSTY_VERSION="0.2.0-dev"
 
 # ---------------------------------------------------------------------------
-# Locations
+# Platform and locations
 # ---------------------------------------------------------------------------
+if [ "$(uname -s)" = "Darwin" ]; then PLATFORM="macos"; else PLATFORM="linux"; fi
+is_macos() { [ "$PLATFORM" = "macos" ]; }
+is_linux() { [ "$PLATFORM" = "linux" ]; }
+
 VHOSTY_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 if [ -n "${SUDO_USER:-}" ]; then
   VHOSTY_HOME_DIR="$(eval echo "~$SUDO_USER")"
@@ -28,21 +33,26 @@ VHOSTY_DIR="${VHOSTY_DIR:-$VHOSTY_HOME_DIR/.vhosty}"
 
 CONFIG_FILE="$VHOSTY_DIR/config"
 SECRETS_FILE="$VHOSTY_DIR/.env"
+PHP_INI="$VHOSTY_DIR/php.ini"
 BIN_DIR="$VHOSTY_DIR/bin"
 CADDY_BIN="$BIN_DIR/caddy"
-FPM_BIN="$BIN_DIR/php-fpm"
 CADDYFILE="$VHOSTY_DIR/Caddyfile"
-FPM_CONF="$VHOSTY_DIR/php-fpm.conf"
+PHP_CONF_DIR="$VHOSTY_DIR/php"
 LOG_DIR="$VHOSTY_DIR/logs"
 RUN_DIR="$VHOSTY_DIR/run"
 CADDY_LOG="$LOG_DIR/caddy.log"
-FPM_LOG="$LOG_DIR/php-fpm.log"
 
+# macOS: launchd system daemons
 DAEMON_DIR="${VHOSTY_DAEMON_DIR:-/Library/LaunchDaemons}"
-LABEL_CADDY="link.vhosty.caddy"
-LABEL_FPM="link.vhosty.php-fpm"
+LABEL_PREFIX="link.vhosty"
+# Linux: systemd user units
+UNIT_DIR="${XDG_CONFIG_HOME:-$VHOSTY_HOME_DIR/.config}/systemd/user"
 
-CADDY_CERTS="$VHOSTY_HOME_DIR/Library/Application Support/Caddy/certificates"
+if is_macos; then
+  CADDY_CERTS="$VHOSTY_HOME_DIR/Library/Application Support/Caddy/certificates"
+else
+  CADDY_CERTS="${XDG_DATA_HOME:-$VHOSTY_HOME_DIR/.local/share}/caddy/certificates"
+fi
 CF_API="https://api.cloudflare.com/client/v4"
 PHP_DOWNLOADS="https://dl.static-php.dev/static-php-cli/bulk"
 
@@ -50,7 +60,9 @@ PHP_DOWNLOADS="https://dl.static-php.dev/static-php-cli/bulk"
 VHOSTY_DOMAIN=""
 VHOSTY_PARKED=""          # colon-separated folders
 VHOSTY_PHP="on"           # on | off
-VHOSTY_FPM_PORT="9000"
+VHOSTY_PHP_DEFAULT=""     # e.g. 8.5; empty = newest installed
+VHOSTY_SERVICES_DIR=""    # docker compose project for `vhosty services`
+VHOSTY_FPM_PORT=""        # old setting (TCP); FPM now uses sockets in ~/.vhosty/run
 
 FAILED=0
 
@@ -129,8 +141,34 @@ save_config() {
 VHOSTY_DOMAIN="$VHOSTY_DOMAIN"
 VHOSTY_PARKED="$VHOSTY_PARKED"
 VHOSTY_PHP="$VHOSTY_PHP"
-VHOSTY_FPM_PORT="$VHOSTY_FPM_PORT"
+VHOSTY_PHP_DEFAULT="$VHOSTY_PHP_DEFAULT"
+VHOSTY_SERVICES_DIR="$VHOSTY_SERVICES_DIR"
 EOF
+}
+
+# A config copied from another machine: drop the old FPM port, and move
+# parked folders from another home directory (/Users/me/Dev) to this one.
+migrate_config() {
+  local d new="" moved=""
+  if [ -n "$VHOSTY_FPM_PORT" ]; then
+    info "PHP-FPM now listens on sockets in $RUN_DIR; dropped VHOSTY_FPM_PORT=$VHOSTY_FPM_PORT"
+    VHOSTY_FPM_PORT=""
+  fi
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    if [ ! -d "$d" ]; then
+      case "$d" in
+        /Users/*/*|/home/*/*)
+          moved="$VHOSTY_HOME_DIR/$(printf '%s' "$d" | cut -d/ -f4-)"
+          if [ -d "$moved" ]; then info "parked folder $d → $moved"; d="$moved"; fi
+          ;;
+      esac
+    fi
+    case ":$new:" in *":$d:"*) ;; *) new="${new:+$new:}$d" ;; esac
+  done <<EOF
+$(parked_list)
+EOF
+  VHOSTY_PARKED="$new"
 }
 
 load_token() {
@@ -161,8 +199,6 @@ parked_list() { printf '%s\n' "$VHOSTY_PARKED" | tr ':' '\n' | sed '/^$/d'; }
 # ---------------------------------------------------------------------------
 # System helpers
 # ---------------------------------------------------------------------------
-is_macos() { [ "$(uname -s)" = "Darwin" ]; }
-
 arch_name() { # caddy-style arch name
   case "$(uname -m)" in
     x86_64|amd64) echo amd64 ;;
@@ -192,8 +228,19 @@ is_tailscale_ip() { # 100.64.0.0/10
   [ "$second" -ge 64 ] 2>/dev/null && [ "$second" -le 127 ]
 }
 
+# Name of the process listening on a TCP port, "?" if it belongs to another user
 port_owner() {
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true
+  if is_macos; then
+    lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//' || true
+  else
+    ss -ltnpH "( sport = :$1 )" 2>/dev/null | awk '{
+      if (match($0, /users:\(\("[^"]+"/)) { s = substr($0, RSTART + 9, RLENGTH - 10); print s } else print "?"
+    }' | sort -u | tr '\n' ' ' | sed 's/ $//' \
+      | { IFS= read -r o || true
+          # Caddy's port capability hides its sockets from ss; "?" is ours if it's running
+          if [ "$o" = "?" ] && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && [ "$(svc_state caddy)" = "running" ]; then o="caddy"; fi
+          printf '%s' "$o"; } || true
+  fi
 }
 
 # Read one value out of JSON. Path uses dots: result.0.id
@@ -205,12 +252,30 @@ json_get() {
   elif command -v plutil >/dev/null 2>&1; then
     printf '%s' "$input" | plutil -extract "$path" raw -o - - 2>/dev/null || true
   else
-    die "Need jq or plutil to read API responses"
+    die "Need jq to read API responses (sudo apt install jq)"
   fi
 }
 
 download() { # download URL DEST
-  curl -fSL --progress-bar --retry 2 -o "$2" "$1"
+  if [ -t 2 ]; then curl -fSL --progress-bar --retry 2 -o "$2" "$1"
+  else curl -fsSL --retry 2 -o "$2" "$1"; fi
+}
+
+open_url() {
+  if is_macos; then open "$1"
+  elif { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } && command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$1" >/dev/null 2>&1 &
+  else
+    return 1
+  fi
+}
+
+copy_text() {
+  if command -v pbcopy >/dev/null 2>&1; then printf %s "$1" | pbcopy
+  elif [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then printf %s "$1" | wl-copy
+  elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then printf %s "$1" | xclip -selection clipboard
+  else return 1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -301,8 +366,17 @@ dns_sync() {
 }
 
 # ---------------------------------------------------------------------------
-# Downloads
+# Caddy
 # ---------------------------------------------------------------------------
+# Lets Caddy bind 80/443 as a normal user. Replacing the binary drops it, so
+# this runs again after every download.
+caddy_allow_ports() {
+  is_linux || return 0
+  if getcap "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service; then return 0; fi
+  info "letting Caddy use ports 80 and 443 without root (asks for your password)"
+  sudo setcap cap_net_bind_service=+ep "$CADDY_BIN" || die "setcap failed"
+}
+
 install_caddy() {
   local os arch url tmp
   os="darwin"; is_macos || os="linux"
@@ -312,35 +386,79 @@ install_caddy() {
   tmp="$(mktemp)"
   info "downloading Caddy with the Cloudflare DNS plugin ($os/$arch)"
   download "$url" "$tmp" || die "Caddy download failed"
-  chmod +x "$tmp"
-  xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
+  chmod 755 "$tmp"
+  if is_macos; then xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true; fi
   "$tmp" list-modules 2>/dev/null | grep -q dns.providers.cloudflare \
-    || die "Downloaded Caddy is missing the Cloudflare plugin, or doesn't run on this macOS version"
+    || die "Downloaded Caddy is missing the Cloudflare plugin, or doesn't run on this system"
   mv "$tmp" "$CADDY_BIN"
+  caddy_allow_ports
   ok "Caddy $("$CADDY_BIN" version | awk '{print $1}')"
 }
 
-php_cli_minor() {
-  command -v php >/dev/null 2>&1 || return 0
-  php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true
+caddy_installed() { [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; }
+
+# ---------------------------------------------------------------------------
+# PHP versions
+#   Linux: apt packages (phpX.Y-fpm), side by side
+#   macOS: static PHP-FPM builds in ~/.vhosty/bin/php-fpm-X.Y
+# ---------------------------------------------------------------------------
+fpm_bin() { if is_macos; then echo "$BIN_DIR/php-fpm-$1"; else echo "/usr/sbin/php-fpm$1"; fi; }
+fpm_conf() { echo "$PHP_CONF_DIR/$1/php-fpm.conf"; }
+fpm_sock() { echo "$RUN_DIR/php-$1.sock"; }
+fpm_log() { echo "$LOG_DIR/php-$1.log"; }
+
+php_installed_versions() { # newest first
+  local f
+  {
+    if is_macos; then
+      for f in "$BIN_DIR"/php-fpm-*; do [ -x "$f" ] && echo "${f##*/php-fpm-}"; done
+    else
+      for f in /usr/sbin/php-fpm[0-9]*; do [ -x "$f" ] && echo "${f#/usr/sbin/php-fpm}"; done
+    fi
+  } | grep -E '^[0-9]+\.[0-9]+$' | sort -t. -k1,1nr -k2,2nr || true
 }
 
-# Picks the newest static PHP-FPM build for a minor version (8.5 → php-8.5.x)
+php_is_installed() { [ -x "$(fpm_bin "$1")" ]; }
+
+php_default() {
+  if [ -n "$VHOSTY_PHP_DEFAULT" ]; then echo "$VHOSTY_PHP_DEFAULT"; else php_installed_versions | head -1; fi
+}
+
+# Versions that need a running FPM
+php_versions_in_use() {
+  php_enabled || return 0
+  php_default
+}
+
+# PHP on PATH outside vhosty's shim, for picking a default on first setup
+php_cli_minor() {
+  local p
+  for p in /usr/bin/php /usr/local/bin/php "$(command -v php 2>/dev/null || true)"; do
+    [ -x "$p" ] || continue
+    "$p" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null && return 0
+  done
+  return 0
+}
+
+# macOS: picks the newest static PHP-FPM build for a minor version (8.5 → php-8.5.x)
 php_fpm_file() {
   local minor="$1" arch listing
   case "$(arch_name)" in amd64) arch="x86_64" ;; arm64) arch="aarch64" ;; esac
   listing="$(curl -fsSL "$PHP_DOWNLOADS/")" || die "Couldn't reach $PHP_DOWNLOADS"
   printf '%s' "$listing" \
-    | grep -oE "php-${minor//./\\.}\.[0-9]+-fpm-macos-${arch}\.tar\.gz" \
+    | grep -oE "php-$(printf '%s' "$minor" | sed 's/\./\\./')\.[0-9]+-fpm-macos-${arch}\.tar\.gz" \
     | sort -u | awk -F- '{split($2,v,"."); printf "%d %s\n", v[3], $0}' \
     | sort -n | tail -1 | cut -d' ' -f2
 }
 
-install_php_fpm() {
+install_php_fpm() { # install_php_fpm 8.5
   local minor="${1:-}" file tmp found
-  is_macos || die "Automatic PHP-FPM download is macOS-only for now"
   [ -n "$minor" ] || minor="$(php_cli_minor)"
-  [ -n "$minor" ] || minor="8.4"
+  [ -n "$minor" ] || minor="8.5"
+  if is_linux; then
+    php_is_installed "$minor" && { ok "PHP $minor ($("$(fpm_bin "$minor")" -v 2>/dev/null | head -1 | awk '{print $2}'))"; return 0; }
+    die "PHP $minor isn't installed. Install it with apt (e.g. sudo apt install php$minor-fpm php$minor-cli)."
+  fi
   file="$(php_fpm_file "$minor")"
   [ -n "$file" ] || die "No PHP $minor FPM build for this Mac at $PHP_DOWNLOADS. Try: vhosty update php <version>"
   info "downloading $file"
@@ -352,20 +470,58 @@ install_php_fpm() {
   mkdir -p "$BIN_DIR"
   chmod +x "$found"
   xattr -d com.apple.quarantine "$found" 2>/dev/null || true
-  mv "$found" "$FPM_BIN"
+  mv "$found" "$(fpm_bin "$minor")"
   rm -rf "$tmp"
-  ok "$("$FPM_BIN" -v 2>/dev/null | head -1)"
+  ok "$("$(fpm_bin "$minor")" -v 2>/dev/null | head -1)"
+}
+
+# vhosty 0.1 on macOS kept one build at bin/php-fpm. Give it a versioned name.
+migrate_php_fpm() {
+  local v
+  is_macos && [ -x "$BIN_DIR/php-fpm" ] || return 0
+  v="$("$BIN_DIR/php-fpm" -v 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1,2)"
+  [ -n "$v" ] || return 0
+  [ -e "$(fpm_bin "$v")" ] || mv "$BIN_DIR/php-fpm" "$(fpm_bin "$v")"
+}
+
+# ---------------------------------------------------------------------------
+# php.ini: key = value lines for every PHP version (web and CLI)
+# ---------------------------------------------------------------------------
+write_default_php_ini() {
+  [ -f "$PHP_INI" ] && return 0
+  cat >"$PHP_INI" <<'EOF'
+; vhosty: PHP settings for every site and every PHP version (web and CLI).
+; They apply on top of the distro's php.ini. After editing, run: vhosty rebuild
+memory_limit = 512M
+upload_max_filesize = 128M
+post_max_size = 128M
+EOF
+}
+
+# Prints key=value pairs from an ini file (comments, sections and blanks dropped)
+ini_pairs() {
+  [ -f "$1" ] || return 0
+  sed -e 's/^[[:space:]]*//' -e '/^[;#[]/d' -e 's/[[:space:]]*$//' "$1" \
+    | grep '=' | sed -E 's/^([^=[:space:]]+)[[:space:]]*=[[:space:]]*/\1=/' || true
 }
 
 # ---------------------------------------------------------------------------
 # Generated config
 # ---------------------------------------------------------------------------
 write_caddyfile() {
-  local depth i=0 dir
+  local depth i=0 dir v ip bind
   depth="$(domain_depth)"
+  v="$(php_default)"
+  # Listen on the Tailscale address (and localhost) only, not the LAN
+  ip="$(ts_ip)"
+  bind="127.0.0.1 ::1"; [ -z "$ip" ] || bind="$ip $bind"
   {
     cat <<EOF
 # Generated by vhosty. Don't edit: change ~/.vhosty/config, then run \`vhosty rebuild\`.
+{
+	default_bind $bind
+}
+
 *.$VHOSTY_DOMAIN {
 	tls {
 		dns cloudflare {env.CF_API_TOKEN}
@@ -379,17 +535,17 @@ write_caddyfile() {
 EOF
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
-      if php_enabled; then
+      if php_enabled && [ -n "$v" ]; then
         cat <<EOF
 
-	# Parked: $dir (PHP, e.g. Laravel)
+	# Parked: $dir (PHP $v, e.g. Laravel)
 	@php$i file {
 		root "$dir/{labels.$depth}/public"
 		try_files index.php
 	}
 	handle @php$i {
 		root * "$dir/{labels.$depth}/public"
-		php_fastcgi 127.0.0.1:$VHOSTY_FPM_PORT
+		php_fastcgi unix/$(fpm_sock "$v")
 		file_server
 	}
 EOF
@@ -420,17 +576,20 @@ EOF
   } >"$CADDYFILE"
 }
 
-write_fpm_conf() {
-  mkdir -p "$LOG_DIR" "$RUN_DIR"
-  cat >"$FPM_CONF" <<EOF
-; Generated by vhosty. Change ~/.vhosty/config, then run \`vhosty rebuild\`.
+write_fpm_conf() { # write_fpm_conf 8.5
+  local v="$1" kv
+  mkdir -p "$PHP_CONF_DIR/$v" "$LOG_DIR" "$RUN_DIR"
+  {
+    cat <<EOF
+; Generated by vhosty. Change ~/.vhosty/config or ~/.vhosty/php.ini, then run \`vhosty rebuild\`.
 [global]
-pid = $RUN_DIR/php-fpm.pid
-error_log = $FPM_LOG
+pid = $RUN_DIR/php-$v.pid
+error_log = $(fpm_log "$v")
 daemonize = no
 
-[www]
-listen = 127.0.0.1:$VHOSTY_FPM_PORT
+[default]
+listen = $(fpm_sock "$v")
+listen.mode = 0600
 pm = dynamic
 pm.max_children = 10
 pm.start_servers = 2
@@ -438,50 +597,148 @@ pm.min_spare_servers = 1
 pm.max_spare_servers = 4
 catch_workers_output = yes
 clear_env = no
-php_admin_value[memory_limit] = 512M
 EOF
+    ini_pairs "$PHP_INI" | while IFS= read -r kv; do
+      printf 'php_value[%s] = %s\n' "${kv%%=*}" "${kv#*=}"
+    done
+  } >"$(fpm_conf "$v")"
+}
+
+write_configs() {
+  local v
+  write_caddyfile
+  for v in $(php_versions_in_use); do write_fpm_conf "$v"; done
 }
 
 # ---------------------------------------------------------------------------
-# launchd
+# Services
+#   Names: caddy, php-8.5, php-8.4, ...
+#   Linux: systemd user units (vhosty-caddy, vhosty-php@8.5), no sudo needed
+#   macOS: launchd daemons (link.vhosty.caddy, link.vhosty.php-8.5)
 # ---------------------------------------------------------------------------
-plist_for() { echo "$DAEMON_DIR/$1.plist"; }
-is_loaded() { sudo launchctl print "system/$1" >/dev/null 2>&1; }
-
-svc_field() {
-  sudo launchctl print "system/$1" 2>/dev/null \
-    | awk -F'= ' -v key="$2" '$0 ~ "^\t" key " = " {print $2; exit}' || true
+svc_all() { # PHP first, so Caddy starts with its upstreams ready
+  local v
+  for v in $(php_versions_in_use); do printf 'php-%s\n' "$v"; done
+  echo caddy
 }
 
-all_labels() {
-  if php_enabled; then echo "$LABEL_FPM $LABEL_CADDY"; else echo "$LABEL_CADDY"; fi
-}
-
-svc_labels() {
-  case "${1:-all}" in
-    caddy)           echo "$LABEL_CADDY" ;;
-    php-fpm|fpm|php) php_enabled || die "PHP is turned off in ~/.vhosty/config"; echo "$LABEL_FPM" ;;
-    all)             all_labels ;;
-    *) die "Unknown service '$1' (use caddy, php-fpm, or all)" ;;
+# Turns a user argument (caddy, php, php-8.5, php@8.5, 8.5, all) into service names
+svc_resolve() {
+  local a="${1:-all}" v
+  case "$a" in
+    all) svc_all ;;
+    caddy) echo caddy ;;
+    php|php-fpm|fpm)
+      php_enabled || die "PHP is turned off in ~/.vhosty/config"
+      for v in $(php_versions_in_use); do echo "php-$v"; done ;;
+    php-[0-9]*|php@[0-9]*|[0-9]*.[0-9]*)
+      v="${a#php}"; v="${v#[-@]}"
+      php_is_installed "$v" || die "PHP $v isn't installed"
+      echo "php-$v" ;;
+    *) die "Unknown service '$a' (use caddy, php, php-8.x, or all)" ;;
   esac
 }
 
-write_plist() { # write_plist LABEL WORKDIR LOG ARGS...
-  local label="$1" workdir="$2" log="$3" args="" a dest
-  shift 3
-  for a in "$@"; do
+svc_log() { case "$1" in caddy) echo "$CADDY_LOG" ;; php-*) fpm_log "${1#php-}" ;; esac; }
+
+svc_cmd() { # the command line that runs a service
+  case "$1" in
+    caddy) printf '%s\n' "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" ;;
+    php-*) printf '%s\n' "$(fpm_bin "${1#php-}")" --nodaemonize --fpm-config "$(fpm_conf "${1#php-}")" ;;
+  esac
+}
+
+# --- Linux: systemd user units ---------------------------------------------
+sd() { systemctl --user "$@"; }
+unit_of() { case "$1" in caddy) echo vhosty-caddy.service ;; php-*) echo "vhosty-php@${1#php-}.service" ;; esac; }
+
+write_units() {
+  mkdir -p "$UNIT_DIR" "$LOG_DIR" "$RUN_DIR"
+  cat >"$UNIT_DIR/vhosty-caddy.service" <<EOF
+# Generated by vhosty
+[Unit]
+Description=vhosty: Caddy for *.$VHOSTY_DOMAIN
+
+[Service]
+Type=notify
+EnvironmentFile=$SECRETS_FILE
+ExecStart=$CADDY_BIN run --config $CADDYFILE --adapter caddyfile
+ExecReload=$CADDY_BIN reload --config $CADDYFILE --adapter caddyfile --force
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:$CADDY_LOG
+StandardError=append:$CADDY_LOG
+
+[Install]
+WantedBy=default.target
+EOF
+  cat >"$UNIT_DIR/vhosty-php@.service" <<EOF
+# Generated by vhosty. One instance per PHP version: vhosty-php@8.5
+[Unit]
+Description=vhosty: PHP %i FPM
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/php-fpm%i --nodaemonize --fpm-config $PHP_CONF_DIR/%i/php-fpm.conf
+ExecReload=/bin/kill -USR2 \$MAINPID
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:$LOG_DIR/php-%i.log
+StandardError=append:$LOG_DIR/php-%i.log
+
+[Install]
+WantedBy=default.target
+EOF
+  sd daemon-reload
+}
+
+# Units that exist for PHP versions vhosty no longer uses
+sd_stale_php() {
+  local u v keep
+  keep=" $(php_versions_in_use | tr '\n' ' ') "
+  sd list-units 'vhosty-php@*' --all --plain --no-legend 2>/dev/null | awk '{print $1}' | while IFS= read -r u; do
+    v="${u#vhosty-php@}"; v="${v%.service}"
+    case "$keep" in *" $v "*) ;; *) echo "$u" ;; esac
+  done
+  { ls "$UNIT_DIR/default.target.wants" 2>/dev/null || true; } | grep '^vhosty-php@' | while IFS= read -r u; do
+    v="${u#vhosty-php@}"; v="${v%.service}"
+    case "$keep" in *" $v "*) ;; *) echo "$u" ;; esac
+  done || true
+}
+
+ensure_linger() {
+  [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ] && return 0
+  info "letting your services run at boot, without logging in (asks for your password)"
+  sudo loginctl enable-linger "$VHOSTY_USER" || die "loginctl enable-linger failed"
+}
+
+# --- macOS: launchd ---------------------------------------------------------
+label_of() { echo "$LABEL_PREFIX.$1"; }
+plist_for() { echo "$DAEMON_DIR/$(label_of "$1").plist"; }
+is_loaded() { sudo launchctl print "system/$(label_of "$1")" >/dev/null 2>&1; }
+
+launchd_field() {
+  sudo launchctl print "system/$(label_of "$1")" 2>/dev/null \
+    | awk -F'= ' -v key="$2" '$0 ~ "^\t" key " = " {print $2; exit}' || true
+}
+
+write_plist() { # write_plist NAME
+  local name="$1" args="" a dest
+  while IFS= read -r a; do
     args="$args    <string>$a</string>
 "
-  done
-  dest="$(plist_for "$label")"
+  done <<EOF
+$(svc_cmd "$name")
+EOF
+  dest="$(plist_for "$name")"
   sudo tee "$dest" >/dev/null <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>$label</string>
+  <key>Label</key><string>$(label_of "$name")</string>
   <key>UserName</key><string>$VHOSTY_USER</string>
-  <key>WorkingDirectory</key><string>$workdir</string>
+  <key>WorkingDirectory</key><string>$VHOSTY_DIR</string>
   <key>ProgramArguments</key>
   <array>
 $args  </array>
@@ -489,8 +746,8 @@ $args  </array>
   <dict><key>HOME</key><string>$VHOSTY_HOME_DIR</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$log</string>
-  <key>StandardErrorPath</key><string>$log</string>
+  <key>StandardOutPath</key><string>$(svc_log "$name")</string>
+  <key>StandardErrorPath</key><string>$(svc_log "$name")</string>
 </dict>
 </plist>
 EOF
@@ -498,39 +755,103 @@ EOF
   sudo chmod 644 "$dest"
 }
 
-install_services() {
-  local l
-  mkdir -p "$LOG_DIR" "$RUN_DIR"
-  for l in $LABEL_FPM $LABEL_CADDY; do
-    if is_loaded "$l"; then sudo launchctl bootout "system/$l" 2>/dev/null || true; fi
+# Daemons for services vhosty no longer runs, including 0.1's link.vhosty.php-fpm
+launchd_stale() {
+  local f name keep
+  keep=" $(svc_all | tr '\n' ' ') "
+  for f in "$DAEMON_DIR/$LABEL_PREFIX".*.plist; do
+    [ -f "$f" ] || continue
+    name="${f##*/$LABEL_PREFIX.}"; name="${name%.plist}"
+    case "$keep" in *" $name "*) ;; *) echo "$name" ;; esac
   done
-  sleep 1
-  if php_enabled; then
-    write_plist "$LABEL_FPM" "$VHOSTY_DIR" "$FPM_LOG" "$FPM_BIN" -y "$FPM_CONF"
-    sudo launchctl bootstrap system "$(plist_for "$LABEL_FPM")"
-    ok "started $LABEL_FPM"
-  elif [ -f "$(plist_for "$LABEL_FPM")" ]; then
-    sudo rm -f "$(plist_for "$LABEL_FPM")"
-  fi
-  write_plist "$LABEL_CADDY" "$VHOSTY_DIR" "$CADDY_LOG" \
-    "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE"
-  sudo launchctl bootstrap system "$(plist_for "$LABEL_CADDY")"
-  ok "started $LABEL_CADDY"
 }
 
-restart_label() {
-  if is_loaded "$1"; then
-    sudo launchctl kickstart -k "system/$1"
+# --- Common ------------------------------------------------------------------
+svc_installed() {
+  if is_linux; then [ -f "$UNIT_DIR/vhosty-caddy.service" ]; else [ -f "$(plist_for caddy)" ]; fi
+}
+
+svc_state() { # running | stopped | failed | ...
+  local s
+  if is_linux; then
+    s="$(sd show -p ActiveState --value "$(unit_of "$1")" 2>/dev/null || true)"
+    case "$s" in active|reloading) echo running ;; inactive|"") echo stopped ;; *) echo "$s" ;; esac
   else
-    sudo launchctl bootstrap system "$(plist_for "$1")"
+    s="$(launchd_field "$1" state)"
+    echo "${s:-stopped}"
   fi
+}
+
+svc_pid() {
+  if is_linux; then sd show -p MainPID --value "$(unit_of "$1")" 2>/dev/null || true
+  else launchd_field "$1" pid; fi
+}
+
+svc_start() {
+  if is_linux; then sd enable --now --quiet "$(unit_of "$1")"
+  elif is_loaded "$1"; then sudo launchctl kickstart "system/$(label_of "$1")"
+  else sudo launchctl bootstrap system "$(plist_for "$1")"; fi
+}
+
+svc_stop() {
+  if is_linux; then sd stop "$(unit_of "$1")"
+  elif is_loaded "$1"; then sudo launchctl bootout "system/$(label_of "$1")" 2>/dev/null || true; fi
+}
+
+svc_restart() {
+  if is_linux; then sd enable --quiet "$(unit_of "$1")"; sd restart "$(unit_of "$1")"
+  elif is_loaded "$1"; then sudo launchctl kickstart -k "system/$(label_of "$1")"
+  else sudo launchctl bootstrap system "$(plist_for "$1")"; fi
+}
+
+# Graceful where the platform allows: Caddy keeps connections, FPM finishes requests
+svc_reload() {
+  if is_linux; then sd enable --quiet "$(unit_of "$1")"; sd reload-or-restart "$(unit_of "$1")"
+  else svc_restart "$1"; fi
+}
+
+svc_remove() {
+  if is_linux; then
+    sd disable --now --quiet "$1" 2>/dev/null || true
+  else
+    if is_loaded "$1"; then sudo launchctl bootout "system/$(label_of "$1")" 2>/dev/null || true; fi
+    sudo rm -f "$(plist_for "$1")"
+  fi
+}
+
+# Installs or refreshes every service definition, starts what's needed and
+# removes what isn't. Used by setup and rebuild.
+svc_sync() {
+  local s
+  mkdir -p "$LOG_DIR" "$RUN_DIR"
+  if is_linux; then
+    write_units
+    for s in $(sd_stale_php | sort -u); do svc_remove "$s"; ok "stopped $s (no longer used)"; done
+  else
+    sudo -v
+    for s in $(launchd_stale); do svc_remove "$s"; ok "removed $(label_of "$s") (no longer used)"; done
+    for s in $(svc_all); do
+      if is_loaded "$s"; then sudo launchctl bootout "system/$(label_of "$s")" 2>/dev/null || true; fi
+      write_plist "$s"
+    done
+    sleep 1
+  fi
+}
+
+# Starts what isn't running, reloads what is
+svc_apply() {
+  local s
+  for s in $(svc_all); do
+    if [ "$(svc_state "$s")" = "running" ]; then svc_reload "$s"; ok "reloaded $s"
+    else svc_start "$s"; ok "started $s"; fi
+  done
 }
 
 # ---------------------------------------------------------------------------
 # Commands: setup
 # ---------------------------------------------------------------------------
 cmd_setup() {
-  local domain="" token="" park="" php="" yes=0 ip o
+  local domain="" token="" park="" php="" yes=0 ip o v
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) domain="$2"; shift 2 ;;
@@ -544,21 +865,26 @@ cmd_setup() {
   done
   [ "$yes" = "1" ] && export VHOSTY_YES=1
 
-  is_macos || die "vhosty setup supports macOS only for now (launchd services)"
   load_config
 
-  printf "%svhosty setup%s\n" "$B" "$N"
+  printf "%svhosty setup%s (%s)\n" "$B" "$N" "$PLATFORM"
 
   step "Checking this machine"
   ip="$(ts_ip)"
   [ -n "$ip" ] || die "Tailscale isn't running, or its CLI wasn't found. Install and sign in first: https://tailscale.com/download"
   ok "Tailscale IP: $ip"
+  if is_linux; then
+    command -v jq >/dev/null 2>&1 || die "vhosty needs jq: sudo apt install jq"
+    command -v systemctl >/dev/null 2>&1 || die "vhosty on Linux needs systemd"
+  fi
   o="$(port_owner 443)"
   if [ -n "$o" ] && [ "$o" != "caddy" ]; then
     warn "port 443 is in use by: $o"
-    warn "Herd and Valet use 443. Stop them, or vhosty's Caddy can't start."
+    warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."
     confirm "Continue anyway?" N || exit 1
   fi
+  migrate_config
+  migrate_php_fpm
 
   step "Domain"
   info "A domain whose DNS is on Cloudflare. vhosty points *.domain at this machine."
@@ -586,7 +912,7 @@ cmd_setup() {
 
   step "Parked folders"
   info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
-  [ -n "$park" ] || park="$(ask "Folder to park" "${VHOSTY_PARKED:-$VHOSTY_HOME_DIR/Sites}")"
+  [ -n "$park" ] || park="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
   park="$(eval echo "$park")"
   [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
   park="$(cd "$park" && pwd)"
@@ -594,38 +920,50 @@ cmd_setup() {
     *":$park:"*) ;;
     *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
   esac
-  ok "parked $park"
+  parked_list | while IFS= read -r o; do ok "parked $o"; done
 
   step "PHP"
   if [ -z "$php" ]; then
     if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
   fi
   VHOSTY_PHP="$php"
+  if php_enabled; then
+    v="$(php_default)"
+    [ -n "$v" ] || v="$(php_cli_minor)"
+    php_is_installed "${v:-none}" || install_php_fpm "$v"
+    v="$(php_default)"
+    [ -n "$v" ] || die "No PHP-FPM found"
+    VHOSTY_PHP_DEFAULT="$v"
+    ok "default PHP: $v ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') installed)"
+    write_default_php_ini
+    info "PHP settings for every site: $PHP_INI"
+  fi
   save_config
 
-  step "Downloading"
-  if [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then
+  step "Caddy"
+  if caddy_installed; then
+    caddy_allow_ports
     ok "Caddy already installed ($("$CADDY_BIN" version | awk '{print $1}'))"
   else
     install_caddy
-  fi
-  if php_enabled; then
-    if [ -x "$FPM_BIN" ]; then ok "PHP-FPM already installed ($("$FPM_BIN" -v 2>/dev/null | head -1 | awk '{print $2}'))"; else install_php_fpm; fi
   fi
 
   step "DNS"
   dns_sync
 
   step "Config"
-  write_caddyfile
-  php_enabled && write_fpm_conf
-  "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" >/dev/null 2>&1 \
-    || die "Generated Caddyfile didn't validate. Run: vhosty validate"
+  write_configs
+  cmd_validate >/dev/null || { cmd_validate || true; die "Generated config didn't validate"; }
   ok "wrote $CADDYFILE"
 
-  step "Services (asks for your password)"
-  sudo -v
-  install_services
+  if is_linux; then
+    step "Services (systemd, as $VHOSTY_USER)"
+    ensure_linger
+  else
+    step "Services (asks for your password)"
+  fi
+  svc_sync
+  svc_apply
 
   step "Waiting for the certificate"
   local n=0
@@ -686,14 +1024,12 @@ cmd_parked() {
 
 cmd_rebuild() {
   need_config
-  write_caddyfile
-  php_enabled && write_fpm_conf
+  write_configs
   ok "regenerated config"
-  if [ -f "$(plist_for "$LABEL_CADDY")" ]; then
-    cmd_validate caddy >/dev/null || { cmd_validate caddy; die "Not restarting. Fix the errors above."; }
-    restart_label "$LABEL_CADDY"
-    ok "restarted Caddy"
-    if php_enabled && [ -f "$(plist_for "$LABEL_FPM")" ]; then restart_label "$LABEL_FPM"; ok "restarted PHP-FPM"; fi
+  if svc_installed; then
+    cmd_validate >/dev/null || { cmd_validate || true; die "Not applying. Fix the errors above."; }
+    svc_sync
+    svc_apply
   fi
 }
 
@@ -701,65 +1037,49 @@ cmd_rebuild() {
 # Commands: services
 # ---------------------------------------------------------------------------
 need_installed() {
-  [ -f "$(plist_for "$LABEL_CADDY")" ] || die "Services aren't installed. Run: vhosty setup"
+  svc_installed || die "Services aren't installed. Run: vhosty setup"
 }
 
 cmd_start() {
   need_config; need_installed
-  local l
-  svc_labels "${1:-all}" >/dev/null
-  for l in $(svc_labels "${1:-all}"); do
-    if is_loaded "$l"; then sudo launchctl kickstart "system/$l"; else sudo launchctl bootstrap system "$(plist_for "$l")"; fi
-    ok "started $l"
-  done
+  local s
+  for s in $(svc_resolve "${1:-all}"); do svc_start "$s"; ok "started $s"; done
 }
 
 cmd_stop() {
   need_config
-  local l
-  svc_labels "${1:-all}" >/dev/null
-  for l in $(svc_labels "${1:-all}"); do
-    if is_loaded "$l"; then
-      sudo launchctl bootout "system/$l" 2>/dev/null || true
-      ok "stopped $l"
-    else
-      warn "$l isn't running"
-    fi
+  local s
+  for s in $(svc_resolve "${1:-all}"); do
+    if [ "$(svc_state "$s")" = "running" ]; then svc_stop "$s"; ok "stopped $s"
+    else warn "$s isn't running"; fi
   done
 }
 
 cmd_restart() {
   need_config; need_installed
-  local l
-  svc_labels "${1:-all}" >/dev/null
-  for l in $(svc_labels "${1:-all}"); do
-    if [ "$l" = "$LABEL_CADDY" ]; then cmd_validate caddy >/dev/null || { cmd_validate caddy; die "Not restarting Caddy."; }; fi
-    if [ "$l" = "$LABEL_FPM" ]; then cmd_validate php-fpm >/dev/null || { cmd_validate php-fpm; die "Not restarting PHP-FPM."; }; fi
-    restart_label "$l"
-    ok "restarted $l"
-  done
+  local s
+  cmd_validate >/dev/null || { cmd_validate || true; die "Not restarting. Fix the errors above."; }
+  for s in $(svc_resolve "${1:-all}"); do svc_restart "$s"; ok "restarted $s"; done
 }
 
 cmd_status() {
   need_config
-  sudo -v
-  local ip l s p o
+  is_macos && sudo -v
+  local ip s st p o v
   ip="$(ts_ip)"
   printf "%svhosty%s  *.%s  →  %s\n" "$B" "$N" "$VHOSTY_DOMAIN" "${ip:-tailscale not running}"
   head_ "Services"
-  for l in $(all_labels); do
-    s="$(svc_field "$l" state)"
-    p="$(svc_field "$l" pid)"
-    if [ "$s" = "running" ]; then ok "$l running (pid $p)"
-    elif [ -n "$s" ]; then bad "$l $s (see: vhosty logs)"
-    else bad "$l not loaded (run: vhosty start)"; fi
+  for s in $(svc_all); do
+    st="$(svc_state "$s")"
+    p="$(svc_pid "$s")"
+    if [ "$st" = "running" ]; then ok "$s running (pid $p)"
+    else bad "$s $st (run: vhosty start, or see: vhosty logs $s)"; fi
   done
-  head_ "Ports"
+  head_ "Listening"
   o="$(port_owner 443)"; if [ -n "$o" ]; then ok "443 → $o"; else bad "nothing listening on 443"; fi
-  if php_enabled; then
-    o="$(port_owner "$VHOSTY_FPM_PORT")"
-    if [ -n "$o" ]; then ok "$VHOSTY_FPM_PORT → $o"; else bad "nothing listening on $VHOSTY_FPM_PORT"; fi
-  fi
+  for v in $(php_versions_in_use); do
+    if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v → $(fpm_sock "$v")"; else bad "no socket for PHP $v"; fi
+  done
   echo
 }
 
@@ -767,12 +1087,8 @@ cmd_status() {
 # Commands: logs
 # ---------------------------------------------------------------------------
 log_files() {
-  case "${1:-all}" in
-    caddy)           echo "$CADDY_LOG" ;;
-    php-fpm|fpm|php) echo "$FPM_LOG" ;;
-    all)             echo "$CADDY_LOG $FPM_LOG" ;;
-    *) die "Unknown log '$1' (use caddy, php-fpm, or all)" ;;
-  esac
+  local s
+  for s in $(svc_resolve "${1:-all}"); do svc_log "$s"; done
 }
 
 existing_logs() {
@@ -784,7 +1100,6 @@ existing_logs() {
 
 cmd_logs() {
   local files
-  log_files "${1:-all}" >/dev/null
   files="$(existing_logs "${1:-all}")"
   [ -n "$files" ] || die "No log files yet"
   # shellcheck disable=SC2086
@@ -793,7 +1108,6 @@ cmd_logs() {
 
 cmd_tail() {
   local files
-  log_files "${1:-all}" >/dev/null
   files="$(existing_logs "${1:-all}")"
   [ -n "$files" ] || die "No log files yet"
   # shellcheck disable=SC2086
@@ -815,7 +1129,7 @@ cmd_sites() {
       if ! [[ $name =~ $re ]]; then
         info "$name (not a valid hostname: use letters, numbers, dashes)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
-        printf "  https://%s.%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN"
+        printf "  https://%s.%s  %s(PHP %s)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$(php_default)" "$N"
       elif [ -f "$p/index.html" ]; then
         printf "  https://%s.%s  %s(static)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$N"
       else
@@ -838,41 +1152,42 @@ site_url() {
 cmd_open() {
   local u
   u="$(site_url "${1:-}")"
-  open "$u"
-  ok "opened $u"
+  if open_url "$u"; then ok "opened $u"; else echo "$u"; fi
 }
 
 cmd_url() {
   local u
   u="$(site_url "${1:-}")"
   echo "$u"
-  if printf %s "$u" | pbcopy 2>/dev/null; then info "(copied to clipboard)"; fi
+  if copy_text "$u" 2>/dev/null; then info "(copied to clipboard)"; fi
 }
 
 # ---------------------------------------------------------------------------
 # Commands: config
 # ---------------------------------------------------------------------------
 cmd_validate() {
-  local target="${1:-all}" rc=0
+  local target="${1:-all}" rc=0 v out
   if [ "$target" = "all" ] || [ "$target" = "caddy" ]; then
-    if "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" >/dev/null 2>&1; then
+    load_token
+    if out="$(CF_API_TOKEN="$CF_API_TOKEN" "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"; then
       ok "Caddyfile is valid"
     else
       bad "Caddyfile has errors:"
-      "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" 2>&1 \
-        | grep -iE 'error' | tail -5 | sed 's/^/      /' || true
+      printf '%s\n' "$out" | grep -iE 'error' | tail -5 | sed 's/^/      /' || true
       rc=1
     fi
   fi
-  if { [ "$target" = "all" ] && php_enabled; } || [ "$target" = "php-fpm" ]; then
-    if "$FPM_BIN" -t -y "$FPM_CONF" >/dev/null 2>&1; then
-      ok "php-fpm.conf is valid"
-    else
-      bad "php-fpm.conf has errors:"
-      "$FPM_BIN" -t -y "$FPM_CONF" 2>&1 | tail -5 | sed 's/^/      /' || true
-      rc=1
-    fi
-  fi
+  case "$target" in all|php|php-fpm)
+    for v in $(php_versions_in_use); do
+      if out="$("$(fpm_bin "$v")" -t --fpm-config "$(fpm_conf "$v")" 2>&1)"; then
+        ok "PHP $v FPM config is valid"
+      else
+        bad "PHP $v FPM config has errors:"
+        printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+        rc=1
+      fi
+    done ;;
+  esac
   return $rc
 }
 
@@ -880,8 +1195,9 @@ cmd_edit() {
   need_config
   case "${1:-config}" in
     config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
-    env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; restart_label "$LABEL_CADDY"; ok "restarted Caddy" ;;
-    *) die "Unknown file '$1' (use config or env)" ;;
+    php|ini|php.ini) write_default_php_ini; ${EDITOR:-nano} "$PHP_INI"; cmd_rebuild ;;
+    env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; svc_restart caddy; ok "restarted caddy" ;;
+    *) die "Unknown file '$1' (use config, php, or env)" ;;
   esac
 }
 
@@ -900,7 +1216,11 @@ cmd_cert() {
 cmd_dns() {
   need_config
   case "${1:-sync}" in
-    sync) dns_sync ;;
+    sync)
+      dns_sync
+      # Caddy listens on the Tailscale IP, so a new IP needs a new Caddyfile
+      if svc_installed && ! grep -q "default_bind $(ts_ip) " "$CADDYFILE" 2>/dev/null; then cmd_rebuild; fi
+      ;;
     *) die "Usage: vhosty dns sync" ;;
   esac
 }
@@ -909,26 +1229,39 @@ cmd_update() {
   need_config
   case "${1:-all}" in
     caddy) install_caddy ;;
-    php|php-fpm) php_enabled || die "PHP is turned off"; install_php_fpm "${2:-}" ;;
-    all) install_caddy; if php_enabled; then install_php_fpm; fi ;;
+    php|php-fpm)
+      php_enabled || die "PHP is turned off"
+      is_macos || die "On Linux, PHP comes from apt: sudo apt update && sudo apt upgrade"
+      install_php_fpm "${2:-$(php_default)}" ;;
+    all)
+      install_caddy
+      if php_enabled && is_macos; then install_php_fpm "$(php_default)"; fi ;;
     *) die "Usage: vhosty update [caddy|php [8.x]]" ;;
   esac
-  if [ -f "$(plist_for "$LABEL_CADDY")" ]; then cmd_restart all; fi
+  if svc_installed; then cmd_restart all; fi
 }
 
 cmd_paths() {
+  local s
   cat <<EOF
   vhosty dir    $VHOSTY_DIR
   Config        $CONFIG_FILE
+  PHP settings  $PHP_INI
   Token         $SECRETS_FILE
   Caddyfile     $CADDYFILE
-  php-fpm.conf  $FPM_CONF
+  FPM configs   $PHP_CONF_DIR/<version>/php-fpm.conf
   Binaries      $BIN_DIR
   Logs          $LOG_DIR
-  Services      $(plist_for "$LABEL_CADDY")
-                $(plist_for "$LABEL_FPM")
-  Certificates  $CADDY_CERTS
+  Sockets       $RUN_DIR
 EOF
+  if is_linux; then
+    printf "  Services      %s/vhosty-caddy.service\n" "$UNIT_DIR"
+    printf "                %s/vhosty-php@.service\n" "$UNIT_DIR"
+  else
+    printf "  Services      %s\n" "$(plist_for caddy)"
+    for s in $(svc_all); do [ "$s" = caddy ] || printf "                %s\n" "$(plist_for "$s")"; done
+  fi
+  printf "  Certificates  %s\n" "$CADDY_CERTS"
 }
 
 # ---------------------------------------------------------------------------
@@ -937,8 +1270,8 @@ EOF
 cmd_doctor() {
   need_config
   FAILED=0
-  sudo -v
-  local ip probe resolved l s code o
+  is_macos && sudo -v
+  local ip probe resolved s st code o v
   ip="$(ts_ip)"
   probe="vhosty-doctor.$VHOSTY_DOMAIN"
   printf "%svhosty doctor%s  (*.%s)\n" "$B" "$N" "$VHOSTY_DOMAIN"
@@ -957,28 +1290,37 @@ cmd_doctor() {
   head_ "Caddy"
   if [ -x "$CADDY_BIN" ]; then ok "binary: $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}')"; else bad "Caddy missing. Run: vhosty update caddy"; fi
   if "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then ok "Cloudflare DNS plugin"; else bad "Caddy is missing the Cloudflare plugin. Run: vhosty update caddy"; fi
+  if is_linux; then
+    if getcap "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service; then ok "allowed to use ports 80 and 443"; else bad "Caddy can't bind 80/443. Run: vhosty setup"; fi
+  fi
   if [ -s "$SECRETS_FILE" ]; then ok "token file present"; else bad "Missing $SECRETS_FILE. Run: vhosty setup"; fi
   cmd_validate caddy || true
   cmd_cert || true
 
   if php_enabled; then
-    head_ "PHP-FPM"
-    if [ -x "$FPM_BIN" ]; then ok "binary: $("$FPM_BIN" -v 2>/dev/null | head -1)"; else bad "php-fpm missing. Run: vhosty update php"; fi
-    cmd_validate php-fpm || true
+    head_ "PHP"
+    for v in $(php_versions_in_use); do
+      if php_is_installed "$v"; then ok "PHP $v: $("$(fpm_bin "$v")" -v 2>/dev/null | head -1 | awk '{print $2}')"
+      else bad "PHP $v isn't installed"; fi
+    done
+    cmd_validate php || true
   fi
 
   head_ "Services"
-  for l in $(all_labels); do
-    s="$(svc_field "$l" state)"
-    if [ "$s" = "running" ]; then ok "$l running"
-    elif [ -f "$(plist_for "$l")" ]; then bad "$l ${s:-not loaded}. Run: vhosty start"
-    else bad "$l not installed. Run: vhosty setup"; fi
+  if is_linux; then
+    if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
+    else bad "services won't start until you log in. Run: vhosty setup"; fi
+  fi
+  for s in $(svc_all); do
+    st="$(svc_state "$s")"
+    if [ "$st" = "running" ]; then ok "$s running"
+    elif svc_installed; then bad "$s $st. Run: vhosty start (logs: vhosty logs $s)"
+    else bad "$s not installed. Run: vhosty setup"; fi
   done
   o="$(port_owner 443)"; if [ -n "$o" ]; then ok "443 → $o"; else bad "nothing listening on 443"; fi
-  if php_enabled; then
-    o="$(port_owner "$VHOSTY_FPM_PORT")"
-    if [ -n "$o" ]; then ok "$VHOSTY_FPM_PORT → $o"; else bad "nothing listening on $VHOSTY_FPM_PORT"; fi
-  fi
+  for v in $(php_versions_in_use); do
+    if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v socket"; else bad "no socket for PHP $v"; fi
+  done
 
   head_ "End to end"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$probe/" 2>/dev/null || true)"
@@ -1001,12 +1343,21 @@ cmd_doctor() {
 # Command: uninstall
 # ---------------------------------------------------------------------------
 cmd_uninstall() {
-  local l
+  local s
   confirm "Stop and remove the vhosty services? (~/.vhosty and your DNS record stay)" N || { info "Cancelled."; return 0; }
-  for l in $LABEL_CADDY $LABEL_FPM; do
-    if is_loaded "$l"; then sudo launchctl bootout "system/$l" 2>/dev/null || true; fi
-    if [ -f "$(plist_for "$l")" ]; then sudo rm -f "$(plist_for "$l")"; ok "removed $l"; fi
-  done
+  if is_linux; then
+    for s in $(sd list-unit-files 'vhosty-*' --plain --no-legend 2>/dev/null | awk '{print $1}'; sd list-units 'vhosty-php@*' --all --plain --no-legend 2>/dev/null | awk '{print $1}'); do
+      svc_remove "$s"
+    done
+    rm -f "$UNIT_DIR/vhosty-caddy.service" "$UNIT_DIR/vhosty-php@.service"
+    sd daemon-reload
+    ok "removed the systemd user services"
+    info "Linger stays on (other user services may need it). To turn it off: sudo loginctl disable-linger $VHOSTY_USER"
+  else
+    for s in $(svc_all) $(launchd_stale); do
+      if [ -f "$(plist_for "$s")" ]; then svc_remove "$s"; ok "removed $(label_of "$s")"; fi
+    done
+  fi
   info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record in Cloudflare."
 }
 
@@ -1030,18 +1381,18 @@ ${B}Sites${N}
   vhosty url  [site|port]            Print the URL and copy it
 
 ${B}Services${N}
-  vhosty start   [caddy|php-fpm]     Start services (default: all)
-  vhosty stop    [caddy|php-fpm]     Stop services
-  vhosty restart [caddy|php-fpm]     Validate config, then restart
-  vhosty status                      Service state, PIDs, and ports
-  vhosty logs [caddy|php-fpm] [N]    Show the last N log lines (default 100)
-  vhosty tail [caddy|php-fpm]        Follow logs live
+  vhosty start   [caddy|php|php-8.x] Start services (default: all)
+  vhosty stop    [caddy|php|php-8.x] Stop services
+  vhosty restart [caddy|php|php-8.x] Validate config, then restart
+  vhosty status                      Service state, PIDs, and sockets
+  vhosty logs [service] [N]          Show the last N log lines (default 100)
+  vhosty tail [service]              Follow logs live
 
 ${B}Config${N}
-  vhosty edit [config|env]           Edit settings or the token, then apply
-  vhosty rebuild                     Regenerate the Caddyfile and restart
+  vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply
+  vhosty rebuild                     Regenerate config and reload services
   vhosty dns sync                    Point *.domain at this machine's Tailscale IP
-  vhosty update [caddy|php [8.x]]    Re-download Caddy or PHP-FPM
+  vhosty update [caddy|php [8.x]]    Re-download Caddy (or PHP-FPM, on macOS)
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry
   vhosty doctor                      Check DNS, certs, services, and HTTPS end to end

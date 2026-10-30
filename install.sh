@@ -18,7 +18,10 @@ if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; N=$'\033[0m'; else
 ok()  { printf "  %s✓%s %s\n" "$G" "$N" "$*"; }
 die() { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = "Darwin" ] || die "vhosty supports macOS only for now"
+case "$(uname -s)" in
+  Darwin|Linux) ;;
+  *) die "vhosty supports macOS and Linux" ;;
+esac
 
 printf "%sInstalling vhosty%s\n" "$B" "$N"
 mkdir -p "$VHOSTY_DIR/bin" "$VHOSTY_DIR/completions"
@@ -43,7 +46,11 @@ else
 fi
 chmod +x "$VHOSTY_DIR/bin/vhosty"
 
-# Put it on the PATH
+# Put it on the PATH: ~/.local/bin when it's already on the PATH (most Linux
+# setups), otherwise /usr/local/bin
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) LINK="$HOME/.local/bin/vhosty"; mkdir -p "$HOME/.local/bin" ;;
+esac
 linked=0
 if [ -d "$(dirname "$LINK")" ] && [ -w "$(dirname "$LINK")" ]; then
   ln -sf "$VHOSTY_DIR/bin/vhosty" "$LINK" && linked=1

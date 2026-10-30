@@ -99,6 +99,7 @@ Already on PATH via `.zshrc`, ahead of `/usr/bin`. On each call it:
    `SITE_INI`.
 
 `composer` (`#!/usr/bin/env php`) and `php artisan` go through the shim automatically.
+`VHOSTY_PHP_VERSION=8.4 php ...` overrides the version for one command.
 Adds a few milliseconds per call; no daemons.
 
 ## Commands

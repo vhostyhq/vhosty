@@ -41,6 +41,11 @@ PHP_CONF_DIR="$VHOSTY_DIR/php"
 LOG_DIR="$VHOSTY_DIR/logs"
 RUN_DIR="$VHOSTY_DIR/run"
 CADDY_LOG="$LOG_DIR/caddy.log"
+SITES_DIR="$VHOSTY_DIR/sites"
+PHP_SHIM="$BIN_DIR/php"
+
+# Installed with `vhosty php install` (Linux: phpX.Y-<name> apt packages)
+PHP_PACKAGES="cli fpm common mysql pgsql sqlite3 redis mbstring xml curl zip bcmath intl gd readline igbinary"
 
 # macOS: launchd system daemons
 DAEMON_DIR="${VHOSTY_DAEMON_DIR:-/Library/LaunchDaemons}"
@@ -424,11 +429,25 @@ php_default() {
   if [ -n "$VHOSTY_PHP_DEFAULT" ]; then echo "$VHOSTY_PHP_DEFAULT"; else php_installed_versions | head -1; fi
 }
 
-# Versions that need a running FPM
+# Versions that need a running FPM: the default, plus every pinned version
 php_versions_in_use() {
+  local name
   php_enabled || return 0
-  php_default
+  {
+    php_default
+    for name in $(site_names); do
+      site_load "$name"
+      [ -n "$SITE_PHP" ] && php_is_installed "$SITE_PHP" && echo "$SITE_PHP"
+    done
+  } | grep . | awk '!seen[$0]++' || true
 }
+
+# The version a site actually runs: its pin if that's installed, else the default
+site_php() { # after site_load
+  if [ -n "$SITE_PHP" ] && php_is_installed "$SITE_PHP"; then echo "$SITE_PHP"; else php_default; fi
+}
+
+valid_version() { printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+$' || die "'$1' isn't a PHP version (use e.g. 8.4)"; }
 
 # PHP on PATH outside vhosty's shim, for picking a default on first setup
 php_cli_minor() {
@@ -506,8 +525,139 @@ ini_pairs() {
 }
 
 # ---------------------------------------------------------------------------
+# Sites: ~/.vhosty/sites/<name>.conf, one per site that differs from the
+# defaults (linked, PHP version pinned, PHP settings). Nothing is stored in
+# the project folders.
+# ---------------------------------------------------------------------------
+valid_name() { printf '%s' "$1" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+site_file() { echo "$SITES_DIR/$1.conf"; }
+
+site_names() {
+  local f
+  for f in "$SITES_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    f="${f##*/}"; echo "${f%.conf}"
+  done
+}
+
+site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI
+  SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""
+  # shellcheck disable=SC1090
+  if [ -f "$(site_file "$1")" ]; then . "$(site_file "$1")"; fi
+}
+
+# Writes the loaded SITE_* values, or removes the file when nothing differs
+# from the defaults any more
+site_save() {
+  local f
+  f="$(site_file "$1")"
+  if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ]; then
+    rm -f "$f"
+    return 0
+  fi
+  mkdir -p "$SITES_DIR"
+  {
+    echo "# vhosty site: https://$1.$VHOSTY_DOMAIN. Change with vhosty commands, or edit and run: vhosty rebuild"
+    printf 'SITE_PATH=%q\n' "$SITE_PATH"
+    printf 'SITE_LINKED=%q\n' "$SITE_LINKED"
+    printf 'SITE_PHP=%q\n' "$SITE_PHP"
+    printf 'SITE_INI=%q\n' "$SITE_INI"
+  } >"$f"
+}
+
+# Site name for a folder: a configured site whose path contains it (deepest
+# wins), else the folder directly inside a parked folder
+site_from_dir() {
+  local dir="$1" name best="" bestlen=0 p rest
+  for name in $(site_names); do
+    site_load "$name"
+    [ -n "$SITE_PATH" ] || continue
+    case "$dir/" in
+      "$SITE_PATH"/*) if [ ${#SITE_PATH} -gt $bestlen ]; then best="$name"; bestlen=${#SITE_PATH}; fi ;;
+    esac
+  done
+  if [ -n "$best" ]; then echo "$best"; return 0; fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$dir/" in
+      "$p"/*/*) rest="${dir#"$p"/}"; lower "${rest%%/*}"; return 0 ;;
+    esac
+  done <<EOF
+$(parked_list)
+EOF
+  return 1
+}
+
+# Folder a site is served from: its configured path, else <parked>/<name>
+site_dir() {
+  local name="$1" p f
+  site_load "$name"
+  if [ -n "$SITE_PATH" ]; then echo "$SITE_PATH"; return 0; fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    for f in "$p"/*/; do
+      f="${f%/}"
+      [ -d "$f" ] && [ "$(lower "${f##*/}")" = "$name" ] && { echo "$f"; return 0; }
+    done
+  done <<EOF
+$(parked_list)
+EOF
+  return 1
+}
+
+# Site name from an argument (a name) or the current folder
+resolve_site() {
+  local name
+  if [ -n "${1:-}" ]; then
+    name="$(lower "$1")"
+  else
+    name="$(site_from_dir "$PWD")" || die "$PWD isn't inside a site. Pass a site name, or cd into one."
+  fi
+  valid_name "$name" || die "'$name' isn't a valid site name (letters, numbers, dashes)"
+  echo "$name"
+}
+
+# ---------------------------------------------------------------------------
 # Generated config
 # ---------------------------------------------------------------------------
+# Rules for configured sites. They come before the parked wildcards, so a pin
+# or a link wins over the default.
+caddy_sites() {
+  local name dir v
+  for name in $(site_names); do
+    site_load "$name"
+    dir="$(site_dir "$name" || true)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      printf '\n\t# Site: %s (skipped: folder %s not found)\n' "$name" "${dir:-?}"
+      continue
+    fi
+    if php_enabled && { [ -f "$dir/public/index.php" ] || [ ! -f "$dir/index.html" ]; }; then
+      v="$(site_php)"
+      cat <<EOF
+
+	# Site: $name → $dir (PHP $v)
+	@site_$name host $name.$VHOSTY_DOMAIN
+	handle @site_$name {
+		root * "$dir/public"
+		php_fastcgi unix/$(fpm_sock "$v")
+		file_server
+	}
+EOF
+    else
+      cat <<EOF
+
+	# Site: $name → $dir (static)
+	@site_$name host $name.$VHOSTY_DOMAIN
+	handle @site_$name {
+		root * "$dir"
+		file_server
+	}
+EOF
+    fi
+  done
+}
+
 write_caddyfile() {
   local depth i=0 dir v ip bind
   depth="$(domain_depth)"
@@ -533,6 +683,7 @@ write_caddyfile() {
 		reverse_proxy localhost:{re.port.1}
 	}
 EOF
+    caddy_sites
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
       if php_enabled && [ -n "$v" ]; then
@@ -604,10 +755,72 @@ EOF
   } >"$(fpm_conf "$v")"
 }
 
+# ~/.vhosty/bin/php: runs the PHP version (and settings) of the site you're in,
+# so `php`, `php artisan` and `composer` match what the browser gets.
+# Standalone and quick: it reads the config files directly.
+write_shim() {
+  mkdir -p "$BIN_DIR"
+  cat >"$PHP_SHIM.tmp" <<'SHIM'
+#!/usr/bin/env bash
+# Generated by vhosty: runs the PHP version pinned for the current folder
+# (vhosty isolate), with the settings in ~/.vhosty/php.ini.
+# VHOSTY_PHP_VERSION=8.4 php ...  overrides the version for one command.
+VHOSTY_DIR="${VHOSTY_DIR:-$HOME/.vhosty}"
+VHOSTY_PHP_DEFAULT=""
+# shellcheck disable=SC1091
+[ -f "$VHOSTY_DIR/config" ] && . "$VHOSTY_DIR/config"
+
+v="${VHOSTY_PHP_VERSION:-}" best=0 ini=""
+for f in "$VHOSTY_DIR"/sites/*.conf; do
+  [ -f "$f" ] || continue
+  SITE_PATH="" SITE_PHP="" SITE_INI=""
+  # shellcheck disable=SC1090
+  . "$f"
+  [ -n "$SITE_PATH" ] || continue
+  case "$PWD/" in
+    "$SITE_PATH"/*)
+      if [ ${#SITE_PATH} -gt $best ]; then
+        best=${#SITE_PATH}; ini="$SITE_INI"
+        [ -n "${VHOSTY_PHP_VERSION:-}" ] || v="$SITE_PHP"
+      fi ;;
+  esac
+done
+v="${v:-$VHOSTY_PHP_DEFAULT}"
+
+real=""
+for c in "/usr/bin/php$v" "/usr/local/bin/php$v" "$VHOSTY_DIR/bin/php-$v"; do
+  [ -n "$v" ] && [ -x "$c" ] && { real="$c"; break; }
+done
+if [ -z "$real" ]; then # next php on the PATH that isn't this shim
+  IFS=:
+  for d in $PATH; do
+    [ "$d" = "$VHOSTY_DIR/bin" ] && continue
+    [ -x "$d/php" ] && { real="$d/php"; break; }
+  done
+  unset IFS
+fi
+[ -n "$real" ] || { echo "vhosty: no PHP ${v:-found} (vhosty php install $v)" >&2; exit 127; }
+
+# Settings: ~/.vhosty/php.ini, then the site's own
+args=()
+while IFS= read -r kv; do
+  [ -n "$kv" ] && args+=(-d "$kv")
+done <<EOF
+$( [ -f "$VHOSTY_DIR/php.ini" ] && sed -e 's/^[[:space:]]*//' -e '/^[;#[]/d' -e 's/[[:space:]]*$//' "$VHOSTY_DIR/php.ini" \
+     | grep '=' | sed -E 's/^([^=[:space:]]+)[[:space:]]*=[[:space:]]*/\1=/' )
+$ini
+EOF
+exec "$real" ${args[@]+"${args[@]}"} "$@"
+SHIM
+  chmod 755 "$PHP_SHIM.tmp"
+  mv "$PHP_SHIM.tmp" "$PHP_SHIM"
+}
+
 write_configs() {
   local v
   write_caddyfile
   for v in $(php_versions_in_use); do write_fpm_conf "$v"; done
+  if php_enabled; then write_shim; else rm -f "$PHP_SHIM"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1297,132 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------------------
+# Commands: PHP versions
+# ---------------------------------------------------------------------------
+cmd_php() {
+  local sub="${1:-list}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    list|ls)          cmd_php_list ;;
+    install|add)      cmd_php_install "${1:-}" ;;
+    default|use)      cmd_php_default "${1:-}" ;;
+    which)            cmd_php_which "${1:-}" ;;
+    *) die "Usage: vhosty php [list | install <version> | default <version> | which [site]]" ;;
+  esac
+}
+
+cmd_php_list() {
+  need_config
+  local v def used name pins st
+  def="$(php_default)"
+  used=" $(php_versions_in_use | tr '\n' ' ') "
+  [ -n "$(php_installed_versions)" ] || { info "No PHP installed. Run: vhosty php install 8.5"; return 0; }
+  for v in $(php_installed_versions); do
+    pins=""
+    for name in $(site_names); do
+      site_load "$name"
+      [ "$SITE_PHP" = "$v" ] && pins="${pins:+$pins, }$name"
+    done
+    case "$used" in
+      *" $v "*) st="$(svc_state "php-$v")" ;;
+      *) st="not needed" ;;
+    esac
+    printf "  %sPHP %s%s  %s%s%s%s\n" "$B" "$v" "$N" \
+      "$([ "$v" = "$def" ] && echo "default, ")" "FPM $st" \
+      "$([ -n "$pins" ] && echo ", pinned: $pins")" ""
+  done
+}
+
+cmd_php_install() {
+  local v="$1" pkgs="" e
+  [ -n "$v" ] || die "Usage: vhosty php install <version>"
+  valid_version "$v"
+  if is_macos; then
+    install_php_fpm "$v"
+    info "macOS: this is PHP-FPM for sites; the CLI shim uses the php on your PATH"
+  else
+    for e in $PHP_PACKAGES; do pkgs="$pkgs php$v-$e"; done
+    if ! apt-cache show "php$v-fpm" >/dev/null 2>&1; then
+      die "No php$v-fpm package. Add the PHP repo first: https://packages.sury.org/php/README.txt"
+    fi
+    info "installing PHP $v with apt (asks for your password)"
+    # shellcheck disable=SC2086
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs || die "apt-get install failed"
+    # vhosty runs its own FPM as you; the distro's would sit idle as root
+    sudo systemctl disable --now "php$v-fpm" >/dev/null 2>&1 || true
+    ok "PHP $v installed ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') available)"
+  fi
+  [ -n "$VHOSTY_PHP_DEFAULT" ] || { VHOSTY_PHP_DEFAULT="$v"; save_config; }
+  info "Use it with: vhosty isolate $v (in a project), or: vhosty php default $v"
+}
+
+cmd_php_default() {
+  need_config
+  local v="$1"
+  [ -n "$v" ] || { php_default; return 0; }
+  valid_version "$v"
+  php_is_installed "$v" || die "PHP $v isn't installed. Run: vhosty php install $v"
+  VHOSTY_PHP_DEFAULT="$v"
+  save_config
+  ok "default PHP is now $v"
+  cmd_rebuild
+}
+
+cmd_php_which() { # the version a site (default: current folder) runs
+  need_config
+  local name
+  if [ -z "${1:-}" ] && ! site_from_dir "$PWD" >/dev/null; then php_default; return 0; fi
+  name="$(resolve_site "${1:-}")"
+  site_load "$name"
+  site_php
+}
+
+# ---------------------------------------------------------------------------
+# Commands: isolate (pin a site to a PHP version)
+# ---------------------------------------------------------------------------
+cmd_isolate() {
+  need_config
+  php_enabled || die "PHP is turned off in ~/.vhosty/config"
+  local v="${1:-}" name dir
+  [ -n "$v" ] || die "Usage: vhosty isolate <version> [site]"
+  valid_version "$v"
+  php_is_installed "$v" || die "PHP $v isn't installed. Run: vhosty php install $v"
+  name="$(resolve_site "${2:-}")"
+  dir="$(site_dir "$name")" || die "No folder for '$name' in your parked folders. Run: vhosty sites"
+  site_load "$name"
+  SITE_PATH="$dir"
+  SITE_PHP="$v"
+  site_save "$name"
+  ok "$name now uses PHP $v (web and CLI)"
+  cmd_rebuild
+}
+
+cmd_unisolate() {
+  need_config
+  local name
+  name="$(resolve_site "${1:-}")"
+  site_load "$name"
+  [ -n "$SITE_PHP" ] || { warn "$name isn't pinned; it uses the default PHP ($(php_default))"; return 0; }
+  SITE_PHP=""
+  site_save "$name"
+  ok "$name uses the default PHP again ($(php_default))"
+  cmd_rebuild
+}
+
+cmd_isolated() {
+  need_config
+  local name any=0 note
+  for name in $(site_names); do
+    site_load "$name"
+    [ -n "$SITE_PHP" ] || continue
+    any=1
+    note=""; php_is_installed "$SITE_PHP" || note="  ${R}(not installed: using $(php_default))${N}"
+    printf "  %-24s PHP %s  %s%s%s%s\n" "$name" "$SITE_PHP" "$D" "$SITE_PATH" "$N" "$note"
+  done
+  [ "$any" = "1" ] || info "No pinned sites. Pin one with: vhosty isolate <version> (in the project folder)"
+}
+
+# ---------------------------------------------------------------------------
 # Commands: logs
 # ---------------------------------------------------------------------------
 log_files() {
@@ -1129,7 +1468,8 @@ cmd_sites() {
       if ! [[ $name =~ $re ]]; then
         info "$name (not a valid hostname: use letters, numbers, dashes)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
-        printf "  https://%s.%s  %s(PHP %s)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$(php_default)" "$N"
+        site_load "$(lower "$name")"
+        printf "  https://%s.%s  %s(PHP %s%s)%s\n" "$(lower "$name")" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")" "$N"
       elif [ -f "$p/index.html" ]; then
         printf "  https://%s.%s  %s(static)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$N"
       else
@@ -1380,6 +1720,16 @@ ${B}Sites${N}
   vhosty open [site|port]            Open in the browser (default: current folder)
   vhosty url  [site|port]            Print the URL and copy it
 
+${B}PHP${N}
+  vhosty php [list]                  Installed versions, the default, and pins
+  vhosty php install <version>       Install a PHP version (apt on Linux)
+  vhosty php default [version]       Show or set the default version
+  vhosty php which [site]            The version a site uses (default: current folder)
+  vhosty isolate <version> [site]    Pin a site to a version (default: current folder)
+  vhosty unisolate [site]            Back to the default version
+  vhosty isolated                    List pinned sites
+  ${D}php, php artisan and composer use the site's version inside its folder.${N}
+
 ${B}Services${N}
   vhosty start   [caddy|php|php-8.x] Start services (default: all)
   vhosty stop    [caddy|php|php-8.x] Stop services
@@ -1414,6 +1764,10 @@ main() {
     park|link)          cmd_park "${1:-}" ;;
     unpark|unlink)      cmd_unpark "${1:-}" ;;
     parked)             cmd_parked ;;
+    php)                cmd_php "$@" ;;
+    isolate)            cmd_isolate "${1:-}" "${2:-}" ;;
+    unisolate)          cmd_unisolate "${1:-}" ;;
+    isolated)           cmd_isolated ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;
     url)                cmd_url "${1:-}" ;;

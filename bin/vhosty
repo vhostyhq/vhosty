@@ -91,6 +91,18 @@ step()  { printf "\n%s→ %s%s\n" "$B" "$*" "$N"; }
 head_() { printf "\n%s%s%s\n" "$B" "$*" "$N"; }
 die()   { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
 
+# Temp files and folders, removed when vhosty exits, errors included.
+# make_tmp VAR [-d] sets VAR (no subshell, so the path gets recorded).
+TMP_PATHS=""
+cleanup_tmp() { local p; for p in $TMP_PATHS; do rm -rf "$p"; done; }
+trap cleanup_tmp EXIT
+make_tmp() {
+  local _p
+  _p="$(mktemp ${2:+"$2"})" || die "Couldn't create a temp file"
+  TMP_PATHS="$TMP_PATHS $_p"
+  printf -v "$1" '%s' "$_p"
+}
+
 # Prompts read from the terminal, so they work even when stdin is a pipe.
 # With no terminal at all (scripts, CI), they fall back to the default.
 has_tty() { { : </dev/tty; } 2>/dev/null; }
@@ -393,7 +405,7 @@ install_caddy() {
   arch="$(arch_name)"
   url="https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare"
   mkdir -p "$BIN_DIR"
-  tmp="$(mktemp)"
+  make_tmp tmp
   info "downloading Caddy with the Cloudflare DNS plugin ($os/$arch)"
   download "$url" "$tmp" || die "Caddy download failed"
   chmod 755 "$tmp"
@@ -487,7 +499,7 @@ install_php_fpm() { # install_php_fpm 8.5
   file="$(php_fpm_file "$minor")"
   [ -n "$file" ] || die "No PHP $minor FPM build for this Mac at $PHP_DOWNLOADS. Try: vhosty update php <version>"
   info "downloading $file"
-  tmp="$(mktemp -d)"
+  make_tmp tmp -d
   download "$PHP_DOWNLOADS/$file" "$tmp/php.tar.gz" || die "PHP-FPM download failed"
   tar -xzf "$tmp/php.tar.gz" -C "$tmp"
   found="$(find "$tmp" -type f -name php-fpm | head -1)"
@@ -1146,7 +1158,7 @@ mark_applied() { mkdir -p "$RUN_DIR"; generated_hash >"$APPLIED_STAMP"; }
 # True when the generated files match what the config would generate now
 config_in_sync() {
   local tmp rc=0 v
-  tmp="$(mktemp -d)"
+  make_tmp tmp -d
   ( CADDYFILE="$tmp/Caddyfile"; PHP_CONF_DIR="$tmp/php"; PHP_SHIM="$tmp/php-shim"; write_configs ) >/dev/null 2>&1 || rc=1
   cmp -s "$tmp/Caddyfile" "$CADDYFILE" || rc=1
   for v in $(php_versions_in_use); do cmp -s "$tmp/php/$v/php-fpm.conf" "$(fpm_conf "$v")" || rc=1; done
@@ -1976,16 +1988,15 @@ cmd_ini_edit() {
   ini_scope "$@"
   if [ "$INI_SCOPE" = "global" ]; then
     write_default_php_ini
-    ${EDITOR:-nano} "$PHP_INI"
+    ${EDITOR:-nano} "$PHP_INI" || die "The editor exited with an error. If you saved changes, apply them with: vhosty rebuild"
   else
-    tmp="$(mktemp)"
+    make_tmp tmp
     {
       echo "; PHP settings for $INI_SCOPE only (override ~/.vhosty/php.ini). One per line: key = value"
       ini_current | while IFS= read -r kv; do printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"; done
     } >"$tmp"
-    ${EDITOR:-nano} "$tmp"
+    ${EDITOR:-nano} "$tmp" || die "The editor exited with an error. Nothing was saved."
     ini_store "$(ini_pairs "$tmp")"
-    rm -f "$tmp"
   fi
   ok "saved ($(scope_label))"
   cmd_rebuild

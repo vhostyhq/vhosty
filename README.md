@@ -13,33 +13,45 @@ localhost:5173   →  https://5173.yourdomain.dev
 - Real HTTPS: a trusted Let's Encrypt wildcard certificate, with no browser warnings and no local CA to install.
 - Private: the sites are reachable only from your tailnet. Nothing is exposed to the internet, and no router ports are opened.
 - No per-site setup: drop a folder in, and it's live.
-- Built for an always-on dev box, like an old iMac running your coding agents, that you check from anywhere.
+- Several PHP versions side by side, pinned per site, with per-site PHP settings. The `php` command follows the site you're in.
+- Built for an always-on dev box, like an old iMac running Linux and your coding agents, that you check from anywhere.
+
+Runs on **Linux** (systemd) and **macOS** (launchd).
 
 ## How it works
 
 ```
-your phone ──tailnet──▶ Mac (100.x.y.z)
+your phone ──tailnet──▶ dev box (100.x.y.z)
                          └─ Caddy :443   *.yourdomain.dev, wildcard cert
                               ├─ <port>.yourdomain.dev  → localhost:<port>
-                              ├─ <folder>.yourdomain.dev → PHP-FPM (folder/public/index.php)
-                              └─ <folder>.yourdomain.dev → static (folder/index.html)
+                              ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
+                              └─ <site>.yourdomain.dev  → static (site/index.html)
 ```
 
-1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the Mac's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
+1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the machine's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
 2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through Cloudflare's API, so Let's Encrypt never needs to reach the machine.
-3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port.
-4. **Services:** Caddy and PHP-FPM run as launchd services. They start at boot, before login, and restart if they crash.
+3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on the Tailscale IP and localhost only, not your LAN.
+4. **Services:** Caddy and one PHP-FPM per PHP version in use. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
 
 ## Requirements
 
-- **macOS 13 (Ventura) or newer**, Intel or Apple Silicon. No Homebrew needed.
-- **[Tailscale](https://tailscale.com/download)** on this Mac and on every device you'll browse from.
+- **[Tailscale](https://tailscale.com/download)** on this machine and on every device you'll browse from.
 - **A domain with its DNS on [Cloudflare](https://cloudflare.com)**, either one you own or a new one. It doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
 - **A Cloudflare API token** with *Zone → Read* and *DNS → Edit* for that domain. Create one at dash.cloudflare.com → My Profile → API Tokens, using the "Edit zone DNS" template.
-- **Ports 443 and 9000 free.** Herd and Valet use 443, so stop them first.
+- **Ports 80 and 443 free.** Herd, Valet, nginx and Apache use them, so stop those first.
 
-vhosty downloads its own Caddy (with the Cloudflare plugin built in) and a
-static PHP-FPM build that matches your `php -v`.
+**Linux** (tested on Ubuntu 26.04): systemd, `curl`, `jq`, and PHP from apt. Ubuntu
+ships one PHP version; for several side by side, add Ondřej Surý's repo
+([packages.sury.org/php](https://packages.sury.org/php/README.txt)), then
+`vhosty php install 8.4`. Setup asks for your password twice, once each to let
+your services run at boot (`loginctl enable-linger`) and to let Caddy use ports
+80 and 443 (`setcap`). Nothing else needs root.
+
+**macOS** 13 (Ventura) or newer, Intel or Apple Silicon. No Homebrew needed:
+vhosty downloads static PHP-FPM builds. Starting and stopping services asks for
+your password (launchd daemons).
+
+vhosty downloads its own Caddy, with the Cloudflare plugin built in.
 
 ## Install
 
@@ -49,7 +61,7 @@ cd vhosty && ./install.sh
 vhosty setup
 ```
 
-Once the repo is public, this one-liner will work too:
+Or in one line:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | bash
@@ -57,10 +69,10 @@ curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | b
 
 `vhosty setup` asks for your domain, token, and the folder to park, then:
 
-- downloads Caddy and PHP-FPM into `~/.vhosty/bin`,
+- downloads Caddy into `~/.vhosty/bin` (and PHP-FPM on macOS),
 - creates or fixes the `*.domain` DNS record (DNS only, not proxied),
-- generates the Caddyfile and `php-fpm.conf`,
-- installs and starts the launchd services, and
+- generates the Caddyfile and PHP-FPM configs,
+- installs and starts the services, and
 - waits for the wildcard certificate.
 
 To run it without prompts:
@@ -69,22 +81,35 @@ To run it without prompts:
 vhosty setup --domain box.example.com --token "$CF_TOKEN" --park ~/Sites --yes
 ```
 
+Add `~/.vhosty/bin` to the front of your `PATH` so `php` follows the site you're
+in (see [PHP versions](#php-versions)), and turn on tab completion (zsh):
+
+```bash
+export PATH="$HOME/.vhosty/bin:$PATH"
+fpath=(~/.vhosty/completions $fpath)   # before compinit
+```
+
 ## Usage
 
 | Command | What it does |
 |---|---|
-| `vhosty park [dir]` / `unpark [dir]` | Serve, or stop serving, every folder inside `dir` |
-| `vhosty sites` | List every site and its URL, and flag folders that won't work |
-| `vhosty open [site\|port]` | Open a site. With no argument, it opens the current folder's site |
-| `vhosty url [site\|port]` | Print a site's URL and copy it |
-| `vhosty start\|stop\|restart [caddy\|php-fpm]` | Control the services. `restart` validates the config first |
-| `vhosty status` | Service state, process IDs, and ports |
+| `vhosty park [dir]` / `unpark [dir]` | Serve, or stop serving, every folder inside `dir`. Park as many as you like |
+| `vhosty link [dir] [--name N]` / `unlink [name]` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
+| `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
+| `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
+| `vhosty open [site\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
+| `vhosty php [list\|install\|default\|which]` | PHP versions |
+| `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
+| `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
+| `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
+| `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
+| `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live |
-| `vhosty doctor` | Check Tailscale, DNS, the certificate, services, and a live HTTPS request |
-| `vhosty dns sync` | Re-point `*.domain` at this Mac, for when its Tailscale IP changes |
-| `vhosty update [caddy\|php [8.x]]` | Re-download Caddy or PHP-FPM |
-| `vhosty edit [config\|env]` | Edit the settings or the token, then apply them |
-| `vhosty rebuild` | Regenerate the Caddyfile and restart |
+| `vhosty doctor` | Check Tailscale, DNS, the certificate, config, sites, services, and a live HTTPS request |
+| `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
+| `vhosty update [caddy]` | Re-download Caddy |
+| `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
+| `vhosty rebuild` | Regenerate the config and reload the services |
 
 ### What gets served
 
@@ -93,6 +118,10 @@ For a folder `~/Sites/escrow`:
 - If it has `public/index.php`, vhosty serves it with PHP (Laravel, Symfony, etc.).
 - If it has `index.html`, vhosty serves it as a static site.
 - Folder names become hostnames, so stick to letters, numbers, and dashes.
+
+Folders outside a parked directory can be linked one at a time:
+`vhosty link ~/Projects/My\ App` serves it at `https://my-app.yourdomain.dev`
+(pick another name with `--name`). A link wins over a parked folder with the same name.
 
 Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
 Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
@@ -103,26 +132,90 @@ Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
 with no config. Laravel setup and mixed-content fixes are in
 [docs/laravel-vite.md](docs/laravel-vite.md).
 
+### PHP versions
+
+```bash
+vhosty php install 8.4      # Linux: apt packages with the usual Laravel extensions
+vhosty php default 8.5      # what every site uses unless pinned
+cd ~/Sites/legacy && vhosty isolate 8.4
+vhosty isolated             # list pins
+vhosty unisolate legacy
+```
+
+Pins are stored in `~/.vhosty`, not in your projects. A PHP-FPM runs for each
+version in use and stops when nothing uses it.
+
+With `~/.vhosty/bin` first on your `PATH`, the `php` command (and so
+`php artisan` and `composer`) runs the pinned version, with the same settings as
+the site, anywhere inside its folder. `VHOSTY_PHP_VERSION=8.5 php ...` overrides
+it for one command. On macOS the shim uses the `php` on your `PATH` for versions
+it can't find.
+
+### PHP settings
+
+```bash
+vhosty ini                                  # global settings, plus the current site's
+vhosty ini set memory_limit -1 --global     # every site, web and CLI
+cd ~/Sites/kudos && vhosty ini set max_execution_time 300   # just this site
+vhosty ini set upload_max_filesize 1G --site escrow
+vhosty ini unset max_execution_time
+vhosty ini edit [--global | --site NAME]
+```
+
+Inside a site's folder, `ini` commands change that site; elsewhere, the global
+settings (`~/.vhosty/php.ini`). Site settings replace global ones key by key and
+apply on the web and in the CLI. A site with its own settings gets its own
+PHP-FPM pool, so settings never leak between sites. Settings PHP only reads at
+startup (`extension`, `opcache.memory_consumption`) belong in the distro's php.ini.
+
+### Docker services
+
+Point vhosty at a folder with a `compose.yaml` for your databases and other services:
+
+```bash
+vhosty services dir ~/Sites/services
+vhosty services              # state, health and ports of each service
+vhosty services up           # start everything (or name services)
+vhosty services logs mysql
+vhosty services exec mysql mysql -uroot
+vhosty services pull         # update images and recreate
+```
+
+Docker bypasses the firewall for published ports, so publish them on localhost
+(`"127.0.0.1:3306:3306"`). `vhosty services` and `vhosty doctor` flag any port
+that isn't.
+
 ## Files
 
 ```
 ~/.vhosty/
-├── config          domain, parked folders, PHP on/off (edit, then `vhosty rebuild`)
-├── .env            Cloudflare token (mode 600)
-├── Caddyfile       generated
-├── php-fpm.conf    generated
-├── bin/            vhosty, caddy, php-fpm
-└── logs/           caddy.log, php-fpm.log
-/Library/LaunchDaemons/link.vhosty.caddy.plist
-/Library/LaunchDaemons/link.vhosty.php-fpm.plist
+├── config                 domain, parked folders, default PHP, services folder
+├── php.ini                PHP settings for every site (web and CLI)
+├── sites/<name>.conf      one per site with a link, pin, or its own settings
+├── .env                   Cloudflare token (mode 600)
+├── Caddyfile              generated
+├── php/<version>/         generated PHP-FPM config, one per version
+├── bin/                   vhosty, caddy, php (the CLI shim)
+├── completions/           zsh completion
+├── run/                   sockets
+└── logs/                  caddy.log, php-<version>.log
 ```
+
+Services: `~/.config/systemd/user/vhosty-caddy.service` and `vhosty-php@.service`
+on Linux; `/Library/LaunchDaemons/link.vhosty.*.plist` on macOS.
+
+Edit `config` or `php.ini` by hand if you like, then run `vhosty rebuild`.
 
 ## After a reboot
 
-The services start on their own. Two macOS settings decide whether you can reach them:
+The services start on their own, before anyone logs in. Check with `vhosty status`.
+
+On **macOS**, two settings decide whether you can reach them:
 
 - **Tailscale has to connect without anyone logging in.** The App Store version only connects after login. Either turn on automatic login, or use the standalone Tailscale installer with "run unattended" enabled.
 - **Sleep:** in System Settings → Energy, turn on "Prevent automatic sleeping when the display is off."
+
+On **Linux**, turn off automatic suspend (GNOME: Settings → Power).
 
 ## Troubleshooting
 
@@ -131,25 +224,26 @@ Start with `vhosty doctor`. It checks everything below.
 | Symptom | Fix |
 |---|---|
 | 525 errors, or CORS errors on every asset | The DNS record is proxied (orange cloud). Run `vhosty dns sync`; it sets the record to DNS only. |
-| Site can't be reached | The device you're browsing from isn't on Tailscale, or the Mac is asleep. |
+| Site can't be reached | The device you're browsing from isn't on Tailscale, or the machine is asleep. |
 | Works on one network but not another | Some routers and DNS filters (Pi-hole, NextDNS) block public names that resolve to private IPs. Allowlist your domain there. |
 | `vhosty: no site found` (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
-| 502 on a folder site | PHP-FPM is down. Run `vhosty logs php-fpm`, then `vhosty restart php-fpm`. |
+| 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
 | 502 on a port site | Nothing is listening on that port, or it only listens on another interface. |
-| Port 443 in use | Herd or Valet is running. Stop it. |
+| A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |
+| Port 443 in use | Herd, Valet, nginx or Apache is running. Stop it. |
 
 ## Security
 
-- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the Mac with, can reach every parked site. Use Tailscale's access controls to restrict that.
+- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that.
 - Laravel's debug pages (`APP_DEBUG=true`) show environment details to anyone who can load them.
 - Domain names appear in public certificate logs. The wildcard certificate only reveals `*.yourdomain.dev`, not your folder names.
 
 ## Uninstall
 
 ```bash
-vhosty uninstall          # removes the launchd services
+vhosty uninstall          # removes the services
 rm -rf ~/.vhosty          # removes everything else
-sudo rm /usr/local/bin/vhosty
+rm ~/.local/bin/vhosty    # or: sudo rm /usr/local/bin/vhosty
 ```
 
 Then delete the `*.domain` record in Cloudflare.

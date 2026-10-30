@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VHOSTY_VERSION="0.2.0-dev"
+VHOSTY_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Platform and locations
@@ -42,6 +42,7 @@ LOG_DIR="$VHOSTY_DIR/logs"
 RUN_DIR="$VHOSTY_DIR/run"
 CADDY_LOG="$LOG_DIR/caddy.log"
 SITES_DIR="$VHOSTY_DIR/sites"
+APPLIED_STAMP="$RUN_DIR/applied"   # fingerprint of the config the services last loaded
 PHP_SHIM="$BIN_DIR/php"
 
 # Installed with `vhosty php install` (Linux: phpX.Y-<name> apt packages)
@@ -1091,7 +1092,37 @@ svc_apply() {
     if [ "$(svc_state "$s")" = "running" ]; then svc_reload "$s"; ok "reloaded $s"
     else svc_start "$s"; ok "started $s"; fi
   done
+  mark_applied
 }
+
+# ---------------------------------------------------------------------------
+# Drift: lets doctor tell "changed but not rebuilt" and "rebuilt but not
+# loaded" apart (e.g. after a command was interrupted)
+# ---------------------------------------------------------------------------
+hash_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | awk '{print $1}'
+}
+
+generated_hash() {
+  local v
+  { cat "$CADDYFILE" 2>/dev/null || true
+    for v in $(php_versions_in_use); do cat "$(fpm_conf "$v")" 2>/dev/null || true; done; } | hash_stdin
+}
+
+mark_applied() { mkdir -p "$RUN_DIR"; generated_hash >"$APPLIED_STAMP"; }
+
+# True when the generated files match what the config would generate now
+config_in_sync() {
+  local tmp rc=0 v
+  tmp="$(mktemp -d)"
+  ( CADDYFILE="$tmp/Caddyfile"; PHP_CONF_DIR="$tmp/php"; PHP_SHIM="$tmp/php-shim"; write_configs ) >/dev/null 2>&1 || rc=1
+  cmp -s "$tmp/Caddyfile" "$CADDYFILE" || rc=1
+  for v in $(php_versions_in_use); do cmp -s "$tmp/php/$v/php-fpm.conf" "$(fpm_conf "$v")" || rc=1; done
+  rm -rf "$tmp"
+  return $rc
+}
+
+config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(generated_hash)" ]; }
 
 # ---------------------------------------------------------------------------
 # Commands: setup
@@ -1414,6 +1445,7 @@ cmd_start() {
   need_config; need_installed
   local s
   for s in $(svc_resolve "${1:-all}"); do svc_start "$s"; ok "started $s"; done
+  [ "${1:-all}" != "all" ] || mark_applied
 }
 
 cmd_stop() {
@@ -1430,6 +1462,7 @@ cmd_restart() {
   local s
   cmd_validate >/dev/null || { cmd_validate || true; die "Not restarting. Fix the errors above."; }
   for s in $(svc_resolve "${1:-all}"); do svc_restart "$s"; ok "restarted $s"; done
+  [ "${1:-all}" != "all" ] || mark_applied
 }
 
 cmd_status() {
@@ -1980,7 +2013,7 @@ cmd_doctor() {
   need_config
   FAILED=0
   is_macos && sudo -v
-  local ip probe resolved s st code o v
+  local ip probe resolved s st code o v name dir
   ip="$(ts_ip)"
   probe="vhosty-doctor.$VHOSTY_DOMAIN"
   printf "%svhosty doctor%s  (*.%s)\n" "$B" "$N" "$VHOSTY_DOMAIN"
@@ -2014,6 +2047,22 @@ cmd_doctor() {
     done
     cmd_validate php || true
   fi
+
+  head_ "Config"
+  if config_in_sync; then ok "generated files match ~/.vhosty settings"
+  else bad "settings changed since the last rebuild. Run: vhosty rebuild"; fi
+  if config_applied; then ok "services are running the current config"
+  elif svc_installed; then bad "services haven't loaded the current config. Run: vhosty rebuild"; fi
+  for name in $(site_names); do
+    site_load "$name"
+    dir="$(site_dir "$name" || true)"
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+      bad "site $name: folder ${dir:-?} is gone. Remove it: vhosty unlink $name, or rm $(site_file "$name")"
+    fi
+    if [ -n "$SITE_PHP" ] && ! php_is_installed "$SITE_PHP"; then
+      bad "site $name is pinned to PHP $SITE_PHP, which isn't installed (using $(php_default)). Run: vhosty php install $SITE_PHP"
+    fi
+  done
 
   head_ "Services"
   if is_linux; then

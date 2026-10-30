@@ -3,15 +3,58 @@
 # zsh completion for vhosty. Add the folder to fpath before compinit:
 #   fpath=(~/.vhosty/completions $fpath)
 
+_vhosty_dir() { print -r -- "${VHOSTY_DIR:-$HOME/.vhosty}"; }
+
+_vhosty_config() { # _vhosty_config VHOSTY_PARKED → its value
+  local config="$(_vhosty_dir)/config"
+  [ -f "$config" ] && sed -n "s/^$1=\"\(.*\)\"\$/\1/p" "$config"
+}
+
+# Parked folders' subfolders plus configured sites (links, pins)
 _vhosty_sites() {
-  local config="${VHOSTY_DIR:-$HOME/.vhosty}/config" parked dir
+  local dir f
   local -a sites
-  [ -f "$config" ] || return 1
-  parked="$(sed -n 's/^VHOSTY_PARKED="\(.*\)"$/\1/p' "$config")"
-  for dir in ${(s.:.)parked}; do
+  for dir in ${(s.:.)$(_vhosty_config VHOSTY_PARKED)}; do
     sites+=( "$dir"/*(/N:t:l) )
   done
-  (( ${#sites} )) && _values 'site' $sites
+  for f in "$(_vhosty_dir)"/sites/*.conf(N); do
+    sites+=( "${${f:t}%.conf}" )
+  done
+  (( ${#sites} )) && _values 'site' ${(u)sites}
+}
+
+_vhosty_links() {
+  local f
+  local -a links
+  for f in "$(_vhosty_dir)"/sites/*.conf(N); do
+    grep -q '^SITE_LINKED=yes' "$f" && links+=( "${${f:t}%.conf}" )
+  done
+  (( ${#links} )) && _values 'link' $links
+}
+
+# Installed PHP versions (apt on Linux, static builds on macOS)
+_vhosty_php_versions() {
+  local -a versions
+  versions=( /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) )
+  versions=( ${versions#php-fpm} ); versions=( ${versions#-} )
+  (( ${#versions} )) && _values 'version' $versions
+}
+
+_vhosty_services() {
+  local -a svcs
+  svcs=( caddy php ${${(f)"$(_vhosty_php_versions_raw)"}/#/php-} )
+  _values 'service' $svcs
+}
+_vhosty_php_versions_raw() {
+  print -l /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) | sed 's/^php-fpm-*//'
+}
+
+_vhosty_docker_services() {
+  local dir="$(_vhosty_config VHOSTY_SERVICES_DIR)"
+  [ -n "$dir" ] || return 1
+  local -a svcs
+  svcs=( ${(f)"$(docker compose --project-directory "$dir" config --services 2>/dev/null)"} )
+  (( ${#svcs} )) && _values -w 'service' $svcs
 }
 
 _vhosty() {
@@ -21,19 +64,29 @@ _vhosty() {
     'park:Serve every folder in a directory'
     'unpark:Stop serving a parked directory'
     'parked:List parked directories'
+    'link:Serve one folder as a site'
+    'unlink:Remove a link'
+    'links:List links'
     'sites:List sites and their URLs'
+    'site:Everything about one site'
     'open:Open a site in the browser'
     'url:Print and copy a site URL'
-    'start:Start services'
-    'stop:Stop services'
+    'php:PHP versions (list, install, default, which)'
+    'isolate:Pin a site to a PHP version'
+    'unisolate:Back to the default PHP version'
+    'isolated:List pinned sites'
+    'ini:PHP settings, global or per site'
+    'services:Docker services (databases, caches, search, S3)'
+    'start:Start Caddy and PHP-FPM'
+    'stop:Stop Caddy and PHP-FPM'
     'restart:Validate config and restart'
-    'status:Service state and ports'
+    'status:Service state and sockets'
     'logs:Show recent logs'
     'tail:Follow logs live'
-    'edit:Edit settings or the token'
-    'rebuild:Regenerate the Caddyfile and restart'
+    'edit:Edit settings, PHP settings, or the token'
+    'rebuild:Regenerate config and reload'
     'dns:Point *.domain at this machine'
-    'update:Re-download Caddy or PHP-FPM'
+    'update:Re-download Caddy (or PHP-FPM on macOS)'
     'validate:Check the generated config'
     'cert:Show the wildcard certificate'
     'doctor:Check everything end to end'
@@ -51,13 +104,42 @@ _vhosty() {
   fi
 
   case "${words[2]}" in
-    start|stop|restart|logs|log|tail) _values 'service' caddy php-fpm ;;
-    edit)          _values 'file' config env ;;
-    validate)      _values 'config' caddy php-fpm ;;
+    start|stop|restart|logs|log|tail) _vhosty_services ;;
+    edit)          _values 'file' config php env ;;
+    validate)      _values 'config' caddy php ;;
     dns)           _values 'action' sync ;;
     update)        _values 'what' caddy php ;;
     park|unpark)   _files -/ ;;
-    open|url)      _vhosty_sites ;;
+    link)          _arguments '1:folder:_files -/' '--name[Site name]:name:' ;;
+    unlink)        _vhosty_links ;;
+    open|url|site|unisolate) _vhosty_sites ;;
+    isolate)
+      if (( CURRENT == 3 )); then _vhosty_php_versions; else _vhosty_sites; fi ;;
+    php)
+      if (( CURRENT == 3 )); then
+        _values 'action' list install default which
+      else
+        case "${words[3]}" in
+          default) _vhosty_php_versions ;;
+          which)   _vhosty_sites ;;
+        esac
+      fi ;;
+    ini)
+      if (( CURRENT == 3 )); then
+        _values 'action' show set unset edit --global --site
+      elif [ "${words[CURRENT-1]}" = "--site" ]; then
+        _vhosty_sites
+      else
+        _values 'option' --global --site
+      fi ;;
+    services|svc|db)
+      if (( CURRENT == 3 )); then
+        _values 'action' status up stop down restart logs tail pull edit exec dir
+      elif [ "${words[3]}" = "dir" ]; then
+        _files -/
+      else
+        _vhosty_docker_services
+      fi ;;
     setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token]:token:' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--yes[Accept defaults]' ;;
   esac
 }

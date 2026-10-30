@@ -1,6 +1,6 @@
 # vhosty on Linux: design
 
-Status: draft for review (2026-10-29). Linux is the priority; macOS keeps working as it does today
+Status: implemented in 0.2.0 (2026-10-29). Linux is the priority; macOS keeps working as it does today
 and picks up new features only where they're cheap.
 
 ## Principles
@@ -34,10 +34,10 @@ and picks up new features only where they're cheap.
 
 ```bash
 VHOSTY_DOMAIN="vhosty.link"
-VHOSTY_PARKED="/home/remote/Dev"          # colon-separated, several allowed (already supported)
+VHOSTY_PARKED="/home/me/Dev"          # colon-separated, several allowed (already supported)
 VHOSTY_PHP="on"
 VHOSTY_PHP_DEFAULT="8.5"                   # replaces VHOSTY_FPM_PORT
-VHOSTY_SERVICES_DIR="/home/remote/Dev/services"   # docker compose project for `vhosty services`
+VHOSTY_SERVICES_DIR="/home/me/Dev/services"   # docker compose project for `vhosty services`
 ```
 
 ### `php.ini` (global)
@@ -56,7 +56,7 @@ Created only when a site needs something beyond the defaults. `<name>` is the ho
 (`kudos` → `https://kudos.vhosty.link`).
 
 ```bash
-SITE_PATH="/home/remote/Dev/kudos"   # set by `link`; parked sites store their resolved path too
+SITE_PATH="/home/me/Dev/kudos"   # set by `link`; parked sites store their resolved path too
 SITE_LINKED="no"                      # yes = served from SITE_PATH even if not in a parked folder
 SITE_PHP="8.4"                        # pin; empty = VHOSTY_PHP_DEFAULT
 SITE_INI="memory_limit=2G

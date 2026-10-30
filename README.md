@@ -101,6 +101,7 @@ fpath=(~/.vhosty/completions $fpath)   # before compinit
 | `vhosty php [list\|install\|default\|which]` | PHP versions |
 | `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
 | `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
+| `vhosty ext [require\|install\|check]` | PHP extensions each site needs |
 | `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
@@ -168,6 +169,29 @@ apply on the web and in the CLI. A site with its own settings gets its own
 PHP-FPM pool, so settings never leak between sites. Settings PHP only reads at
 startup (`extension`, `opcache.memory_consumption`) belong in the distro's php.ini.
 
+### PHP extensions
+
+vhosty checks each site against its own PHP version, so a missing extension
+shows up in `vhosty doctor` instead of as a 500:
+
+- **Required** extensions come from the project's `composer.lock` (anything a
+  package requires, like `ext-soap`). Nothing to configure.
+- **Declared** extensions are ones a site needs but its packages only suggest,
+  like `protobuf` for the Google Ads API's speed. Declare them without touching
+  the project; they're stored in `~/.vhosty/sites/<name>.conf`.
+
+```bash
+cd ~/Sites/kudos && vhosty ext require protobuf   # declare (and install if missing)
+vhosty ext                                        # this site: declared and required
+vhosty ext check                                  # every site
+vhosty ext install mongodb --php 8.4              # Linux: apt php8.4-mongodb, restarts that FPM
+```
+
+`vhosty isolate` warns when the new version lacks something the site needs,
+and `vhosty php install` installs every declared extension along with the
+version. If a site can't work at all without an extension, declare it in the
+project's `composer.json` (`"ext-name": "*"`) instead, so it travels with the code.
+
 ### Docker services
 
 Point vhosty at a folder with a `compose.yaml` for your databases and other services:
@@ -191,7 +215,7 @@ that isn't.
 ~/.vhosty/
 ├── config                 domain, parked folders, default PHP, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
-├── sites/<name>.conf      one per site with a link, pin, or its own settings
+├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
 ├── .env                   Cloudflare token (mode 600)
 ├── Caddyfile              generated
 ├── php/<version>/         generated PHP-FPM config, one per version

@@ -46,7 +46,7 @@ APPLIED_STAMP="$RUN_DIR/applied"   # fingerprint of the config the services last
 PHP_SHIM="$BIN_DIR/php"
 
 # Installed with `vhosty php install` (Linux: phpX.Y-<name> apt packages)
-PHP_PACKAGES="cli fpm common mysql pgsql sqlite3 redis mbstring xml curl zip bcmath intl gd readline igbinary"
+PHP_PACKAGES="cli fpm common mysql pgsql sqlite3 redis mbstring xml curl zip bcmath intl gd readline igbinary soap"
 
 # macOS: launchd system daemons
 DAEMON_DIR="${VHOSTY_DAEMON_DIR:-/Library/LaunchDaemons}"
@@ -553,8 +553,8 @@ site_names() {
   done
 }
 
-site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI
-  SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""
+site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT
+  SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""; SITE_EXT=""
   # shellcheck disable=SC1090
   if [ -f "$(site_file "$1")" ]; then . "$(site_file "$1")"; fi
 }
@@ -564,7 +564,7 @@ site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI
 site_save() {
   local f
   f="$(site_file "$1")"
-  if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ]; then
+  if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ] && [ -z "$SITE_EXT" ]; then
     rm -f "$f"
     return 0
   fi
@@ -575,6 +575,7 @@ site_save() {
     printf 'SITE_LINKED=%q\n' "$SITE_LINKED"
     printf 'SITE_PHP=%q\n' "$SITE_PHP"
     printf 'SITE_INI=%q\n' "$SITE_INI"
+    printf 'SITE_EXT=%q\n' "$SITE_EXT"
   } >"$f"
 }
 
@@ -1395,7 +1396,7 @@ cmd_links() {
 # Everything about one site
 cmd_site() {
   need_config
-  local name dir kind v source settings sock
+  local name dir kind v source settings sock missing
   name="$(resolve_site "${1:-}")"
   site_load "$name"
   dir="$(site_dir "$name" || true)"
@@ -1419,6 +1420,9 @@ cmd_site() {
     if [ -n "$SITE_INI" ]; then
       printf '%s\n' "$SITE_INI" | while IFS= read -r kv; do printf "  %-10s %s = %s\n" "" "${kv%%=*}" "${kv#*=}"; done
     fi
+    missing="$(missing_exts "$dir" "$(site_php)" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
+    printf "  %-10s %s%s\n" "Extensions" "${SITE_EXT:+declared: $SITE_EXT; }" \
+      "$([ -n "$missing" ] && echo "${R}missing: $missing${N} (vhosty ext install <ext>)" || echo "none missing")"
   fi
   [ ! -f "$(site_file "$name")" ] || printf "  %-10s %s\n" "Config" "$(site_file "$name")"
 }
@@ -1532,6 +1536,10 @@ cmd_php_install() {
     info "macOS: this is PHP-FPM for sites; the CLI shim uses the php on your PATH"
   else
     for e in $PHP_PACKAGES; do pkgs="$pkgs php$v-$e"; done
+    # Extensions sites have declared (vhosty ext require)
+    for e in $(for n in $(site_names); do site_load "$n"; echo "$SITE_EXT"; done | tr ' ' '\n' | grep . | sort -u); do
+      apt-cache show "php$v-$(ext_package "$e")" >/dev/null 2>&1 && pkgs="$pkgs php$v-$(ext_package "$e")"
+    done
     if ! apt-cache show "php$v-fpm" >/dev/null 2>&1; then
       die "No php$v-fpm package. Add the PHP repo first: https://packages.sury.org/php/README.txt"
     fi
@@ -1568,6 +1576,218 @@ cmd_php_which() { # the version a site (default: current folder) runs
 }
 
 # ---------------------------------------------------------------------------
+# PHP extensions
+#   Required: what composer.lock requires (composer check-platform-reqs), so
+#   nothing to configure. Declared: extensions a site wants but doesn't
+#   require, e.g. protobuf for speed (vhosty ext require protobuf), kept in
+#   ~/.vhosty/sites/<name>.conf so the project stays untouched.
+# ---------------------------------------------------------------------------
+valid_ext() { printf '%s' "$1" | grep -qE '^[a-z0-9_-]+$' || die "'$1' isn't a PHP extension name"; }
+
+# apt package suffix for an extension (php8.5-<suffix>)
+ext_package() {
+  case "$1" in
+    pdo_mysql|mysqli|mysqlnd) echo mysql ;;
+    pdo_pgsql)                echo pgsql ;;
+    pdo_sqlite)               echo sqlite3 ;;
+    dom|simplexml|xmlreader|xmlwriter|xsl) echo xml ;;
+    zend-opcache)             echo opcache ;;
+    *)                        echo "$1" ;;
+  esac
+}
+
+php_bin_for() { # CLI binary for a version
+  if is_linux && [ -x "/usr/bin/php$1" ]; then echo "/usr/bin/php$1"; else command -v php 2>/dev/null || true; fi
+}
+
+ext_loaded() { # ext_loaded 8.5 protobuf
+  local bin
+  bin="$(php_bin_for "$1")"
+  [ -n "$bin" ] || return 1
+  "$bin" -r 'exit(extension_loaded($argv[1]) || extension_loaded(str_replace("-", " ", $argv[1])) ? 0 : 1);' "$2" 2>/dev/null
+}
+
+# Missing extensions for a folder on a PHP version, one "ext<TAB>why" per line.
+# Reads SITE_EXT, so call site_load first (or clear SITE_EXT).
+missing_exts() { # missing_exts DIR VERSION
+  local dir="$1" v="$2" bin composer e
+  bin="$(php_bin_for "$v")"
+  [ -n "$bin" ] || return 0
+  composer="$(command -v composer 2>/dev/null || true)"
+  {
+    if [ -f "$dir/composer.lock" ] && [ -n "$composer" ]; then
+      (cd "$dir" && "$bin" "$composer" check-platform-reqs --lock --format=json 2>/dev/null) \
+        | jq -r '.[]? | select(.status == "missing") | .name | select(startswith("ext-")) | sub("^ext-"; "") + "\trequired by composer.lock"' 2>/dev/null || true
+    fi
+    for e in $SITE_EXT; do ext_loaded "$v" "$e" || printf '%s\tdeclared for this site\n' "$e"; done
+  } | awk -F'\t' '!seen[$1]++'
+}
+
+# Every PHP site: "name|dir" (configured sites first; they win over parked ones)
+all_php_sites() {
+  local name dir p f seen=" "
+  for name in $(site_names); do
+    dir="$(site_dir "$name" || true)"
+    [ -n "$dir" ] && [ -f "$dir/public/index.php" ] || continue
+    echo "$name|$dir"; seen="$seen$name "
+  done
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    for f in "$p"/*/; do
+      f="${f%/}"; name="$(lower "${f##*/}")"
+      [ -f "$f/public/index.php" ] && valid_name "$name" || continue
+      case "$seen" in *" $name "*) continue ;; esac
+      echo "$name|$f"; seen="$seen$name "
+    done
+  done <<EOF
+$(parked_list)
+EOF
+}
+
+# Installs extensions for one PHP version and restarts its FPM if it's running
+install_exts() { # install_exts VERSION ext...
+  local v="$1" e pkgs=""
+  shift
+  is_linux || die "On macOS, PHP-FPM is a static build with a fixed set of extensions"
+  php_is_installed "$v" || die "PHP $v isn't installed. Run: vhosty php install $v"
+  for e in "$@"; do
+    pkgs="$pkgs php$v-$(ext_package "$e")"
+    apt-cache show "php$v-$(ext_package "$e")" >/dev/null 2>&1 \
+      || die "No apt package php$v-$(ext_package "$e") for '$e'. Install it another way (e.g. pecl)."
+  done
+  info "installing$pkgs (asks for your password)"
+  # shellcheck disable=SC2086
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null || die "apt-get install failed"
+  sudo systemctl disable --now "php$v-fpm" >/dev/null 2>&1 || true
+  for e in "$@"; do
+    if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded"; fi
+  done
+  if [ "$(svc_state "php-$v")" = "running" ]; then svc_restart "php-$v"; ok "restarted php-$v"; fi
+}
+
+cmd_ext() {
+  need_config
+  local sub="${1:-list}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    list|ls|show)       cmd_ext_list "$@" ;;
+    require|add)        cmd_ext_require "$@" ;;
+    unrequire|rm|remove) cmd_ext_unrequire "$@" ;;
+    install)            cmd_ext_install "$@" ;;
+    check)              cmd_ext_check ;;
+    *) die "Usage: vhosty ext [list [site] | require <ext..> | unrequire <ext..> | install <ext..> [--php V] | check]" ;;
+  esac
+}
+
+# Parses "ext... [--site N]" into EXT_ARGS and EXT_SITE (default: current folder)
+ext_args() {
+  EXT_ARGS=""; EXT_SITE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --site|-s) [ -n "${2:-}" ] || die "--site needs a site name"; EXT_SITE="$2"; shift 2 ;;
+      -*) die "Unknown option '$1'" ;;
+      *) valid_ext "$1"; EXT_ARGS="$EXT_ARGS $1"; shift ;;
+    esac
+  done
+  EXT_SITE="$(resolve_site "$EXT_SITE")"
+}
+
+cmd_ext_list() {
+  local name dir v e line
+  name="$(resolve_site "${1:-}")"
+  dir="$(site_dir "$name")" || die "No site '$name'. Run: vhosty sites"
+  site_load "$name"
+  v="$(site_php)"
+  printf "%s%s%s  PHP %s\n" "$B" "$name" "$N" "$v"
+  if [ -n "$SITE_EXT" ]; then
+    for e in $SITE_EXT; do
+      if ext_loaded "$v" "$e"; then ok "$e (declared)"; else bad "$e (declared) missing. Run: vhosty ext install $e --php $v"; fi
+    done
+  else
+    info "no declared extensions (add one with: vhosty ext require <ext>)"
+  fi
+  line="$(SITE_EXT="" missing_exts "$dir" "$v")"
+  if [ -n "$line" ]; then
+    printf '%s\n' "$line" | while IFS="$(printf '\t')" read -r e _; do
+      bad "$e (required by composer.lock) missing. Run: vhosty ext install $e --php $v"
+    done
+  elif [ -f "$dir/composer.lock" ]; then
+    ok "everything composer.lock requires is installed"
+  fi
+}
+
+cmd_ext_require() {
+  local e dir v missing=""
+  ext_args "$@"
+  [ -n "$EXT_ARGS" ] || die "Usage: vhosty ext require <ext...> [--site N]"
+  dir="$(site_dir "$EXT_SITE")" || die "No site '$EXT_SITE'. Run: vhosty sites"
+  site_load "$EXT_SITE"
+  SITE_PATH="$dir"
+  for e in $EXT_ARGS; do
+    case " $SITE_EXT " in *" $e "*) ;; *) SITE_EXT="${SITE_EXT:+$SITE_EXT }$e" ;; esac
+  done
+  site_save "$EXT_SITE"
+  ok "$EXT_SITE needs:$EXT_ARGS (saved in $(site_file "$EXT_SITE"))"
+  v="$(site_php)"
+  for e in $EXT_ARGS; do ext_loaded "$v" "$e" || missing="$missing $e"; done
+  # shellcheck disable=SC2086
+  if [ -n "$missing" ] && is_linux; then install_exts "$v" $missing
+  elif [ -n "$missing" ]; then warn "missing on PHP $v:$missing"; fi
+}
+
+cmd_ext_unrequire() {
+  local e new=""
+  ext_args "$@"
+  [ -n "$EXT_ARGS" ] || die "Usage: vhosty ext unrequire <ext...> [--site N]"
+  site_load "$EXT_SITE"
+  for e in $SITE_EXT; do
+    case " $EXT_ARGS " in *" $e "*) ;; *) new="${new:+$new }$e" ;; esac
+  done
+  SITE_EXT="$new"
+  site_save "$EXT_SITE"
+  ok "$EXT_SITE no longer declares:$EXT_ARGS (the extensions stay installed)"
+}
+
+cmd_ext_install() {
+  local v="" exts="" name
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --php) [ -n "${2:-}" ] || die "--php needs a version"; v="$2"; shift 2 ;;
+      -*) die "Unknown option '$1'" ;;
+      *) valid_ext "$1"; exts="$exts $1"; shift ;;
+    esac
+  done
+  [ -n "$exts" ] || die "Usage: vhosty ext install <ext...> [--php V]"
+  if [ -z "$v" ]; then
+    if name="$(site_from_dir "$PWD")"; then site_load "$name"; v="$(site_php)"; else v="$(php_default)"; fi
+  fi
+  valid_version "$v"
+  # shellcheck disable=SC2086
+  install_exts "$v" $exts
+}
+
+# Every site against its own PHP version. Used by doctor too.
+cmd_ext_check() {
+  local name dir v line e why any=0
+  while IFS="|" read -r name dir; do
+    [ -n "$name" ] || continue
+    site_load "$name"
+    v="$(site_php)"
+    line="$(missing_exts "$dir" "$v")"
+    [ -n "$line" ] || continue
+    any=1
+    while IFS="$(printf '\t')" read -r e why; do
+      bad "$name (PHP $v) is missing $e, $why. Run: vhosty ext install $e --php $v"
+    done <<EOF
+$line
+EOF
+  done <<EOF
+$(all_php_sites)
+EOF
+  [ "$any" = "1" ] || ok "every site has the extensions it needs"
+}
+
+# ---------------------------------------------------------------------------
 # Commands: isolate (pin a site to a PHP version)
 # ---------------------------------------------------------------------------
 cmd_isolate() {
@@ -1584,6 +1804,9 @@ cmd_isolate() {
   SITE_PHP="$v"
   site_save "$name"
   ok "$name now uses PHP $v (web and CLI)"
+  missing_exts "$dir" "$v" | while IFS="$(printf '\t')" read -r e why; do
+    [ -n "$e" ] && warn "PHP $v is missing $e ($why). Run: vhosty ext install $e --php $v"
+  done
   cmd_rebuild
 }
 
@@ -2064,6 +2287,11 @@ cmd_doctor() {
     fi
   done
 
+  if php_enabled; then
+    head_ "PHP extensions"
+    cmd_ext_check
+  fi
+
   head_ "Services"
   if is_linux; then
     if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
@@ -2159,6 +2387,11 @@ ${B}PHP${N}
   vhosty isolate <version> [site]    Pin a site to a version (default: current folder)
   vhosty unisolate [site]            Back to the default version
   vhosty isolated                    List pinned sites
+  vhosty ext [site]                  A site's extensions: declared and required by composer.lock
+  vhosty ext require <ext..> [..]    A site needs an extension composer doesn't require (e.g. protobuf)
+  vhosty ext unrequire <ext..> [..]  Remove that again
+  vhosty ext install <ext..> [--php V]  Install extensions (apt) and restart PHP-FPM
+  vhosty ext check                   Check every site against its PHP version
   ${D}php, php artisan and composer use the site's version inside its folder.${N}
 
 ${B}PHP settings${N} ${D}(default scope: the current folder's site, else global)${N}
@@ -2219,6 +2452,7 @@ main() {
     unisolate)          cmd_unisolate "${1:-}" ;;
     isolated)           cmd_isolated ;;
     ini)                cmd_ini "$@" ;;
+    ext|exts|extension|extensions) cmd_ext "$@" ;;
     services|svc|db)    cmd_services "$@" ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;

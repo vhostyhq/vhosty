@@ -76,6 +76,7 @@ _vhosty() {
     'unisolate:Back to the default PHP version'
     'isolated:List pinned sites'
     'ini:PHP settings, global or per site'
+    'ext:PHP extensions a site needs'
     'services:Docker services (databases, caches, search, S3)'
     'start:Start Caddy and PHP-FPM'
     'stop:Stop Caddy and PHP-FPM'
@@ -123,6 +124,16 @@ _vhosty() {
           default) _vhosty_php_versions ;;
           which)   _vhosty_sites ;;
         esac
+      fi ;;
+    ext|exts)
+      if (( CURRENT == 3 )); then
+        _values 'action' list require unrequire install check
+      elif [ "${words[CURRENT-1]}" = "--php" ]; then
+        _vhosty_php_versions
+      elif [ "${words[CURRENT-1]}" = "--site" ] || [ "${words[3]}" = "list" ]; then
+        _vhosty_sites
+      else
+        _values 'option' --site --php
       fi ;;
     ini)
       if (( CURRENT == 3 )); then

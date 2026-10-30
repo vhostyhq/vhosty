@@ -1705,6 +1705,90 @@ cmd_ini_edit() {
 }
 
 # ---------------------------------------------------------------------------
+# Commands: services (docker compose for databases, caches, search, S3)
+# ---------------------------------------------------------------------------
+need_services() {
+  [ -n "$VHOSTY_SERVICES_DIR" ] || die "No services folder set. Run: vhosty services dir <folder with compose.yaml>"
+  [ -d "$VHOSTY_SERVICES_DIR" ] || die "$VHOSTY_SERVICES_DIR doesn't exist. Run: vhosty services dir <folder>"
+  command -v docker >/dev/null 2>&1 || die "Docker isn't installed"
+  docker info >/dev/null 2>&1 || {
+    if [ -S /var/run/docker.sock ] && ! [ -w /var/run/docker.sock ]; then
+      die "No access to Docker. Add yourself to the docker group (sudo usermod -aG docker $VHOSTY_USER), then log in again"
+    fi
+    die "Docker isn't running (sudo systemctl start docker)"
+  }
+}
+
+dc() { docker compose --project-directory "$VHOSTY_SERVICES_DIR" "$@"; }
+
+# One line per container: service|state|health|published ports (space-separated).
+# Not tabs: read merges consecutive tabs, which shifts an empty health field.
+services_rows() {
+  dc ps --all --format json 2>/dev/null | jq -r -s 'flatten | .[] |
+    [.Service, .State, (.Health // ""),
+     ([.Publishers[]? | select(.PublishedPort > 0) | "\(.URL):\(.PublishedPort)->\(.TargetPort)"] | unique | join(" "))] | join("|")'
+}
+
+# Published on something other than localhost?
+exposed_ports() { # "url:port->target ..." → the ones not on 127.0.0.1 / ::1
+  local p
+  for p in $1; do
+    case "$p" in 127.0.0.1:*|::1:*|"[::1]":*) ;; *) printf '%s ' "$p" ;; esac
+  done
+}
+
+cmd_services() {
+  need_config
+  local sub="${1:-status}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    dir)
+      if [ -z "${1:-}" ]; then echo "${VHOSTY_SERVICES_DIR:-(not set)}"; return 0; fi
+      [ -d "$1" ] || die "No such folder: $1"
+      VHOSTY_SERVICES_DIR="$(cd "$1" && pwd)"
+      save_config
+      ok "services folder: $VHOSTY_SERVICES_DIR"
+      return 0 ;;
+  esac
+  need_services
+  case "$sub" in
+    status|st|ps|ls) services_status ;;
+    up|start)        dc up -d --remove-orphans "$@"; services_status ;;
+    down)            if [ $# -gt 0 ]; then dc stop "$@"; else dc down; fi ;;
+    stop)            dc stop "$@" ;;
+    restart)         dc restart "$@"; services_status ;;
+    logs|log)        dc logs --tail "${VHOSTY_LOG_LINES:-100}" "$@" ;;
+    tail|follow)     dc logs --tail 30 -f "$@" ;;
+    pull|update)     dc pull "$@" && dc up -d --remove-orphans "$@" && services_status ;;
+    edit)            ${EDITOR:-nano} "$VHOSTY_SERVICES_DIR/compose.yaml" && dc config -q && ok "compose.yaml is valid. Apply with: vhosty services up" ;;
+    exec)            [ $# -ge 1 ] || die "Usage: vhosty services exec <service> [command]"; dc exec "$@" ;;
+    *) die "Usage: vhosty services [status | up | down | stop | restart | logs | tail | pull | edit | exec | dir] [service...]" ;;
+  esac
+}
+
+services_status() { # [--no-header]
+  local svc st health ports bad_ports defined rows
+  [ "${1:-}" = "--no-header" ] || printf "%sServices%s  %s\n" "$B" "$N" "$VHOSTY_SERVICES_DIR"
+  rows="$(services_rows)"
+  defined="$(dc config --services 2>/dev/null | sort)"
+  for svc in $defined; do
+    st=""; health=""; ports=""
+    while IFS="|" read -r s1 s2 s3 s4; do
+      [ "$s1" = "$svc" ] && { st="$s2"; health="$s3"; ports="$s4"; }
+    done <<EOF
+$rows
+EOF
+    bad_ports="$(exposed_ports "$ports")"
+    if [ "$st" = "running" ] && [ "$health" != "unhealthy" ]; then
+      ok "$(printf '%-12s' "$svc") ${D}${ports:-no ports}${N}${health:+ ($health)}"
+    else
+      bad "$(printf '%-12s' "$svc") ${st:-not created}${health:+ ($health)}  (vhosty services up $svc)"
+    fi
+    [ -z "$bad_ports" ] || bad "$(printf '%-12s' "") reachable beyond this machine: $bad_ports(bind to 127.0.0.1 in compose.yaml)"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Commands: logs
 # ---------------------------------------------------------------------------
 log_files() {
@@ -1947,6 +2031,15 @@ cmd_doctor() {
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v socket"; else bad "no socket for PHP $v"; fi
   done
 
+  if [ -n "$VHOSTY_SERVICES_DIR" ]; then
+    head_ "Docker services"
+    if ( need_services ) 2>/dev/null; then
+      services_status --no-header
+    else
+      bad "$( ( need_services ) 2>&1 | sed 's/^error: //')"
+    fi
+  fi
+
   head_ "End to end"
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$probe/" 2>/dev/null || true)"
   if [ -n "$code" ] && [ "$code" != "000" ]; then
@@ -2025,7 +2118,16 @@ ${B}PHP settings${N} ${D}(default scope: the current folder's site, else global)
   vhosty ini unset <key> [..]        Remove one
   vhosty ini edit [..]               Edit in \$EDITOR
 
-${B}Services${N}
+${B}Docker services${N} ${D}(docker compose in VHOSTY_SERVICES_DIR)${N}
+  vhosty services [status]           State and ports of each service
+  vhosty services up|stop|restart [svc..]   Start (default: all), stop, restart
+  vhosty services down               Stop and remove the containers (data stays)
+  vhosty services logs|tail [svc..]  Recent logs, or follow them
+  vhosty services pull [svc..]       Update images and recreate
+  vhosty services exec <svc> [cmd]   Run a command in a service (e.g. mysql)
+  vhosty services edit | dir [path]  Edit compose.yaml, or show/set the folder
+
+${B}Caddy and PHP-FPM${N}
   vhosty start   [caddy|php|php-8.x] Start services (default: all)
   vhosty stop    [caddy|php|php-8.x] Stop services
   vhosty restart [caddy|php|php-8.x] Validate config, then restart
@@ -2068,6 +2170,7 @@ main() {
     unisolate)          cmd_unisolate "${1:-}" ;;
     isolated)           cmd_isolated ;;
     ini)                cmd_ini "$@" ;;
+    services|svc|db)    cmd_services "$@" ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;
     url)                cmd_url "${1:-}" ;;

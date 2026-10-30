@@ -149,9 +149,15 @@ _vhosty() {
       fi ;;
     services|svc|db)
       if (( CURRENT == 3 )); then
-        _values 'action' status up stop down restart logs tail pull edit exec dir
+        _values 'action' status up stop down restart logs tail pull edit exec dir init backup restore
       elif [ "${words[3]}" = "dir" ]; then
         _files -/
+      elif [ "${words[3]}" = "init" ]; then
+        _arguments '1:folder:_files -/' '--only[Services, comma-separated]:services:_sequence compadd - mysql postgres valkey meilisearch typesense rustfs' '--force[Replace compose.yaml]'
+      elif [ "${words[3]}" = "backup" ]; then
+        _arguments '--to[Folder to save in]:folder:_files -/'
+      elif [ "${words[3]}" = "restore" ]; then
+        _arguments '1:backup:_alternative "saved:saved backup:_files -/ -W $(_vhosty_dir)/backups" "folders:folder:_files -/"' '--into[Services folder]:folder:_files -/' '--replace-config[Use the backup'"'"'s compose.yaml and .env]' '--yes[Don'"'"'t ask]'
       else
         _vhosty_docker_services
       fi ;;

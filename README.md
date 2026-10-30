@@ -195,10 +195,20 @@ project's `composer.json` (`"ext-name": "*"`) instead, so it travels with the co
 
 ### Docker services
 
-Point vhosty at a folder with a `compose.yaml` for your databases and other services:
+Databases, caches, search and S3 run in Docker, managed with `docker compose`.
+Start with the standard set, or point vhosty at a `compose.yaml` you already have:
 
 ```bash
-vhosty services dir ~/Sites/services
+vhosty services init         # MySQL 8.4, Postgres 18 + pgvector, Valkey, Meilisearch, Typesense, RustFS
+vhosty services init --only mysql,valkey
+vhosty services dir ~/Sites/services   # or use your own compose.yaml
+```
+
+`init` writes `compose.yaml` to `~/.vhosty/services` (or the folder you give it),
+with every port on 127.0.0.1, MySQL and Postgres sized for the machine's memory,
+and a `.env` of generated keys. Then:
+
+```bash
 vhosty services              # state, health and ports of each service
 vhosty services up           # start everything (or name services)
 vhosty services logs mysql
@@ -209,6 +219,36 @@ vhosty services pull         # update images and recreate
 Docker bypasses the firewall for published ports, so publish them on localhost
 (`"127.0.0.1:3306:3306"`). `vhosty services` and `vhosty doctor` flag any port
 that isn't.
+
+#### Backups
+
+```bash
+vhosty services backup                  # into ~/.vhosty/backups/services-<date>
+vhosty services backup --to /mnt/usb
+vhosty services restore ~/.vhosty/backups/services-20261030-112158
+```
+
+A backup is one folder holding:
+
+- `config/`: `compose.yaml`, `.env` and the other files next to them,
+- a SQL dump of every MySQL/MariaDB and Postgres database (plus Postgres roles),
+  which loads into newer versions too,
+- a `.tar.gz` of every volume of the other services (Valkey, search indexes, S3
+  files). Each of those services stops for the few seconds its archive takes.
+
+Test databases (`test`, `*_test`, `*_testing`, `*_test_<n>`) are skipped; test
+suites recreate them. Bind-mounted folders aren't included. Backups are readable
+by you only, and hold your keys, so copy them somewhere safe. The newest
+`VHOSTY_BACKUP_KEEP` (default 7) are kept; set `VHOSTY_BACKUP_DIR` to save
+elsewhere by default. `vhosty doctor` warns when the last backup is over a week old.
+
+`restore` is how a new machine gets everything back: it copies the config (keeping
+any `compose.yaml` or `.env` already there, unless `--replace-config`), creates the
+services, puts the volumes back, starts everything, and loads the dumps. It
+replaces the data in those services, so it asks first (`--yes` skips the question).
+
+For nightly backups, run it from cron or a systemd timer:
+`vhosty services backup --to <folder your backup tool picks up>`.
 
 ## Files
 
@@ -223,7 +263,9 @@ that isn't.
 ├── bin/                   vhosty, caddy, php (the CLI shim)
 ├── completions/           zsh completion
 ├── run/                   sockets
-└── logs/                  caddy.log, php-<version>.log, rotated copies (*.log.1.gz …)
+├── logs/                  caddy.log, php-<version>.log, rotated copies (*.log.1.gz …)
+├── services/              compose.yaml and .env from `vhosty services init`
+└── backups/               `vhosty services backup` (services-<date>/)
 ```
 
 Services: `~/.config/systemd/user/vhosty-caddy.service` and `vhosty-php@.service`

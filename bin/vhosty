@@ -524,6 +524,17 @@ ini_pairs() {
     | grep '=' | sed -E 's/^([^=[:space:]]+)[[:space:]]*=[[:space:]]*/\1=/' || true
 }
 
+# key=value lines from stdin, later keys replacing earlier ones, first-seen order kept
+ini_merge() {
+  awk -F= 'NF >= 2 && $1 != "" { k = $1; v = substr($0, length(k) + 2); if (!(k in val)) order[++n] = k; val[k] = v }
+    END { for (i = 1; i <= n; i++) print order[i] "=" val[order[i]] }'
+}
+
+valid_ini_key() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_.-]+$' || die "'$1' isn't a PHP setting name"; }
+
+# Sites with their own PHP settings get their own FPM pool and socket
+site_sock() { echo "$RUN_DIR/site-$1.sock"; }
+
 # ---------------------------------------------------------------------------
 # Sites: ~/.vhosty/sites/<name>.conf, one per site that differs from the
 # defaults (linked, PHP version pinned, PHP settings). Nothing is stored in
@@ -624,7 +635,7 @@ resolve_site() {
 # Rules for configured sites. They come before the parked wildcards, so a pin
 # or a link wins over the default.
 caddy_sites() {
-  local name dir v
+  local name dir v sock
   for name in $(site_names); do
     site_load "$name"
     dir="$(site_dir "$name" || true)"
@@ -634,13 +645,15 @@ caddy_sites() {
     fi
     if php_enabled && { [ -f "$dir/public/index.php" ] || [ ! -f "$dir/index.html" ]; }; then
       v="$(site_php)"
+      sock="$(fpm_sock "$v")"
+      [ -z "$SITE_INI" ] || sock="$(site_sock "$name")"
       cat <<EOF
 
-	# Site: $name → $dir (PHP $v)
+	# Site: $name → $dir (PHP $v$([ -z "$SITE_INI" ] || echo ", own settings"))
 	@site_$name host $name.$VHOSTY_DOMAIN
 	handle @site_$name {
 		root * "$dir/public"
-		php_fastcgi unix/$(fpm_sock "$v")
+		php_fastcgi unix/$sock
 		file_server
 	}
 EOF
@@ -728,7 +741,7 @@ EOF
 }
 
 write_fpm_conf() { # write_fpm_conf 8.5
-  local v="$1" kv
+  local v="$1" kv name
   mkdir -p "$PHP_CONF_DIR/$v" "$LOG_DIR" "$RUN_DIR"
   {
     cat <<EOF
@@ -751,6 +764,26 @@ clear_env = no
 EOF
     ini_pairs "$PHP_INI" | while IFS= read -r kv; do
       printf 'php_value[%s] = %s\n' "${kv%%=*}" "${kv#*=}"
+    done
+    # One pool per site with its own settings: a worker never serves another
+    # site, so settings can't leak between sites. Idle pools have no workers.
+    for name in $(site_names); do
+      site_load "$name"
+      [ -n "$SITE_INI" ] && [ "$(site_php)" = "$v" ] || continue
+      cat <<EOF
+
+[site-$name]
+listen = $(site_sock "$name")
+listen.mode = 0600
+pm = ondemand
+pm.max_children = 10
+pm.process_idle_timeout = 60s
+catch_workers_output = yes
+clear_env = no
+EOF
+      { ini_pairs "$PHP_INI"; printf '%s\n' "$SITE_INI"; } | ini_merge | while IFS= read -r kv; do
+        printf 'php_value[%s] = %s\n' "${kv%%=*}" "${kv#*=}"
+      done
     done
   } >"$(fpm_conf "$v")"
 }
@@ -1423,6 +1456,131 @@ cmd_isolated() {
 }
 
 # ---------------------------------------------------------------------------
+# Commands: ini (PHP settings, global or per site)
+# ---------------------------------------------------------------------------
+# Picks the scope from --global / --site N, else the current folder's site,
+# else global. Sets INI_SCOPE ("global" or a site name).
+ini_scope() {
+  INI_SCOPE=""
+  case "${1:-}" in
+    --global|-g) INI_SCOPE="global" ;;
+    --site|-s)
+      [ -n "${2:-}" ] || die "--site needs a site name"
+      INI_SCOPE="$(resolve_site "$2")"
+      site_dir "$INI_SCOPE" >/dev/null || die "No site '$INI_SCOPE'. Run: vhosty sites" ;;
+    "")          INI_SCOPE="$(site_from_dir "$PWD" || echo global)" ;;
+    *)           die "Unknown option '$1' (use --global or --site <name>)" ;;
+  esac
+}
+
+# Saves new key=value lines for the scope
+ini_store() { # ini_store "lines"
+  local lines="$1" dir kv
+  if [ "$INI_SCOPE" = "global" ]; then
+    write_default_php_ini
+    {
+      echo "; vhosty: PHP settings for every site and every PHP version (web and CLI)."
+      echo "; They apply on top of the distro's php.ini. After editing, run: vhosty rebuild"
+      printf '%s\n' "$lines" | while IFS= read -r kv; do
+        [ -n "$kv" ] && printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"
+      done
+    } >"$PHP_INI.tmp"
+    mv "$PHP_INI.tmp" "$PHP_INI"
+  else
+    dir="$(site_dir "$INI_SCOPE")" || die "No folder for '$INI_SCOPE'. Run: vhosty sites"
+    site_load "$INI_SCOPE"
+    SITE_PATH="$dir"
+    SITE_INI="$(printf '%s\n' "$lines" | grep . || true)"
+    site_save "$INI_SCOPE"
+  fi
+}
+
+ini_current() { # key=value lines for INI_SCOPE
+  if [ "$INI_SCOPE" = "global" ]; then ini_pairs "$PHP_INI"
+  else site_load "$INI_SCOPE"; printf '%s\n' "$SITE_INI" | grep . || true; fi
+}
+
+scope_label() { if [ "$INI_SCOPE" = "global" ]; then echo "global"; else echo "$INI_SCOPE"; fi; }
+
+cmd_ini() {
+  need_config
+  local sub="${1:-show}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    show|list|ls) cmd_ini_show "$@" ;;
+    set)          cmd_ini_set "$@" ;;
+    unset|rm)     cmd_ini_unset "$@" ;;
+    edit)         cmd_ini_edit "$@" ;;
+    --global|-g|--site|-s) cmd_ini_show "$sub" "$@" ;;
+    *) die "Usage: vhosty ini [show | set <key> <value> | unset <key> | edit] [--global | --site <name>]" ;;
+  esac
+}
+
+cmd_ini_show() {
+  local kv site
+  ini_scope "$@"
+  head_ "Global ($PHP_INI)"
+  if [ -n "$(ini_pairs "$PHP_INI")" ]; then
+    ini_pairs "$PHP_INI" | while IFS= read -r kv; do printf "  %s = %s\n" "${kv%%=*}" "${kv#*=}"; done
+  else info "(none)"; fi
+  [ "$INI_SCOPE" = "global" ] && { echo; return 0; }
+  site="$INI_SCOPE"
+  site_load "$site"
+  head_ "$site (overrides global, PHP $(site_php))"
+  if [ -n "$SITE_INI" ]; then
+    printf '%s\n' "$SITE_INI" | while IFS= read -r kv; do printf "  %s = %s\n" "${kv%%=*}" "${kv#*=}"; done
+  else info "(none: uses the global settings)"; fi
+  echo
+}
+
+cmd_ini_set() {
+  local key="${1:-}" value="${2:-}"
+  [ $# -ge 2 ] || die "Usage: vhosty ini set <key> <value> [--global | --site <name>]"
+  shift 2
+  valid_ini_key "$key"
+  case "$value" in *"
+"*) die "Values can't contain newlines" ;; esac
+  ini_scope "$@"
+  ini_store "$( { ini_current; printf '%s=%s\n' "$key" "$value"; } | ini_merge )"
+  ok "$key = $value ($(scope_label))"
+  cmd_rebuild
+}
+
+cmd_ini_unset() {
+  local key="${1:-}" cur
+  [ -n "$key" ] || die "Usage: vhosty ini unset <key> [--global | --site <name>]"
+  shift
+  valid_ini_key "$key"
+  ini_scope "$@"
+  cur="$(ini_current)"
+  printf '%s\n' "$cur" | grep -q "^$(printf '%s' "$key" | sed 's/\./\\./g')=" \
+    || { warn "$key isn't set ($(scope_label))"; return 0; }
+  ini_store "$(printf '%s\n' "$cur" | awk -F= -v k="$key" '$1 != k')"
+  ok "removed $key ($(scope_label))"
+  cmd_rebuild
+}
+
+cmd_ini_edit() {
+  local tmp kv
+  ini_scope "$@"
+  if [ "$INI_SCOPE" = "global" ]; then
+    write_default_php_ini
+    ${EDITOR:-nano} "$PHP_INI"
+  else
+    tmp="$(mktemp)"
+    {
+      echo "; PHP settings for $INI_SCOPE only (override ~/.vhosty/php.ini). One per line: key = value"
+      ini_current | while IFS= read -r kv; do printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"; done
+    } >"$tmp"
+    ${EDITOR:-nano} "$tmp"
+    ini_store "$(ini_pairs "$tmp")"
+    rm -f "$tmp"
+  fi
+  ok "saved ($(scope_label))"
+  cmd_rebuild
+}
+
+# ---------------------------------------------------------------------------
 # Commands: logs
 # ---------------------------------------------------------------------------
 log_files() {
@@ -1535,7 +1693,7 @@ cmd_edit() {
   need_config
   case "${1:-config}" in
     config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
-    php|ini|php.ini) write_default_php_ini; ${EDITOR:-nano} "$PHP_INI"; cmd_rebuild ;;
+    php|ini|php.ini) INI_SCOPE="global"; cmd_ini_edit --global ;;
     env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; svc_restart caddy; ok "restarted caddy" ;;
     *) die "Unknown file '$1' (use config, php, or env)" ;;
   esac
@@ -1730,6 +1888,12 @@ ${B}PHP${N}
   vhosty isolated                    List pinned sites
   ${D}php, php artisan and composer use the site's version inside its folder.${N}
 
+${B}PHP settings${N} ${D}(default scope: the current folder's site, else global)${N}
+  vhosty ini [--global|--site N]     Show settings
+  vhosty ini set <key> <value> [..]  Set one, e.g. vhosty ini set memory_limit 2G
+  vhosty ini unset <key> [..]        Remove one
+  vhosty ini edit [..]               Edit in \$EDITOR
+
 ${B}Services${N}
   vhosty start   [caddy|php|php-8.x] Start services (default: all)
   vhosty stop    [caddy|php|php-8.x] Stop services
@@ -1768,6 +1932,7 @@ main() {
     isolate)            cmd_isolate "${1:-}" "${2:-}" ;;
     unisolate)          cmd_unisolate "${1:-}" ;;
     isolated)           cmd_isolated ;;
+    ini)                cmd_ini "$@" ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;
     url)                cmd_url "${1:-}" ;;

@@ -1268,6 +1268,130 @@ cmd_parked() {
   parked_list | sed 's/^/  /'
 }
 
+# ---------------------------------------------------------------------------
+# Commands: links (one folder, anywhere, as a site)
+# ---------------------------------------------------------------------------
+# Folder name → hostname label: lowercase, anything else becomes a dash
+name_from_folder() { lower "$1" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//'; }
+
+# The parked folder that serves <name> directly, if any
+parked_dir_for() {
+  local name="$1" p f
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    for f in "$p"/*/; do
+      f="${f%/}"
+      [ -d "$f" ] && [ "$(lower "${f##*/}")" = "$name" ] && { echo "$f"; return 0; }
+    done
+  done <<EOF
+$(parked_list)
+EOF
+  return 1
+}
+
+cmd_link() {
+  need_config
+  local dir="" name="" existing
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name|-n) [ -n "${2:-}" ] || die "--name needs a value"; name="$2"; shift 2 ;;
+      -*) die "Unknown option '$1'. Usage: vhosty link [dir] [--name N]" ;;
+      *) [ -z "$dir" ] || die "Usage: vhosty link [dir] [--name N]"; dir="$1"; shift ;;
+    esac
+  done
+  dir="${dir:-$PWD}"
+  [ -d "$dir" ] || die "No such folder: $dir"
+  dir="$(cd "$dir" && pwd)"
+  [ -n "$name" ] || name="$(name_from_folder "${dir##*/}")"
+  name="$(lower "$name")"
+  valid_name "$name" || die "'$name' isn't a valid site name (letters, numbers, dashes). Pick one with --name"
+  printf '%s' "$name" | grep -qE '^[0-9]+$' && die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick one with --name"
+  site_load "$name"
+  if [ "$SITE_LINKED" = "yes" ] && [ "$SITE_PATH" != "$dir" ]; then
+    die "'$name' is already linked to $SITE_PATH. Unlink it first, or pick another name with --name"
+  fi
+  existing="$(parked_dir_for "$name" || true)"
+  if [ -n "$existing" ] && [ "$existing" != "$dir" ]; then
+    warn "$existing (parked) also answers to $name; the link takes over https://$name.$VHOSTY_DOMAIN"
+  fi
+  SITE_PATH="$dir"
+  SITE_LINKED="yes"
+  site_save "$name"
+  ok "linked $dir → https://$name.$VHOSTY_DOMAIN"
+  if [ ! -f "$dir/public/index.php" ] && [ ! -f "$dir/index.html" ]; then
+    warn "no public/index.php or index.html there yet"
+  fi
+  cmd_rebuild
+}
+
+cmd_unlink() {
+  need_config
+  local name parked
+  if [ -n "${1:-}" ]; then
+    name="$(lower "$1")"
+  else
+    name="$(site_from_dir "$PWD")" || die "$PWD isn't a linked site. Pass a name (see: vhosty links)"
+  fi
+  site_load "$name"
+  [ "$SITE_LINKED" = "yes" ] || die "'$name' isn't linked. Run: vhosty links"
+  parked="$(parked_dir_for "$name" || true)"
+  if [ -n "$parked" ] && [ "$parked" = "$SITE_PATH" ]; then
+    # Still served from its parked folder: keep its pin and settings
+    SITE_LINKED="no"
+    site_save "$name"
+  else
+    [ -z "$SITE_PHP$SITE_INI" ] || info "its PHP pin and settings are removed too"
+    rm -f "$(site_file "$name")"
+  fi
+  ok "unlinked $name"
+  [ -z "$parked" ] || info "https://$name.$VHOSTY_DOMAIN is still served from $parked (parked)"
+  cmd_rebuild
+}
+
+cmd_links() {
+  need_config
+  local name any=0 note
+  for name in $(site_names); do
+    site_load "$name"
+    [ "$SITE_LINKED" = "yes" ] || continue
+    any=1
+    note=""; [ -d "$SITE_PATH" ] || note="  ${R}(folder missing)${N}"
+    printf "  https://%s.%s  %s→ %s%s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$SITE_PATH" "$N" "$note"
+  done
+  [ "$any" = "1" ] || info "No links. Link a folder with: vhosty link [dir] [--name N]"
+}
+
+# Everything about one site
+cmd_site() {
+  need_config
+  local name dir kind v source settings sock
+  name="$(resolve_site "${1:-}")"
+  site_load "$name"
+  dir="$(site_dir "$name" || true)"
+  [ -n "$dir" ] || die "No site '$name'. Run: vhosty sites"
+  if [ "$SITE_LINKED" = "yes" ]; then source="linked"; else source="parked in ${dir%/*}"; fi
+  if [ ! -d "$dir" ]; then kind="${R}folder missing${N}"
+  elif php_enabled && [ -f "$dir/public/index.php" ]; then kind="PHP (public/index.php)"
+  elif [ -f "$dir/index.html" ]; then kind="static (index.html)"
+  else kind="${Y}nothing to serve yet${N} (no public/index.php or index.html)"; fi
+  v="$(site_php)"
+  if [ -n "$SITE_PHP" ] && ! php_is_installed "$SITE_PHP"; then v="$v ${R}(pinned $SITE_PHP isn't installed)${N}"
+  elif [ -n "$SITE_PHP" ]; then v="$v (pinned)"
+  else v="$v (default)"; fi
+  if [ -n "$SITE_INI" ]; then settings="own, on top of global"; sock="$(site_sock "$name")"
+  else settings="global"; sock="$(fpm_sock "$(site_php)")"; fi
+
+  printf "%s%s%s  https://%s.%s\n" "$B" "$name" "$N" "$name" "$VHOSTY_DOMAIN"
+  printf "  %-10s %s\n" "Folder" "$dir" "Source" "$source" "Serves" "$kind"
+  if php_enabled; then
+    printf "  %-10s %s\n" "PHP" "$v" "Settings" "$settings" "FPM" "$sock"
+    if [ -n "$SITE_INI" ]; then
+      printf '%s\n' "$SITE_INI" | while IFS= read -r kv; do printf "  %-10s %s = %s\n" "" "${kv%%=*}" "${kv#*=}"; done
+    fi
+  fi
+  [ ! -f "$(site_file "$name")" ] || printf "  %-10s %s\n" "Config" "$(site_file "$name")"
+}
+
 cmd_rebuild() {
   need_config
   write_configs
@@ -1616,9 +1740,12 @@ cmd_tail() {
 # ---------------------------------------------------------------------------
 cmd_sites() {
   need_config
-  local dir p name re='^[A-Za-z0-9-]+$'
-  [ -n "$VHOSTY_PARKED" ] || die "Nothing parked. Run: vhosty park <folder>"
+  local dir p name re='^[A-Za-z0-9-]+$' linked
+  linked="$(cmd_links 2>/dev/null | grep https || true)"
+  [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
+  if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
   while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
     head_ "$dir"
     for p in "$dir"/*/; do
       [ -d "$p" ] || continue
@@ -1874,7 +2001,11 @@ ${B}Sites${N}
   vhosty park [dir]                  Serve every folder in dir (default: current)
   vhosty unpark [dir]                Stop serving a parked folder
   vhosty parked                      List parked folders
+  vhosty link [dir] [--name N]       Serve one folder, anywhere, as N.domain (default: current)
+  vhosty unlink [name]               Remove a link
+  vhosty links                       List links
   vhosty sites                       List sites and their URLs
+  vhosty site [name]                 Everything about one site (default: current folder)
   vhosty open [site|port]            Open in the browser (default: current folder)
   vhosty url  [site|port]            Print the URL and copy it
 
@@ -1925,8 +2056,12 @@ main() {
 
   case "$cmd" in
     setup)              cmd_setup "$@" ;;
-    park|link)          cmd_park "${1:-}" ;;
-    unpark|unlink)      cmd_unpark "${1:-}" ;;
+    park)               cmd_park "${1:-}" ;;
+    unpark)             cmd_unpark "${1:-}" ;;
+    link)               cmd_link "$@" ;;
+    unlink)             cmd_unlink "${1:-}" ;;
+    links)              cmd_links ;;
+    site|info)          cmd_site "${1:-}" ;;
     parked)             cmd_parked ;;
     php)                cmd_php "$@" ;;
     isolate)            cmd_isolate "${1:-}" "${2:-}" ;;

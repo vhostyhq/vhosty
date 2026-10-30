@@ -90,7 +90,8 @@ _vhosty() {
     'update:Re-download Caddy (or PHP-FPM on macOS)'
     'validate:Check the generated config'
     'cert:Show the wildcard certificate'
-    'doctor:Check everything end to end'
+    'doctor:Check everything end to end (--fix repairs)'
+    'prune:Remove configs for sites whose folder is gone'
     'ip:Tailscale IP'
     'domain:Configured domain'
     'paths:Where everything lives'
@@ -151,6 +152,8 @@ _vhosty() {
       else
         _vhosty_docker_services
       fi ;;
+    doctor|dr)     _values 'option' --fix --yes ;;
+    prune)         _values 'option' --yes ;;
     setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token]:token:' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--yes[Accept defaults]' ;;
   esac
 }

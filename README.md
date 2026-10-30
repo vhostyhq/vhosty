@@ -106,7 +106,8 @@ fpath=(~/.vhosty/completions $fpath)   # before compinit
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live |
-| `vhosty doctor` | Check Tailscale, DNS, the certificate, config, sites, services, and a live HTTPS request |
+| `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
+| `vhosty prune` | Remove configs for sites whose folder is gone, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
 | `vhosty update [caddy]` | Re-download Caddy |
 | `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
@@ -243,7 +244,13 @@ On **Linux**, turn off automatic suspend (GNOME: Settings → Power).
 
 ## Troubleshooting
 
-Start with `vhosty doctor`. It checks everything below.
+Start with `vhosty doctor`. It checks everything below, and `vhosty doctor --fix`
+repairs what it can: DNS, configs for deleted sites, missing extensions, a stale
+config, stopped services and Docker services. It asks before each fix (`--yes`
+skips the questions).
+
+Deleting a project doesn't delete its vhosty settings (PHP pin, settings,
+extensions), in case the folder comes back. `vhosty prune` lists and removes them.
 
 | Symptom | Fix |
 |---|---|

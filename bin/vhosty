@@ -438,6 +438,7 @@ php_versions_in_use() {
     php_default
     for name in $(site_names); do
       site_load "$name"
+      [ -n "$SITE_PATH" ] && [ ! -d "$SITE_PATH" ] && continue   # folder gone (see: vhosty prune)
       [ -n "$SITE_PHP" ] && php_is_installed "$SITE_PHP" && echo "$SITE_PHP"
     done
   } | grep . | awk '!seen[$0]++' || true
@@ -772,6 +773,7 @@ EOF
     for name in $(site_names); do
       site_load "$name"
       [ -n "$SITE_INI" ] && [ "$(site_php)" = "$v" ] || continue
+      [ -z "$SITE_PATH" ] || [ -d "$SITE_PATH" ] || continue
       cat <<EOF
 
 [site-$name]
@@ -2230,9 +2232,184 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Command: prune (configs and leftovers for things that are gone)
+# ---------------------------------------------------------------------------
+# Site configs whose folder no longer exists
+stale_sites() {
+  local name dir
+  for name in $(site_names); do
+    site_load "$name"
+    dir="$(site_dir "$name" || true)"
+    [ -n "$dir" ] && [ -d "$dir" ] || echo "$name"
+  done
+}
+
+# Generated files nothing uses any more: "path<TAB>why"
+prune_leftovers() {
+  local d v f keep
+  keep=" $(php_versions_in_use | tr '\n' ' ') "
+  for d in "$PHP_CONF_DIR"/*/; do
+    [ -d "$d" ] || continue
+    v="${d%/}"; v="${v##*/}"
+    case "$keep" in *" $v "*) ;; *) printf '%s\tFPM config for PHP %s, which no site uses\n' "${d%/}" "$v" ;; esac
+  done
+  for f in "$RUN_DIR"/php-*.sock "$RUN_DIR"/php-*.pid; do
+    [ -e "$f" ] || continue
+    v="${f##*/php-}"; v="${v%.*}"
+    case "$keep" in *" $v "*) continue ;; esac
+    [ "$(svc_state "php-$v")" = "running" ] || printf '%s\tPHP %s isn'"'"'t running\n' "$f" "$v"
+  done
+  for f in "$RUN_DIR"/site-*.sock; do
+    [ -e "$f" ] || continue
+    grep -qsF "listen = $f" "$PHP_CONF_DIR"/*/php-fpm.conf || printf '%s\tsocket for a pool that no longer exists\n' "$f"
+  done
+}
+
+describe_site() { # one line about a site config: what would be lost
+  local what=""
+  site_load "$1"
+  [ "$SITE_LINKED" != "yes" ] || what="link"
+  [ -z "$SITE_PHP" ] || what="${what:+$what, }PHP $SITE_PHP"
+  [ -z "$SITE_INI" ] || what="${what:+$what, }settings ($(printf '%s\n' "$SITE_INI" | cut -d= -f1 | tr '\n' ' ' | sed 's/ $//'))"
+  [ -z "$SITE_EXT" ] || what="${what:+$what, }extensions ($SITE_EXT)"
+  printf '%s  %s(%s; was %s)%s' "$1" "$D" "${what:-no settings}" "${SITE_PATH:-?}" "$N"
+}
+
+cmd_prune() {
+  need_config
+  local yes=0 rebuild=1 stale leftovers name f why
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y|--yes) yes=1; shift ;;
+      --no-rebuild) rebuild=0; shift ;;
+      *) die "Usage: vhosty prune [--yes]" ;;
+    esac
+  done
+  stale="$(stale_sites)"
+  # Leftovers are counted as if the stale sites were already gone
+  leftovers="$(prune_leftovers)"
+  if [ -z "$stale" ] && [ -z "$leftovers" ]; then ok "nothing to prune"; return 0; fi
+  if [ -n "$stale" ]; then
+    head_ "Sites whose folder is gone"
+    for name in $stale; do printf '  %s\n' "$(describe_site "$name")"; done
+  fi
+  if [ -n "$leftovers" ]; then
+    head_ "Leftover files"
+    printf '%s\n' "$leftovers" | while IFS="$(printf '\t')" read -r f why; do printf '  %s  %s(%s)%s\n' "${f#"$VHOSTY_DIR"/}" "$D" "$why" "$N"; done
+  fi
+  echo
+  if [ "$yes" != "1" ]; then
+    has_tty || die "Not removing anything without a terminal. Run: vhosty prune --yes"
+    confirm "Remove these?" Y || { info "Nothing removed."; return 0; }
+  fi
+  for name in $stale; do rm -f "$(site_file "$name")"; ok "removed site $name"; done
+  printf '%s\n' "$leftovers" | while IFS="$(printf '\t')" read -r f why; do
+    [ -n "$f" ] || continue
+    rm -rf "$f"; ok "removed ${f#"$VHOSTY_DIR"/}"
+  done
+  if [ -n "$stale" ] && [ "$rebuild" = "1" ] && svc_installed; then cmd_rebuild; fi
+}
+
+# ---------------------------------------------------------------------------
+# doctor --fix
+# ---------------------------------------------------------------------------
+# "version ext" for every site's missing extensions
+missing_ext_pairs() {
+  local name dir v
+  while IFS="|" read -r name dir; do
+    [ -n "$name" ] || continue
+    site_load "$name"
+    v="$(site_php)"
+    missing_exts "$dir" "$v" | cut -f1 | sed "s/^/$v /"
+  done <<EOF
+$(all_php_sites)
+EOF
+}
+
+# Docker services that are defined but not running
+docker_down() {
+  local defined rows svc
+  defined="$(dc config --services 2>/dev/null | sort)"
+  rows="$(services_rows)"
+  for svc in $defined; do
+    printf '%s\n' "$rows" | grep -q "^$svc|running|" || echo "$svc"
+  done
+}
+
+fix_ok() { # fix_ok "what"
+  if [ "$FIX_YES" = "1" ]; then step "$1"; return 0; fi
+  printf "\n"
+  confirm "${B}Fix:${N} $1?" Y
+}
+
+doctor_fix() {
+  local ip resolved s v exts pairs down need_rebuild=0 fixed=0
+  head_ "Fixing"
+
+  ip="$(ts_ip)"
+  resolved="$(dig +short "vhosty-doctor.$VHOSTY_DOMAIN" A 2>/dev/null | tail -1 || true)"
+  if [ -n "$ip" ] && [ "$resolved" != "$ip" ] && fix_ok "point *.$VHOSTY_DOMAIN at $ip (vhosty dns sync)"; then
+    dns_sync; need_rebuild=1; fixed=1
+  fi
+
+  if [ -n "$(stale_sites)" ] && fix_ok "remove configs for sites whose folder is gone (vhosty prune)"; then
+    cmd_prune --yes --no-rebuild; need_rebuild=1; fixed=1
+  fi
+
+  if php_enabled && is_linux; then
+    pairs="$(missing_ext_pairs | sort -u)"
+    for v in $(printf '%s\n' "$pairs" | cut -d' ' -f1 | grep . | sort -u); do
+      exts="$(printf '%s\n' "$pairs" | awk -v v="$v" '$1 == v {print $2}' | tr '\n' ' ' | sed 's/ $//')"
+      # shellcheck disable=SC2086
+      if fix_ok "install on PHP $v: $exts (vhosty ext install)"; then install_exts "$v" $exts; fixed=1; fi
+    done
+  fi
+
+  if ! config_in_sync || ! config_applied; then need_rebuild=1; fi
+  for s in $(svc_all); do [ "$(svc_state "$s")" = "running" ] || need_rebuild=1; done
+  if [ "$need_rebuild" = "1" ] && svc_installed && fix_ok "regenerate config and start or reload services (vhosty rebuild)"; then
+    cmd_rebuild; fixed=1
+  fi
+
+  if [ -n "$VHOSTY_SERVICES_DIR" ] && ( need_services ) 2>/dev/null; then
+    down="$(docker_down | tr '\n' ' ' | sed 's/ $//')"
+    # shellcheck disable=SC2086
+    if [ -n "$down" ] && fix_ok "start Docker services: $down (vhosty services up)"; then dc up -d $down; fixed=1; fi
+  fi
+
+  [ "$fixed" = "1" ] || info "nothing doctor can fix on its own. See the checks above."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Command: doctor
 # ---------------------------------------------------------------------------
 cmd_doctor() {
+  local fix=0
+  FIX_YES=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fix) fix=1; shift ;;
+      -y|--yes) FIX_YES=1; shift ;;
+      *) die "Usage: vhosty doctor [--fix [--yes]]" ;;
+    esac
+  done
+  if [ "$fix" = "1" ] && [ "$FIX_YES" != "1" ] && ! has_tty; then
+    die "doctor --fix asks before each fix. Without a terminal, add --yes"
+  fi
+  if [ "$fix" = "1" ]; then
+    doctor_checks && return 0
+    doctor_fix
+    printf "\n%sChecking again%s\n" "$B" "$N"
+    local out rc=0
+    out="$(doctor_checks 2>&1)" || rc=1
+    printf '%s\n' "$out" | grep -E '✗|All good|Some checks' || true
+    return $rc
+  fi
+  doctor_checks
+}
+
+doctor_checks() {
   need_config
   FAILED=0
   is_macos && sudo -v
@@ -2280,7 +2457,7 @@ cmd_doctor() {
     site_load "$name"
     dir="$(site_dir "$name" || true)"
     if [ -z "$dir" ] || [ ! -d "$dir" ]; then
-      bad "site $name: folder ${dir:-?} is gone. Remove it: vhosty unlink $name, or rm $(site_file "$name")"
+      bad "site $name: folder ${dir:-?} is gone. Remove its config: vhosty prune"
     fi
     if [ -n "$SITE_PHP" ] && ! php_is_installed "$SITE_PHP"; then
       bad "site $name is pinned to PHP $SITE_PHP, which isn't installed (using $(php_default)). Run: vhosty php install $SITE_PHP"
@@ -2329,7 +2506,7 @@ cmd_doctor() {
   if [ "$FAILED" = "0" ]; then
     printf "%sAll good.%s\n" "$G" "$N"
   else
-    printf "%sSome checks failed. See above.%s\n" "$R" "$N"
+    printf "%sSome checks failed. See above, or run: vhosty doctor --fix%s\n" "$R" "$N"
     return 1
   fi
 }
@@ -2424,7 +2601,8 @@ ${B}Config${N}
   vhosty update [caddy|php [8.x]]    Re-download Caddy (or PHP-FPM, on macOS)
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry
-  vhosty doctor                      Check DNS, certs, services, and HTTPS end to end
+  vhosty doctor [--fix [--yes]]      Check DNS, certs, config, sites, services, and HTTPS; --fix repairs
+  vhosty prune [--yes]               Remove configs for sites whose folder is gone, and leftovers
   vhosty ip | domain | paths         Quick lookups
   vhosty version
 EOF
@@ -2467,7 +2645,8 @@ main() {
     update)             cmd_update "${1:-all}" "${2:-}" ;;
     validate|check)     need_config; cmd_validate "${1:-all}" ;;
     cert|certs)         cmd_cert ;;
-    doctor|dr)          cmd_doctor ;;
+    doctor|dr)          cmd_doctor "$@" ;;
+    prune)              cmd_prune "$@" ;;
     ip)                 local ip; ip="$(ts_ip)"; [ -n "$ip" ] || die "Tailscale isn't running"; echo "$ip" ;;
     domain)             need_config; echo "$VHOSTY_DOMAIN" ;;
     paths)              cmd_paths ;;

@@ -101,3 +101,33 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   run curl -s -H 'Host: <b>x.test.example' "http://127.0.0.1:$PORT/"
   refute_contains "$output" "<b>x"
 }
+
+@test "a static site doesn't serve dotfiles, but does serve .well-known" {
+  static_site front
+  echo "SECRET=1" >"$PARKED/front/.env"
+  mkdir -p "$PARKED/front/.git" "$PARKED/front/assets/.cache" "$PARKED/front/.well-known"
+  echo "[core]" >"$PARKED/front/.git/config"
+  echo "x" >"$PARKED/front/assets/.cache/x"
+  echo "contact" >"$PARKED/front/.well-known/security.txt"
+  start_caddy
+  for p in /.env /.git/config /assets/.cache/x /%2eenv; do
+    run get front "$p"
+    [ "$(echo "$output" | tail -1)" = 404 ] || { echo "$p: $output" >&2; false; }
+    refute_contains "$output" "SECRET"
+  done
+  run get front /.well-known/security.txt
+  [ "$(echo "$output" | tail -1)" = 200 ]
+}
+
+@test "a configured static site doesn't serve dotfiles either" {
+  mkdir -p "$HOME/Projects/docs"
+  echo "<h1>docs</h1>" >"$HOME/Projects/docs/index.html"
+  echo "SECRET=1" >"$HOME/Projects/docs/.env"
+  site_conf docs "SITE_PATH=$HOME/Projects/docs
+SITE_LINKED=yes"
+  start_caddy
+  run get docs /.env
+  [ "$(echo "$output" | tail -1)" = 404 ]
+  run get docs /
+  [ "$(echo "$output" | tail -1)" = 200 ]
+}

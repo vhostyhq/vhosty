@@ -710,6 +710,14 @@ resolve_site() {
 # ---------------------------------------------------------------------------
 # Rules for configured sites, and parked folders with capitals in their name.
 # They come before the parked wildcards, so a pin or a link wins over the default.
+# For a static site served from a project folder: .env, .git and any other
+# dotfile answer 404 (index.html sits at the root, next to them), except
+# .well-known. Matched on the request path, not the file's, so a parked
+# folder inside a dot-folder still works.
+static_hide() {
+  printf '\t\t@%s {\n\t\t\tpath */.*\n\t\t\tnot path /.well-known/*\n\t\t}\n\t\terror @%s 404' "$1" "$1"
+}
+
 caddy_sites() {
   local name dir v sock
   for name in $(site_names) $(case_sites); do
@@ -744,6 +752,7 @@ EOF
 	@site_$name host $name.$VHOSTY_DOMAIN
 	handle @site_$name {
 		root * "$dir"
+$(static_hide "dot_$name")
 		file_server
 	}
 EOF
@@ -813,6 +822,7 @@ EOF
 	}
 	handle @static$i {
 		root * "$dir/{labels.$depth}"
+$(static_hide "dot$i")
 		file_server
 	}
 EOF

@@ -78,6 +78,9 @@ VHOSTY_BACKUP_DIR=""      # where `vhosty services backup` saves; empty = ~/.vho
 VHOSTY_BACKUP_KEEP="7"    # backups to keep there
 VHOSTY_ALLOW_DEBUG=""     # yes = doctor doesn't warn about APP_DEBUG=true (only you on the tailnet)
 VHOSTY_PORTS="3000-5999 6006 8000-8099 8888"   # ports <port>.domain reaches (dev servers)
+VHOSTY_DNS="cloudflare"   # DNS provider: cloudflare digitalocean porkbun route53, or custom
+VHOSTY_DNS_PLUGIN=""      # custom: the Caddy plugin, e.g. github.com/caddy-dns/gandi
+VHOSTY_DNS_TLS=""         # custom: its Caddyfile line, e.g. dns gandi {env.GANDI_BEARER_TOKEN}
 
 FAILED=0
 
@@ -178,7 +181,8 @@ save_config() {
   {
     echo "# vhosty config. After editing, run: vhosty rebuild"
     for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
-      VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_ALLOW_DEBUG VHOSTY_PORTS; do
+      VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_ALLOW_DEBUG VHOSTY_PORTS \
+      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS; do
       printf '%s=%q\n' "$k" "${!k}"
     done
   } >"$CONFIG_FILE"
@@ -209,21 +213,69 @@ EOF
   VHOSTY_PARKED="$new"
 }
 
-load_token() {
-  CF_API_TOKEN="${CF_API_TOKEN:-}"
-  local f
+# load_secret NAME: from the environment, else ~/.vhosty/.env (which Caddy
+# also reads: every DNS provider's credentials live there)
+load_secret() {
+  local f v="${!1:-}"
   # Second path: the hand-built layout (~/.vhosty/caddy/.env) from before `vhosty setup`
   for f in "$SECRETS_FILE" "$VHOSTY_DIR/caddy/.env"; do
-    if [ -z "$CF_API_TOKEN" ] && [ -f "$f" ]; then
-      CF_API_TOKEN="$(sed -n 's/^CF_API_TOKEN=//p' "$f" | head -1)"
-    fi
+    if [ -z "$v" ] && [ -f "$f" ]; then v="$(sed -n "s/^$1=//p" "$f" | head -1)"; fi
   done
+  printf -v "$1" '%s' "$v"
 }
 
-save_token() {
+# save_secret NAME VALUE: sets it in ~/.vhosty/.env (mode 600), keeping the rest
+save_secret() {
+  local tmp="$SECRETS_FILE.tmp"
   mkdir -p "$VHOSTY_DIR"
-  ( umask 077; printf 'CF_API_TOKEN=%s\n' "$1" >"$SECRETS_FILE" )
+  ( umask 077
+    { [ ! -f "$SECRETS_FILE" ] || grep -v "^$1=" "$SECRETS_FILE" || true
+      printf '%s=%s\n' "$1" "$2"; } >"$tmp" )
+  mv "$tmp" "$SECRETS_FILE"
   chmod 600 "$SECRETS_FILE"
+}
+
+load_token() { load_secret CF_API_TOKEN; }
+save_token() { save_secret CF_API_TOKEN "$1"; }
+
+# The DNS provider: sets DNS_NAME, DNS_PLUGIN (Caddy plugin), DNS_MODULE,
+# DNS_VARS (its credentials, in ~/.vhosty/.env), DNS_TLS (Caddyfile lines in
+# the tls block), DNS_HELP, and DNS_MANAGED (yes: vhosty keeps the *.domain
+# record itself, through the API; otherwise you create it once)
+dns_provider() {
+  local name
+  DNS_MANAGED="no"; DNS_VARS=""; DNS_HELP=""
+  case "${VHOSTY_DNS:-cloudflare}" in
+    cloudflare)
+      DNS_NAME="Cloudflare"; DNS_PLUGIN="github.com/caddy-dns/cloudflare"; DNS_MANAGED="yes"
+      DNS_VARS="CF_API_TOKEN"; DNS_TLS="dns cloudflare {env.CF_API_TOKEN}"
+      DNS_HELP="dash.cloudflare.com → My Profile → API Tokens → 'Edit zone DNS' (Zone → Read, DNS → Edit)" ;;
+    digitalocean)
+      DNS_NAME="DigitalOcean"; DNS_PLUGIN="github.com/caddy-dns/digitalocean"
+      DNS_VARS="DO_AUTH_TOKEN"; DNS_TLS="dns digitalocean {env.DO_AUTH_TOKEN}"
+      DNS_HELP="cloud.digitalocean.com → API → Tokens (with read and write for domains)" ;;
+    porkbun)
+      DNS_NAME="Porkbun"; DNS_PLUGIN="github.com/caddy-dns/porkbun"
+      DNS_VARS="PORKBUN_API_KEY PORKBUN_API_SECRET_KEY"
+      DNS_TLS="dns porkbun {
+	api_key {env.PORKBUN_API_KEY}
+	api_secret_key {env.PORKBUN_API_SECRET_KEY}
+}"
+      DNS_HELP="porkbun.com → Account → API Access, then turn on API access for the domain" ;;
+    route53)
+      DNS_NAME="Amazon Route 53"; DNS_PLUGIN="github.com/caddy-dns/route53"
+      # The plugin reads these itself (the AWS SDK), from Caddy's environment
+      DNS_VARS="AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION"; DNS_TLS="dns route53"
+      DNS_HELP="an IAM user allowed route53:ListHostedZonesByName, ListResourceRecordSets, ChangeResourceRecordSets and GetChange" ;;
+    custom)
+      DNS_NAME="your DNS provider"; DNS_PLUGIN="$VHOSTY_DNS_PLUGIN"; DNS_TLS="$VHOSTY_DNS_TLS"
+      [ -n "$DNS_PLUGIN" ] && [ -n "$DNS_TLS" ] || die "VHOSTY_DNS=custom needs, in ~/.vhosty/config, VHOSTY_DNS_PLUGIN (a Caddy DNS plugin, like github.com/caddy-dns/gandi) and VHOSTY_DNS_TLS (its Caddyfile line, like: dns gandi {env.GANDI_BEARER_TOKEN}). Its credentials go in ~/.vhosty/.env."
+      DNS_HELP="the plugin's README (https://${DNS_PLUGIN%/v[0-9]*})" ;;
+    *) die "VHOSTY_DNS: '$VHOSTY_DNS' isn't a provider vhosty knows: cloudflare, digitalocean, porkbun, route53, or custom" ;;
+  esac
+  name="${DNS_TLS#dns }"; name="${name%%[ {
+]*}"
+  DNS_MODULE="dns.providers.$name"
 }
 
 php_enabled() { [ "$VHOSTY_PHP" = "on" ]; }
@@ -384,6 +436,42 @@ cf_zone_id() {
 }
 
 # Creates or updates the *.domain A record → this machine's Tailscale IP, DNS only
+# Points *.domain at this machine: through the API for Cloudflare; for
+# other providers, says which record to make and checks it's there
+dns_point() {
+  local ip resolved
+  dns_provider
+  if [ "$DNS_MANAGED" = "yes" ]; then dns_sync; return; fi
+  ip="$(ts_ip)"
+  [ -n "$ip" ] || die "Couldn't get this machine's Tailscale IP. Is Tailscale running?"
+  resolved="$(resolve_a "vhosty-doctor.$VHOSTY_DOMAIN")"
+  if [ "$resolved" = "$ip" ]; then ok "*.$VHOSTY_DOMAIN → $ip"; return 0; fi
+  if [ -n "$resolved" ]; then warn "*.$VHOSTY_DOMAIN points to $resolved, not this machine ($ip)."
+  else warn "*.$VHOSTY_DOMAIN doesn't resolve yet."; fi
+  info "At $DNS_NAME, create (or change) this record, then run: vhosty doctor"
+  printf '      %s*.%s   A   %s%s   (DNS only, any TTL)\n' "$B" "$VHOSTY_DOMAIN" "$ip" "$N"
+  info "The certificate doesn't need it (it's checked over DNS); browsers do."
+}
+
+# The provider's credentials, from the environment, saved, or asked for
+dns_credentials() {
+  local v
+  step "$DNS_NAME credentials"
+  if [ -z "$DNS_VARS" ]; then
+    info "Put what $DNS_TLS needs in $SECRETS_FILE (vhosty edit env); see $DNS_HELP"
+    return 0
+  fi
+  info "From $DNS_HELP"
+  for v in $DNS_VARS; do
+    load_secret "$v"
+    if [ -n "${!v}" ] && ! confirm "Use the saved $v?" Y; then printf -v "$v" '%s' ""; fi
+    [ -n "${!v}" ] || printf -v "$v" '%s' "$(ask_secret "$v")"
+    [ -n "${!v}" ] || die "$v is required"
+    save_secret "$v" "${!v}"
+  done
+  ok "saved to $SECRETS_FILE (readable only by you)"
+}
+
 dns_sync() {
   local ip zone name r rid current proxied body
   ip="$(ts_ip)"
@@ -478,21 +566,25 @@ install_caddy() {
   local os arch url tmp
   os="darwin"; is_macos || os="linux"
   arch="$(arch_name)"
-  url="https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare"
+  dns_provider
+  url="https://caddyserver.com/api/download?os=$os&arch=$arch&p=${DNS_PLUGIN//\//%2F}"
   mkdir -p "$BIN_DIR"
   make_tmp tmp
-  info "downloading Caddy with the Cloudflare DNS plugin ($os/$arch)"
+  info "downloading Caddy with the $DNS_NAME DNS plugin ($os/$arch)"
   download "$url" "$tmp" || die "Caddy download failed"
   chmod 700 "$tmp"   # it may bind ports below 1024: yours to run, nobody else's
   if is_macos; then xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true; fi
-  "$tmp" list-modules 2>/dev/null | grep -q dns.providers.cloudflare \
-    || die "Downloaded Caddy is missing the Cloudflare plugin, or doesn't run on this system"
+  "$tmp" list-modules 2>/dev/null | grep -qx "$DNS_MODULE" \
+    || die "Downloaded Caddy is missing the $DNS_NAME plugin ($DNS_MODULE), or doesn't run on this system"
   mv "$tmp" "$CADDY_BIN"
   caddy_allow_ports
   ok "Caddy $("$CADDY_BIN" version | awk '{print $1}')"
 }
 
-caddy_installed() { [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; }
+caddy_installed() { # with the DNS provider's plugin
+  dns_provider
+  [ -x "$CADDY_BIN" ] && "$CADDY_BIN" list-modules 2>/dev/null | grep -qx "$DNS_MODULE"
+}
 
 # ---------------------------------------------------------------------------
 # PHP versions
@@ -839,6 +931,7 @@ check_ports() {
 write_caddyfile() {
   local depth i=0 dir v ip bind name sites="" cased
   check_ports
+  dns_provider
   mkdir -p "$RUN_DIR"   # for the admin socket
   depth="$(domain_depth)"
   v="$(php_default)"
@@ -863,7 +956,7 @@ write_caddyfile() {
 
 *.$VHOSTY_DOMAIN {
 	tls {
-		dns cloudflare {env.CF_API_TOKEN}
+$(printf '%s\n' "$DNS_TLS" | sed 's/^/		/')
 	}
 
 EOF
@@ -1559,17 +1652,18 @@ config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(g
 # Commands: setup
 # ---------------------------------------------------------------------------
 cmd_setup() {
-  local domain="" token="" park="" php="" yes=0 ip o v
+  local domain="" token="" park="" php="" dns="" yes=0 ip o v
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) domain="$2"; shift 2 ;;
       --token)  token="$2"; shift 2 ;;
       --park)   park="$2"; shift 2 ;;
+      --dns)    dns="$2"; shift 2 ;;
       --no-php) php="off"; shift ;;
       --php)    php="on"; shift ;;
       -y|--yes) yes=1; shift ;;
       --overwrite-dns) export VHOSTY_OVERWRITE_DNS=1; shift ;;
-      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--park DIR] [--no-php] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
+      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
     esac
   done
   [ "$yes" = "1" ] && export VHOSTY_YES=1
@@ -1596,29 +1690,41 @@ cmd_setup() {
   migrate_config
   migrate_php_fpm
 
+  step "DNS provider"
+  info "Where the domain's DNS is: cloudflare (vhosty manages the record), digitalocean,"
+  info "porkbun, route53, or custom (any Caddy DNS plugin; see the README)."
+  [ -n "$dns" ] || dns="$(ask "DNS provider" "${VHOSTY_DNS:-cloudflare}")"
+  VHOSTY_DNS="$(lower "$dns")"
+  dns_provider
+  ok "$DNS_NAME"
+
   step "Domain"
-  info "A domain whose DNS is on Cloudflare. vhosty points *.domain at this machine."
+  info "A domain whose DNS is on $DNS_NAME. vhosty points *.domain at this machine."
   info "Already using the domain's wildcard for something else? Use a subdomain, like box.example.com."
   [ -n "$domain" ] || domain="$(ask "Domain" "$VHOSTY_DOMAIN")"
   domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]' | sed -E 's#^https?://##; s#^\*\.##; s#/.*$##')"
   printf '%s' "$domain" | grep -qE '^[a-z0-9-]+(\.[a-z0-9-]+)+$' || die "'$domain' doesn't look like a domain"
   VHOSTY_DOMAIN="$domain"
 
-  step "Cloudflare API token"
-  load_token
-  if [ -n "$token" ]; then
-    CF_API_TOKEN="$token"
-  elif [ -n "$CF_API_TOKEN" ] && confirm "Use the saved token?" Y; then
-    :
+  if [ "$VHOSTY_DNS" = "cloudflare" ]; then
+    step "Cloudflare API token"
+    load_token
+    if [ -n "$token" ]; then
+      CF_API_TOKEN="$token"
+    elif [ -n "$CF_API_TOKEN" ] && confirm "Use the saved token?" Y; then
+      :
+    else
+      info "Create one at dash.cloudflare.com → My Profile → API Tokens → 'Edit zone DNS'."
+      info "It needs Zone → Read and DNS → Edit for $VHOSTY_DOMAIN."
+      CF_API_TOKEN="$(ask_secret "Token")"
+    fi
+    [ -n "$CF_API_TOKEN" ] || die "A token is required"
+    cf_verify_token || die "Cloudflare rejected that token"
+    save_token "$CF_API_TOKEN"
+    ok "token is valid (saved to $SECRETS_FILE, readable only by you)"
   else
-    info "Create one at dash.cloudflare.com → My Profile → API Tokens → 'Edit zone DNS'."
-    info "It needs Zone → Read and DNS → Edit for $VHOSTY_DOMAIN."
-    CF_API_TOKEN="$(ask_secret "Token")"
+    dns_credentials
   fi
-  [ -n "$CF_API_TOKEN" ] || die "A token is required"
-  cf_verify_token || die "Cloudflare rejected that token"
-  save_token "$CF_API_TOKEN"
-  ok "token is valid (saved to $SECRETS_FILE, readable only by you)"
 
   step "Parked folders"
   info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
@@ -1660,7 +1766,7 @@ cmd_setup() {
   fi
 
   step "DNS"
-  dns_sync
+  dns_point
 
   step "Config"
   write_configs
@@ -3280,8 +3386,10 @@ cmd_validate() {
   local target="${1:-all}" rc=0 v out
   case "$target" in all|caddy|php|php-fpm) ;; *) die "Usage: vhosty validate [caddy|php]" ;; esac
   if [ "$target" = "all" ] || [ "$target" = "caddy" ]; then
-    load_token
-    if out="$(CF_API_TOKEN="$CF_API_TOKEN" "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"; then
+    # with the credentials Caddy runs with (some plugins check their format)
+    set -- validate --config "$CADDYFILE" --adapter caddyfile
+    [ ! -f "$SECRETS_FILE" ] || set -- "$@" --envfile "$SECRETS_FILE"
+    if out="$("$CADDY_BIN" "$@" 2>&1)"; then
       ok "Caddyfile is valid"
     else
       bad "Caddyfile has errors:"
@@ -3342,10 +3450,10 @@ cmd_cert() {
   [ -z "$days" ] || left=" in $days day$([ "$days" = "1" ] || echo s)"
   if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
     bad "certificate for *.$VHOSTY_DOMAIN has expired: Caddy couldn't renew it"; rc=1
-    info "See why: vhosty logs caddy. A deleted or expired Cloudflare token is the usual cause: vhosty edit env"
+    dns_provider; info "See why: vhosty logs caddy. Deleted or expired $DNS_NAME credentials are the usual cause: vhosty edit env"
   elif ! openssl x509 -in "$crt" -noout -checkend $((CERT_WARN_DAYS * 86400)) >/dev/null 2>&1; then
     warn "certificate for *.$VHOSTY_DOMAIN expires$left, and Caddy should have renewed it by now"
-    info "See why: vhosty logs caddy. A deleted or expired Cloudflare token is the usual cause: vhosty edit env"
+    dns_provider; info "See why: vhosty logs caddy. Deleted or expired $DNS_NAME credentials are the usual cause: vhosty edit env"
   else
     ok "certificate for *.$VHOSTY_DOMAIN (expires$left)"
   fi
@@ -3357,7 +3465,7 @@ cmd_dns() {
   need_config
   case "${1:-sync}" in
     sync)
-      dns_sync
+      dns_point
       # Caddy listens on the Tailscale IP, so a new IP needs a new Caddyfile
       if svc_installed && ! grep -q "default_bind $(ts_ip) " "$CADDYFILE" 2>/dev/null; then cmd_rebuild; fi
       ;;
@@ -3621,8 +3729,13 @@ doctor_fix() {
 
   ip="$(ts_ip)"
   resolved="$(resolve_a "vhosty-doctor.$VHOSTY_DOMAIN")"
-  if [ -n "$ip" ] && [ "$resolved" != "$ip" ] && fix_ok "point *.$VHOSTY_DOMAIN at $ip (vhosty dns sync)"; then
-    dns_sync; need_rebuild=1; fixed=1
+  dns_provider
+  if [ -n "$ip" ] && [ "$resolved" != "$ip" ]; then
+    if [ "$DNS_MANAGED" != "yes" ]; then
+      dns_point   # can't change it ourselves: says which record to make
+    elif fix_ok "point *.$VHOSTY_DOMAIN at $ip (vhosty dns sync)"; then
+      dns_sync; need_rebuild=1; fixed=1
+    fi
   fi
 
   if [ -n "$(stale_sites)" ] && fix_ok "remove configs for sites whose folder is gone or no longer parked (vhosty prune)"; then
@@ -3687,31 +3800,36 @@ doctor_checks() {
   need_config
   FAILED=0
   is_macos && sudo -v
-  local ip probe resolved s st code o v name dir latest
+  local ip probe resolved s st code o v name dir latest missing
   ip="$(ts_ip)"
   probe="vhosty-doctor.$VHOSTY_DOMAIN"
   printf "%svhosty doctor%s  (*.%s)\n" "$B" "$N" "$VHOSTY_DOMAIN"
 
+  dns_provider
   head_ "Network"
   if [ -n "$ip" ]; then ok "Tailscale IP: $ip"; else bad "Tailscale isn't running, or its CLI wasn't found"; fi
   resolved="$(resolve_a "$probe")"
   if [ -z "$resolved" ]; then
-    bad "*.$VHOSTY_DOMAIN doesn't resolve. Run: vhosty dns sync"
+    bad "*.$VHOSTY_DOMAIN doesn't resolve. Run: vhosty dns sync$([ "$DNS_MANAGED" = yes ] || echo " (it shows the record to create)")"
   elif [ -n "$ip" ] && [ "$resolved" != "$ip" ]; then
-    bad "*.$VHOSTY_DOMAIN resolves to $resolved, expected $ip. Run: vhosty dns sync"
+    bad "*.$VHOSTY_DOMAIN resolves to $resolved, expected $ip. Run: vhosty dns sync$([ "$DNS_MANAGED" = yes ] || echo " (it shows the record to change)")"
   else
     ok "*.$VHOSTY_DOMAIN resolves to $resolved"
   fi
 
   head_ "Caddy"
   if [ -x "$CADDY_BIN" ]; then ok "binary: $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}')"; else bad "Caddy missing. Run: vhosty update caddy"; fi
-  if "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then ok "Cloudflare DNS plugin"; else bad "Caddy is missing the Cloudflare plugin. Run: vhosty update caddy"; fi
+  dns_provider
+  if "$CADDY_BIN" list-modules 2>/dev/null | grep -qx "$DNS_MODULE"; then ok "$DNS_NAME DNS plugin"; else bad "Caddy is missing the $DNS_NAME plugin. Run: vhosty update caddy"; fi
   if is_linux; then
     if ! sbin_cmd getcap >/dev/null; then warn "can't check that Caddy may use ports 80 and 443: sudo apt install libcap2-bin"
     elif caddy_can_bind; then ok "allowed to use ports 80 and 443"
     else bad "Caddy can't bind 80/443. Run: vhosty setup"; fi
   fi
-  if [ -s "$SECRETS_FILE" ]; then ok "token file present"; else bad "Missing $SECRETS_FILE. Run: vhosty setup"; fi
+  missing=""
+  for v in $DNS_VARS; do load_secret "$v"; [ -n "${!v}" ] || missing="$missing $v"; done
+  if [ -n "$missing" ]; then bad "missing $DNS_NAME credentials in $SECRETS_FILE:$missing. Run: vhosty setup, or: vhosty edit env"
+  else ok "$DNS_NAME credentials present"; fi
   cmd_validate caddy || true
   cmd_cert || true
 
@@ -3823,7 +3941,8 @@ cmd_uninstall() {
       if [ -f "$(plist_for "$s")" ]; then svc_remove "$s"; ok "removed $(label_of "$s")"; fi
     done
   fi
-  info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record in Cloudflare."
+  dns_provider
+  info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record at $DNS_NAME."
 }
 
 # ---------------------------------------------------------------------------
@@ -3834,8 +3953,10 @@ usage() {
 ${B}vhosty${N} $VHOSTY_VERSION: Herd for your tailnet
 
 ${B}Setup${N}
-  vhosty setup [--domain D] [--park DIR] [--no-php] [--yes] [--overwrite-dns]
-                                     The token: CF_API_TOKEN=..., asked for, or --token T
+  vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--yes] [--overwrite-dns]
+                                     PROVIDER: cloudflare (default), digitalocean, porkbun, route53,
+                                     custom. Credentials from the environment (CF_API_TOKEN=...),
+                                     saved, or asked for
   vhosty uninstall                   Remove the services (keeps your files)
 
 ${B}Sites${N}
@@ -3897,7 +4018,7 @@ ${B}Caddy and PHP-FPM${N}
 ${B}Config${N}
   vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply
   vhosty rebuild                     Regenerate config and reload services
-  vhosty dns sync                    Point *.domain at this machine's Tailscale IP
+  vhosty dns sync                    Point *.domain at this machine (Cloudflare), or show the record
   vhosty update [self|caddy|php]     Update vhosty (latest release), Caddy, and PHP-FPM on macOS
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry

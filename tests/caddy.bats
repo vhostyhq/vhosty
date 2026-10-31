@@ -182,3 +182,17 @@ SITE_LINKED=yes"
   run get 5173
   [ "$(echo "$output" | tail -1)" = 403 ]
 }
+
+@test "every provider's Caddyfile is valid, where this Caddy has its plugin" {
+  printf 'CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567\nDO_AUTH_TOKEN=x\nPORKBUN_API_KEY=x\nPORKBUN_API_SECRET_KEY=x\nAWS_ACCESS_KEY_ID=x\nAWS_SECRET_ACCESS_KEY=x\nAWS_REGION=us-east-1\n' >"$VHOSTY_DIR/.env"
+  tested=""
+  for p in cloudflare digitalocean porkbun route53; do
+    "$CADDY" list-modules 2>/dev/null | grep -qx "dns.providers.$p" || continue
+    write_config "VHOSTY_DNS=$p"
+    vh write_caddyfile
+    run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile --envfile "$VHOSTY_DIR/.env"
+    [ "$status" -eq 0 ] || { echo "$p: $output" >&2; false; }
+    tested="$tested $p"
+  done
+  echo "validated:$tested" >&3
+}

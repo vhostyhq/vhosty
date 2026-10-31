@@ -30,19 +30,20 @@ jobs:
         run: git clone --depth 1 --branch v1.12.0 https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats"
 
       # The integration tests run the generated Caddyfile in a real Caddy,
-      # built with the Cloudflare DNS plugin as vhosty downloads it
+      # built from Caddy's build server as vhosty downloads it, with every
+      # DNS provider's plugin vhosty knows
       - name: Cache Caddy
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/caddy
-          key: caddy-cloudflare-${{ runner.os }}-${{ runner.arch }}-v2.11
+          key: caddy-dns-${{ runner.os }}-${{ runner.arch }}-v2.11
       - name: Download Caddy
         run: |
           if [ ! -x "$RUNNER_TEMP/caddy" ]; then
             os=linux; [ "$RUNNER_OS" = macOS ] && os=darwin
             arch=amd64; [ "$RUNNER_ARCH" = ARM64 ] && arch=arm64
             curl -fsSL --retry 3 -o "$RUNNER_TEMP/caddy" \
-              "https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare"
+              "https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare&p=github.com%2Fcaddy-dns%2Fdigitalocean&p=github.com%2Fcaddy-dns%2Fporkbun&p=github.com%2Fcaddy-dns%2Froute53"
             chmod +x "$RUNNER_TEMP/caddy"
           fi
           "$RUNNER_TEMP/caddy" version

@@ -29,15 +29,15 @@ your phone ──tailnet──▶ dev box (100.x.y.z)
 ```
 
 1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the machine's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
-2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through Cloudflare's API, so Let's Encrypt never needs to reach the machine.
+2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through your DNS provider's API, so Let's Encrypt never needs to reach the machine.
 3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on the Tailscale IP and localhost only, not your LAN.
 4. **Services:** Caddy and one PHP-FPM per PHP version in use. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
 
 ## Requirements
 
 - **[Tailscale](https://tailscale.com/download)** on this machine and on every device you'll browse from.
-- **A domain with its DNS on [Cloudflare](https://cloudflare.com)**, either one you own or a new one. It doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
-- **A Cloudflare API token** with *Zone → Read* and *DNS → Edit* for that domain. Create one at dash.cloudflare.com → My Profile → API Tokens, using the "Edit zone DNS" template.
+- **A domain whose DNS is on [Cloudflare](https://cloudflare.com)**, or on another provider vhosty supports (see [DNS providers](#dns-providers)). It can be one you own or a new one, and it doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
+- **An API token for it.** For Cloudflare: *Zone → Read* and *DNS → Edit* for that domain, created at dash.cloudflare.com → My Profile → API Tokens with the "Edit zone DNS" template.
 - **Ports 80 and 443 free.** Herd, Valet, nginx and Apache use them, so stop those first.
 
 **Linux** (tested on Ubuntu 26.04): systemd, `curl`, `jq`, and PHP from apt. Ubuntu
@@ -51,7 +51,37 @@ your services run at boot (`loginctl enable-linger`) and to let Caddy use ports
 vhosty downloads static PHP-FPM builds. Starting and stopping services asks for
 your password (launchd daemons).
 
-vhosty downloads its own Caddy, with the Cloudflare plugin built in.
+vhosty downloads its own Caddy, with your DNS provider's plugin built in.
+
+### DNS providers
+
+| `--dns` | Credentials (`~/.vhosty/.env`) | The `*.domain` record |
+|---|---|---|
+| `cloudflare` (default) | `CF_API_TOKEN` | vhosty creates it, and updates it with `vhosty dns sync` |
+| `digitalocean` | `DO_AUTH_TOKEN` | you create it once |
+| `porkbun` | `PORKBUN_API_KEY`, `PORKBUN_API_SECRET_KEY` | you create it once |
+| `route53` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | you create it once |
+| `custom` | whatever its plugin needs | you create it once |
+
+Setup asks for the credentials (or takes them from the environment) and saves them
+in `~/.vhosty/.env`, which Caddy reads. For the providers marked "you create it
+once", setup shows the record to add: `*.yourdomain.dev`, type A, pointing at the
+machine's Tailscale IP. `vhosty doctor` checks it, and `vhosty dns sync` shows it
+again if the IP changes. The certificate itself doesn't need the record; browsers do.
+
+**Any other provider** with a [Caddy DNS plugin](https://github.com/caddy-dns) works
+as `custom`. In `~/.vhosty/config`, name the plugin and its Caddyfile line, put its
+credentials in `~/.vhosty/.env`, and run `vhosty update caddy`, then `vhosty rebuild`:
+
+```bash
+VHOSTY_DNS=custom
+VHOSTY_DNS_PLUGIN=github.com/caddy-dns/gandi
+VHOSTY_DNS_TLS='dns gandi {env.GANDI_BEARER_TOKEN}'
+```
+
+The plugin has to be one Caddy's build server offers (caddyserver.com/download).
+Hetzner isn't in the table for that reason: the build server only has its v1
+plugin, which uses Hetzner's old DNS API.
 
 ## Install
 
@@ -80,7 +110,7 @@ Ubuntu VM (a droplet, a Hetzner server), `scripts/box-setup.sh` does the same se
 `vhosty setup` asks for your domain, token, and the folder to park, then:
 
 - downloads Caddy into `~/.vhosty/bin` (and PHP-FPM on macOS),
-- creates or fixes the `*.domain` DNS record (DNS only, not proxied),
+- creates or fixes the `*.domain` DNS record on Cloudflare (DNS only, not proxied), or shows the record to create on other providers,
 - generates the Caddyfile and PHP-FPM configs,
 - installs and starts the services, and
 - waits for the wildcard certificate.
@@ -301,7 +331,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── config                 domain, parked folders, default PHP, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
-├── .env                   Cloudflare token (mode 600)
+├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
 ├── error.html             generated: the page for "no site", and PHP or a dev server down
 ├── php/<version>/         generated PHP-FPM config, one per version
@@ -391,7 +421,7 @@ shellcheck --severity=warning bin/vhosty install.sh scripts/*.sh
 
 They run in a scratch home with a fake `tailscale`, so they don't touch your
 setup. `tests/caddy.bats` runs the generated Caddyfile in a real Caddy with the
-Cloudflare plugin (`VHOSTY_TEST_CADDY`, or the one vhosty installed); without one
+DNS plugins (`VHOSTY_TEST_CADDY`, or the one vhosty installed); without one
 it's skipped. CI runs everything on Ubuntu and on macOS's bash 3.2.
 
 ## Uninstall
@@ -402,7 +432,7 @@ rm -rf ~/.vhosty          # removes everything else
 rm ~/.local/bin/vhosty    # or: sudo rm /usr/local/bin/vhosty
 ```
 
-Then delete the `*.domain` record in Cloudflare.
+Then delete the `*.domain` record at your DNS provider.
 
 ## License
 

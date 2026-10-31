@@ -55,7 +55,7 @@ shellcheck --severity=warning bin/vhosty install.sh scripts/*.sh tests/helpers.b
 The tests run in a scratch home with a fake `tailscale`, so they don't touch your
 setup; `tests/helpers.bash` has the helpers (`vh` runs one of vhosty's functions
 with its real shell options). `tests/caddy.bats` runs the generated Caddyfile in a
-real Caddy with the Cloudflare plugin (`VHOSTY_TEST_CADDY`, or the one vhosty
+real Caddy with the DNS plugins (`VHOSTY_TEST_CADDY`, or the one vhosty
 installed), and is skipped without one. Add a test with every fix: one that fails
 without it.
 

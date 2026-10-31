@@ -1168,8 +1168,10 @@ done
 if [ -z "$real" ]; then # next php on the PATH that isn't this shim
   IFS=:
   for d in $PATH; do
-    [ "$d" = "$VHOSTY_DIR/bin" ] && continue
-    [ -x "$d/php" ] && { real="$d/php"; break; }
+    # skip this shim however its folder is spelled (~/.vhosty/bin/, a link...)
+    [ -x "$d/php" ] || continue
+    [ "$d/php" -ef "$0" ] || [ "$d/php" -ef "$VHOSTY_DIR/bin/php" ] && continue
+    real="$d/php"; break
   done
   unset IFS
 fi

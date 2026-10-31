@@ -62,3 +62,17 @@ SITE_PHP=9.8"
   run bash -c "cd '$HOME' && VHOSTY_PHP_VERSION=9.8 '$VHOSTY_DIR/bin/php' x"
   assert_contains "$output" "php 9.8"
 }
+
+@test "the shim skips itself however its folder is spelled on the PATH" {
+  command -v timeout >/dev/null || skip "no timeout command (macOS)"
+  write_config 'VHOSTY_PHP_DEFAULT="9.7"'   # not installed: the shim looks on the PATH
+  vh write_shim
+  mkdir -p "$HOME/realphp"
+  printf '#!/usr/bin/env bash\necho "real php $*"\n' >"$HOME/realphp/php"
+  chmod +x "$HOME/realphp/php"
+  # the shim's folder with a trailing slash, and through a link, before the real php
+  ln -s "$VHOSTY_DIR/bin" "$HOME/binlink"
+  run timeout 5 env PATH="$VHOSTY_DIR/bin/:$HOME/binlink:$HOME/realphp:/usr/bin:/bin" "$VHOSTY_DIR/bin/php" -v
+  [ "$status" -eq 0 ] || { echo "status $status: $output" >&2; false; }
+  [ "$output" = "real php -v" ]
+}

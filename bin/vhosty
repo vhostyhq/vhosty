@@ -1576,21 +1576,25 @@ name_from_folder() { lower "$1" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//'; 
 
 # The parked folder that serves <name> directly, if any
 parked_dir_for() { # an exact (lowercase) folder name wins over one with capitals
-  local name="$1" p f
-  while IFS= read -r p; do
-    [ -n "$p" ] && [ -d "$p/$name" ] && { echo "$p/$name"; return 0; }
-  done <<EOF
+  local name="$1" p f base pass
+  # Names are compared as strings, not by asking the disk: on macOS, whose
+  # disks ignore case, [ -d "$p/myapp" ] is true for MyApp too
+  for pass in exact folded; do
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      for f in "$p"/*/; do
+        f="${f%/}"; base="${f##*/}"
+        [ -d "$f" ] || continue
+        if [ "$base" = "$name" ]; then echo "$f"; return 0; fi
+        # same length first: lower forks, and most folders can't match
+        if [ "$pass" = "folded" ] && [ ${#base} -eq ${#name} ] && [ "$(lower "$base")" = "$name" ]; then
+          echo "$f"; return 0
+        fi
+      done
+    done <<EOF
 $(parked_list)
 EOF
-  while IFS= read -r p; do
-    [ -n "$p" ] || continue
-    for f in "$p"/*/; do
-      f="${f%/}"
-      [ -d "$f" ] && [ "$(lower "${f##*/}")" = "$name" ] && { echo "$f"; return 0; }
-    done
-  done <<EOF
-$(parked_list)
-EOF
+  done
   return 1
 }
 

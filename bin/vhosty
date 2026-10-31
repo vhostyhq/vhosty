@@ -2396,6 +2396,10 @@ cmd_ini_edit() {
 need_services() {
   [ -n "$VHOSTY_SERVICES_DIR" ] || die "No services folder set. Run: vhosty services init (or: vhosty services dir <folder with compose.yaml>)"
   [ -d "$VHOSTY_SERVICES_DIR" ] || die "$VHOSTY_SERVICES_DIR doesn't exist. Run: vhosty services dir <folder>"
+  if ! command -v jq >/dev/null 2>&1; then
+    if is_macos; then die "vhosty services needs jq: brew install jq (macOS 15 and later have it built in)"
+    else die "vhosty services needs jq: sudo apt install jq"; fi
+  fi
   need_docker
 }
 
@@ -2405,7 +2409,8 @@ need_docker() {
     if [ -S /var/run/docker.sock ] && ! [ -w /var/run/docker.sock ]; then
       die "No access to Docker. Add yourself to the docker group (sudo usermod -aG docker $VHOSTY_USER), then log in again"
     fi
-    die "Docker isn't running (sudo systemctl start docker)"
+    if is_macos; then die "Docker isn't running. Start Docker Desktop (or OrbStack, Colima)"
+    else die "Docker isn't running (sudo systemctl start docker)"; fi
   }
 }
 
@@ -2807,7 +2812,7 @@ EOF
 }
 
 cmd_services_backup() { # [--to DIR]
-  local root out partial line svc image kind cid started f keep t0 old pruned=0 skipped=""
+  local root out partial line svc image images kind cid started f keep t0 old pruned=0 skipped=""
   local usage="Usage: vhosty services backup [--to DIR]"
   root="${VHOSTY_BACKUP_DIR:-$VHOSTY_DIR/backups}"
   while [ $# -gt 0 ]; do
@@ -2843,7 +2848,11 @@ cmd_services_backup() { # [--to DIR]
     echo "from=$VHOSTY_SERVICES_DIR"
   } >"$partial/MANIFEST"
 
-  for line in $(services_images); do
+  # Listed first: inside a for loop's $(...), a failure would just mean no
+  # services, and a "backup" of the config alone
+  images="$(services_images)" || die "Couldn't read the services from $VHOSTY_SERVICES_DIR/compose.yaml"
+  [ -n "$images" ] || die "No services in $VHOSTY_SERVICES_DIR/compose.yaml"
+  for line in $images; do
     svc="${line%%|*}"; image="${line#*|}"; kind="$(service_kind "$image")"
     cid="$(service_container "$svc")"
     if [ -z "$cid" ]; then warn "$svc: no container yet, skipped (vhosty services up $svc)"; skipped="$skipped $svc"; continue; fi

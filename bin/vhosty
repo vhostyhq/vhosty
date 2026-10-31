@@ -627,19 +627,31 @@ EOF
 
 # Folder a site is served from: its configured path, else <parked>/<name>
 site_dir() {
-  local name="$1" p f
-  site_load "$name"
+  site_load "$1"
   if [ -n "$SITE_PATH" ]; then echo "$SITE_PATH"; return 0; fi
+  parked_dir_for "$1"
+}
+
+# Parked folders whose name has capitals (MyApp → myapp). Hostnames are
+# lowercase, and on a case-sensitive disk the parked rules only find a
+# lowercase folder, so these get a rule of their own, written on rebuild.
+# A lowercase folder of the same name wins, as it does in the parked rules.
+case_sites() {
+  local p f name seen
+  seen=" $(site_names | tr '\n' ' ') "
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     for f in "$p"/*/; do
-      f="${f%/}"
-      [ -d "$f" ] && [ "$(lower "${f##*/}")" = "$name" ] && { echo "$f"; return 0; }
+      f="${f%/}"; name="$(lower "${f##*/}")"
+      [ -d "$f" ] && [ "$name" != "${f##*/}" ] && valid_name "$name" || continue
+      case "$seen" in *" $name "*) continue ;; esac
+      [ "$(parked_dir_for "$name")" = "$f" ] || continue
+      { php_enabled && [ -f "$f/public/index.php" ]; } || [ -f "$f/index.html" ] || continue
+      echo "$name"; seen="$seen$name "
     done
   done <<EOF
 $(parked_list)
 EOF
-  return 1
 }
 
 # Site name from an argument (a name) or the current folder
@@ -657,11 +669,11 @@ resolve_site() {
 # ---------------------------------------------------------------------------
 # Generated config
 # ---------------------------------------------------------------------------
-# Rules for configured sites. They come before the parked wildcards, so a pin
-# or a link wins over the default.
+# Rules for configured sites, and parked folders with capitals in their name.
+# They come before the parked wildcards, so a pin or a link wins over the default.
 caddy_sites() {
   local name dir v sock
-  for name in $(site_names); do
+  for name in $(site_names) $(case_sites); do
     site_load "$name"
     dir="$(site_dir "$name" || true)"
     if [ -z "$dir" ] || [ ! -d "$dir" ]; then
@@ -705,7 +717,7 @@ write_caddyfile() {
   depth="$(domain_depth)"
   v="$(php_default)"
   # Configured sites whose folder exists, for the "no site found" page
-  for name in $(site_names); do
+  for name in $(site_names) $(case_sites); do
     dir="$(site_dir "$name" || true)"
     [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
   done
@@ -868,13 +880,17 @@ error_page_html() {
 {{- $parked := compact (splitList ":" (placeholder "http.vars.vhosty_parked")) -}}
 {{- $phpOn := eq (placeholder "http.vars.vhosty_php_on") "on" -}}
 {{- $found := "" -}}
+{{- $cased := "" -}}
 {{- if $nosite -}}
   {{- range $d := $parked -}}{{- if fileExists $d -}}
     {{- range $f := listFiles $d -}}
-      {{- if regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $f -}}
-        {{- if or (and $phpOn (fileExists (printf "%s/%s/public/index.php" $d $f))) (fileExists (printf "%s/%s/index.html" $d $f)) -}}
-          {{- $sites = append $sites $f -}}
-        {{- end -}}
+      {{- $servable := or (and $phpOn (fileExists (printf "%s/%s/public/index.php" $d $f))) (fileExists (printf "%s/%s/index.html" $d $f)) -}}
+      {{- if and $servable (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $f) -}}
+        {{- $sites = append $sites $f -}}
+      {{- end -}}
+      {{- /* MyApp for myapp: served once vhosty rebuild gives it a rule */ -}}
+      {{- if and $servable (not $cased) (ne $f $label) (eq (lower $f) $label) -}}
+        {{- $cased = printf "%s/%s" $d $f -}}
       {{- end -}}
     {{- end -}}
     {{- if and (not $found) (fileExists (printf "%s/%s" $d $label)) -}}{{- $found = printf "%s/%s" $d $label -}}{{- end -}}
@@ -923,7 +939,9 @@ summary { cursor: pointer; }
 {{- if $nosite}}
 <h1>No site called <code>{{html $label}}</code></h1>
 <p class="muted">Nothing is set up to serve <strong>{{html .Host}}</strong>.</p>
-{{- if $found}}
+{{- if and $cased (not $found)}}
+<p><code>{{if and $home (hasPrefix $home $cased)}}~{{html (trimPrefix $home $cased)}}{{else}}{{html $cased}}{{end}}</code> has capitals in its name, so it needs its own rule. Run <code>vhosty rebuild</code> to serve it here.</p>
+{{- else if $found}}
 <p><code>{{if and $home (hasPrefix $home $found)}}~{{html (trimPrefix $home $found)}}{{else}}{{html $found}}{{end}}</code> exists, but has no {{if $phpOn}}<code>public/index.php</code> or {{end}}<code>index.html</code>.</p>
 {{- else if $parked}}
 <h2>Looked for</h2>
@@ -1526,8 +1544,13 @@ cmd_parked() {
 name_from_folder() { lower "$1" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//'; }
 
 # The parked folder that serves <name> directly, if any
-parked_dir_for() {
+parked_dir_for() { # an exact (lowercase) folder name wins over one with capitals
   local name="$1" p f
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -d "$p/$name" ] && { echo "$p/$name"; return 0; }
+  done <<EOF
+$(parked_list)
+EOF
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     for f in "$p"/*/; do
@@ -2871,7 +2894,7 @@ cmd_tail() {
 # ---------------------------------------------------------------------------
 cmd_sites() {
   need_config
-  local dir p name re='^[A-Za-z0-9-]+$' linked
+  local dir p name lname note re='^[A-Za-z0-9-]+$' linked
   linked="$(cmd_links 2>/dev/null | grep https || true)"
   [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
   if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
@@ -2880,14 +2903,20 @@ cmd_sites() {
     head_ "$dir"
     for p in "$dir"/*/; do
       [ -d "$p" ] || continue
-      name="$(basename "$p")"
+      name="$(basename "$p")"; lname="$(lower "$name")"; note=""
+      if [[ $name =~ $re ]] && [ "$name" != "$lname" ]; then
+        if [ "$(parked_dir_for "$lname")" != "${p%/}" ]; then
+          info "$name (not served: $(parked_dir_for "$lname") has the name $lname)"; continue
+        fi
+        grep -qF "@site_$lname host" "$CADDYFILE" 2>/dev/null || note="; run vhosty rebuild to serve it"
+      fi
       if ! [[ $name =~ $re ]]; then
         info "$name (not a valid hostname: use letters, numbers, dashes)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
-        site_load "$(lower "$name")"
-        printf "  https://%s.%s  %s(PHP %s%s)%s\n" "$(lower "$name")" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")" "$N"
+        site_load "$lname"
+        printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")" "$note" "$N"
       elif [ -f "$p/index.html" ]; then
-        printf "  https://%s.%s  %s(static)%s\n" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" "$VHOSTY_DOMAIN" "$D" "$N"
+        printf "  https://%s.%s  %s(static%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$note" "$N"
       else
         info "$name (no public/index.php or index.html)"
       fi

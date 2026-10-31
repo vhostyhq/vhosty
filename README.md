@@ -120,6 +120,8 @@ For a folder `~/Sites/escrow`:
 - If it has `public/index.php`, vhosty serves it with PHP (Laravel, Symfony, etc.).
 - If it has `index.html`, vhosty serves it as a static site.
 - Folder names become hostnames, so stick to letters, numbers, and dashes.
+  Hostnames are lowercase: `MyApp` is served at `myapp.yourdomain.dev`. A new
+  folder with capitals needs a `vhosty rebuild` first; `vhosty sites` says when.
 
 Folders outside a parked directory can be linked one at a time:
 `vhosty link ~/Projects/My\ App` serves it at `https://my-app.yourdomain.dev`

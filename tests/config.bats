@@ -10,6 +10,11 @@ caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
   assert_contains "$output" "default_bind 100.64.0.7 127.0.0.1 ::1"
 }
 
+@test "Caddy's admin API is on a socket in ~/.vhosty/run, not localhost:2019" {
+  run caddyfile
+  assert_contains "$output" "admin \"unix/$VHOSTY_DIR/run/caddy-admin.sock|0600\""
+}
+
 @test "the site block covers the wildcard and gets its certificate over DNS" {
   run caddyfile
   assert_contains "$output" "*.test.example {"

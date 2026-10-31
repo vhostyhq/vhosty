@@ -22,7 +22,7 @@ teardown() {
 # Runs the generated config over plain HTTP on a high port, with no certificate
 start_caddy() {
   vh write_configs
-  sed -e "s/^\tdefault_bind .*/\tadmin off\n\tauto_https off\n\tdefault_bind 127.0.0.1/" \
+  sed -e '/^\tadmin /d' -e "s/^\tdefault_bind .*/\tadmin off\n\tauto_https off\n\tdefault_bind 127.0.0.1/" \
       -e "s/^\*\.test\.example {/http:\/\/*.test.example:$PORT {/" \
       -e '/^\ttls {/,/^\t}/d' "$VHOSTY_DIR/Caddyfile" >"$HOME/test.Caddyfile"
   "$CADDY" run --config "$HOME/test.Caddyfile" --adapter caddyfile >"$HOME/caddy.log" 2>&1 &
@@ -144,4 +144,19 @@ SITE_LINKED=yes"
   dials="$(CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 "$CADDY" adapt --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile 2>/dev/null \
     | jq -r '.. | .dial? // empty' | grep '^unix/' | sort -u)"
   [ "$dials" = "unix/$VHOSTY_DIR/run/php-8.4.sock" ] || { echo "upstreams: $dials" >&2; false; }
+}
+
+@test "the admin API is on a socket only the owner can use, and reloads work through it" {
+  vh write_configs
+  sed -e "s/^\tdefault_bind .*/\tauto_https off\n\tdefault_bind 127.0.0.1/" \
+      -e "s/^\*\.test\.example {/http:\/\/*.test.example:$PORT {/" \
+      -e '/^\ttls {/,/^\t}/d' "$VHOSTY_DIR/Caddyfile" >"$HOME/test.Caddyfile"
+  "$CADDY" run --config "$HOME/test.Caddyfile" --adapter caddyfile >"$HOME/caddy.log" 2>&1 &
+  CADDY_PID=$!
+  for _ in $(seq 1 50); do [ -S "$VHOSTY_DIR/run/caddy-admin.sock" ] && break; sleep 0.1; done
+  [ -S "$VHOSTY_DIR/run/caddy-admin.sock" ] || { cat "$HOME/caddy.log" >&2; false; }
+  perms="$(ls -l "$VHOSTY_DIR/run/caddy-admin.sock" | cut -c1-10)"
+  [ "$perms" = "srw-------" ] || { echo "socket: $perms" >&2; false; }
+  run "$CADDY" reload --config "$HOME/test.Caddyfile" --adapter caddyfile --force
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
 }

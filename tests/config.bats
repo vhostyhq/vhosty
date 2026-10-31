@@ -20,7 +20,7 @@ caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
   run caddyfile
   # test.example has 2 labels, so the site name is label 2
   assert_contains "$output" "root \"$PARKED/{labels.2}/public\""
-  assert_contains "$output" "php_fastcgi unix/$VHOSTY_DIR/run/php-8.4.sock"
+  assert_contains "$output" "php_fastcgi \"unix/$VHOSTY_DIR/run/php-8.4.sock\""
   assert_contains "$output" "root \"$PARKED/{labels.2}\""
 }
 
@@ -45,7 +45,7 @@ caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
   php_site kudos
   site_conf kudos "SITE_INI='memory_limit=1G'"
   run caddyfile
-  assert_contains "$output" "php_fastcgi unix/$VHOSTY_DIR/run/site-kudos.sock"
+  assert_contains "$output" "php_fastcgi \"unix/$VHOSTY_DIR/run/site-kudos.sock\""
 }
 
 @test "a static configured site is served without PHP" {
@@ -134,4 +134,39 @@ SITE_LINKED=yes"
   rm "$VHOSTY_DIR/error.html"
   run vh config_in_sync
   [ "$status" -ne 0 ]
+}
+
+@test "save_config keeps folder names as text, even with \$(...) or quotes in them" {
+  weird="$HOME/a \$(touch $HOME/pwned) \`touch $HOME/pwned2\` \"q\" 'q'"
+  VHOSTY_SRC="$ROOT/bin/vhosty" bash -c 'source "$VHOSTY_SRC"; load_config; VHOSTY_PARKED="$1"; save_config' _ "$weird"
+  run vh eval 'printf "%s" "$VHOSTY_PARKED"'
+  [ "$output" = "$weird" ]
+  [ ! -e "$HOME/pwned" ] && [ ! -e "$HOME/pwned2" ]
+}
+
+@test "check_folder refuses paths that can't go into the Caddyfile" {
+  vh check_folder "$HOME/My Sites"
+  vh check_folder "$HOME/it's fine"
+  for bad in "$HOME/a\"b" "$HOME/a{b}" "$HOME/a\\b" "$HOME/a
+b"; do
+    run vh check_folder "$bad"
+    [ "$status" -ne 0 ] || { echo "accepted: $bad" >&2; false; }
+  done
+  vh check_folder "$HOME/a:b"
+  run vh check_folder "$HOME/a:b" parked
+  [ "$status" -ne 0 ]
+}
+
+@test "expand_tilde expands ~ without running anything" {
+  [ "$(vh expand_tilde '~')" = "$HOME" ]
+  [ "$(vh expand_tilde '~/Sites')" = "$HOME/Sites" ]
+  [ "$(vh expand_tilde '/x/$(touch y)')" = '/x/$(touch y)' ]
+  [ "$(vh expand_tilde "~/Zack's Sites")" = "$HOME/Zack's Sites" ]
+}
+
+@test "the PHP-FPM upstream is quoted, for homes with spaces" {
+  php_site escrow
+  site_conf escrow "SITE_PHP=8.4"
+  run caddyfile
+  assert_contains "$output" "php_fastcgi \"unix/$VHOSTY_DIR/run/php-8.4.sock\""
 }

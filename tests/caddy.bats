@@ -131,3 +131,17 @@ SITE_LINKED=yes"
   run get docs /
   [ "$(echo "$output" | tail -1)" = 200 ]
 }
+
+@test "with a space in the home folder, Caddy sees one PHP-FPM upstream" {
+  command -v jq >/dev/null || skip "no jq"
+  export HOME="$BATS_TEST_TMPDIR/Jane Doe" VHOSTY_DIR="$BATS_TEST_TMPDIR/Jane Doe/.vhosty"
+  PARKED="$HOME/Sites"
+  mkdir -p "$VHOSTY_DIR/sites" "$PARKED"
+  write_config
+  php_site escrow
+  site_conf escrow "SITE_PHP=8.4"
+  vh write_caddyfile
+  dials="$(CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 "$CADDY" adapt --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile 2>/dev/null \
+    | jq -r '.. | .dial? // empty' | grep '^unix/' | sort -u)"
+  [ "$dials" = "unix/$VHOSTY_DIR/run/php-8.4.sock" ] || { echo "upstreams: $dials" >&2; false; }
+}

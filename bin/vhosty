@@ -170,20 +170,17 @@ need_config() {
 }
 
 save_config() {
+  local k
   mkdir -p "$VHOSTY_DIR"
-  cat >"$CONFIG_FILE" <<EOF
-# vhosty config. After editing, run: vhosty rebuild
-VHOSTY_DOMAIN="$VHOSTY_DOMAIN"
-VHOSTY_PARKED="$VHOSTY_PARKED"
-VHOSTY_PHP="$VHOSTY_PHP"
-VHOSTY_PHP_DEFAULT="$VHOSTY_PHP_DEFAULT"
-VHOSTY_SERVICES_DIR="$VHOSTY_SERVICES_DIR"
-VHOSTY_LOG_MAX_MB="$VHOSTY_LOG_MAX_MB"
-VHOSTY_LOG_KEEP="$VHOSTY_LOG_KEEP"
-VHOSTY_BACKUP_DIR="$VHOSTY_BACKUP_DIR"
-VHOSTY_BACKUP_KEEP="$VHOSTY_BACKUP_KEEP"
-VHOSTY_ALLOW_DEBUG="$VHOSTY_ALLOW_DEBUG"
-EOF
+  # %q: the file is sourced by every vhosty command and every php call, so a
+  # folder name with $(...) or a quote must stay text
+  {
+    echo "# vhosty config. After editing, run: vhosty rebuild"
+    for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
+      VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_ALLOW_DEBUG; do
+      printf '%s=%q\n' "$k" "${!k}"
+    done
+  } >"$CONFIG_FILE"
 }
 
 # A config copied from another machine: drop the old FPM port, and move
@@ -233,6 +230,28 @@ php_enabled() { [ "$VHOSTY_PHP" = "on" ]; }
 # Number of labels in the domain = which {labels.N} holds the site name.
 # vhosty.link → 2, box.example.com → 3
 domain_depth() { printf '%s' "$VHOSTY_DOMAIN" | awk -F. '{print NF}'; }
+
+# ~ and ~/x expanded, without eval (which would run anything else in it too)
+expand_tilde() {
+  # shellcheck disable=SC2088 # a literal ~ is what's being matched
+  case "$1" in
+    "~") echo "$VHOSTY_HOME_DIR" ;;
+    "~/"*) echo "$VHOSTY_HOME_DIR/${1#\~/}" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Folders go into the Caddyfile inside quotes, where a quote, backslash or
+# brace means something else, and parked ones into a :-separated list
+check_folder() { # check_folder DIR [parked]
+  case "$1" in
+    *[\"\\{}]*|*"
+"*) die "vhosty can't serve $1: its path has a quote, backslash, brace or line break. Rename it, or move it." ;;
+  esac
+  if [ "${2:-}" = "parked" ]; then
+    case "$1" in *:*) die "vhosty can't park $1: its path has a colon. Rename it, or move it." ;; esac
+  fi
+}
 
 parked_list() { printf '%s\n' "$VHOSTY_PARKED" | tr ':' '\n' | sed '/^$/d'; }
 
@@ -741,7 +760,7 @@ caddy_sites() {
 			vhosty_php $v
 		}
 		root * "$dir/public"
-		php_fastcgi unix/$sock
+		php_fastcgi "unix/$sock"
 		file_server
 	}
 EOF
@@ -808,7 +827,7 @@ EOF
 			vhosty_php $v
 		}
 		root * "$dir/{labels.$depth}/public"
-		php_fastcgi unix/$(fpm_sock "$v")
+		php_fastcgi "unix/$(fpm_sock "$v")"
 		file_server
 	}
 EOF
@@ -1478,7 +1497,8 @@ cmd_setup() {
   step "Parked folders"
   info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
   [ -n "$park" ] || park="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
-  park="$(eval echo "$park")"
+  park="$(expand_tilde "$park")"
+  check_folder "$park" parked
   [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
   park="$(cd "$park" && pwd)"
   case ":$VHOSTY_PARKED:" in
@@ -1553,6 +1573,7 @@ cmd_park() {
   need_config
   local dir="${1:-$PWD}"
   dir="$(cd "$dir" 2>/dev/null && pwd)" || die "No such folder: ${1:-$PWD}"
+  check_folder "$dir" parked
   case ":$VHOSTY_PARKED:" in
     *":$dir:"*) warn "$dir is already parked"; return 0 ;;
   esac
@@ -1630,6 +1651,7 @@ cmd_link() {
   dir="${dir:-$PWD}"
   [ -d "$dir" ] || die "No such folder: $dir"
   dir="$(cd "$dir" && pwd)"
+  check_folder "$dir"
   [ -n "$name" ] || name="$(name_from_folder "${dir##*/}")"
   name="$(lower "$name")"
   valid_name "$name" || die "'$name' isn't a valid site name (letters, numbers, dashes). Pick one with --name"
@@ -2950,26 +2972,30 @@ log_files() {
 
 existing_logs() {
   local f
-  for f in $(log_files "${1:-all}"); do
-    if [ -f "$f" ]; then echo "$f"; fi
-  done
+  while IFS= read -r f; do
+    if [ -n "$f" ] && [ -f "$f" ]; then echo "$f"; fi
+  done <<EOF
+$(log_files "${1:-all}")
+EOF
 }
 
-cmd_logs() {
-  local files
-  files="$(existing_logs "${1:-all}")"
-  [ -n "$files" ] || die "No log files yet"
-  # shellcheck disable=SC2086
-  tail -n "${2:-100}" $files
+# tail_logs SERVICE TAIL-ARGS...: tail the service's log files, kept whole
+# (a home folder can have spaces)
+tail_logs() {
+  local svc="$1" f files=()
+  shift
+  while IFS= read -r f; do
+    [ -z "$f" ] || files+=("$f")
+  done <<EOF
+$(existing_logs "$svc")
+EOF
+  [ ${#files[@]} -gt 0 ] || die "No log files yet"
+  tail "$@" "${files[@]}"
 }
 
-cmd_tail() {
-  local files
-  files="$(existing_logs "${1:-all}")"
-  [ -n "$files" ] || die "No log files yet"
-  # shellcheck disable=SC2086
-  tail -n 30 -f $files
-}
+cmd_logs() { tail_logs "${1:-all}" -n "${2:-100}"; }
+
+cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
 
 # ---------------------------------------------------------------------------
 # Commands: sites

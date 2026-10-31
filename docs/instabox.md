@@ -43,13 +43,17 @@ It takes a few minutes. Then open `https://hello.alice.example.com` on your phon
 | `--services LIST` | Docker services, like `mysql,valkey` (see `vhosty services init`) |
 | `--php V`, `--no-php` | PHP version (default: the newest Debian has), or none |
 | `--ref R` | vhosty version on the box: a tag, or `main`. Default: the latest release |
+| `--reuse-token` | Use this computer's Cloudflare token (`~/.vhosty/.env`) for the box |
 
 ### What you need
 
 - **The instabox CLI, signed in:** `npx instabox@latest login`. Or set `INSTABOX_API_KEY`.
 - **A Cloudflare API token** with Zone → Read and DNS → Edit for the domain, as for
-  `vhosty setup`. If the computer you run it from has vhosty set up, its token is used.
-  Otherwise set `CF_API_TOKEN`, or paste it when asked.
+  `vhosty setup`. Set `CF_API_TOKEN`, or paste it when asked. The token is stored on
+  the box, a machine your coding agents work on, and a Cloudflare token can edit the
+  whole zone, not just the box's subdomain. So make a separate token for your boxes
+  rather than reusing your main one (`--reuse-token` does that if you want it). For
+  tighter limits, give the boxes a zone of their own (say `boxes.example.com`).
 - **A Tailscale auth key** (login.tailscale.com → Settings → Keys). Set `TS_AUTHKEY`, or
   paste it when asked. For a box you'll throw away, make it *ephemeral*: the node
   leaves your tailnet on its own once the machine is gone.

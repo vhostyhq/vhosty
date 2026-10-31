@@ -18,10 +18,12 @@
 #   --services LIST  Docker services to set up, like mysql,valkey
 #   --php V          PHP version (default: the newest Debian offers); --no-php for none
 #   --ref R          vhosty version on the box: a tag, or main (default: the latest release)
+#   --reuse-token    use this computer's Cloudflare token (~/.vhosty/.env) for the box
 #
-# Tokens: CF_API_TOKEN (default: the one in ~/.vhosty/.env) and TS_AUTHKEY, asked
-# for when they aren't set. They go to the machine over the instabox CLI, never on
-# a command line. For a box you'll throw away, make the Tailscale key ephemeral.
+# Tokens: CF_API_TOKEN and TS_AUTHKEY, asked for when they aren't set. They go to
+# the machine over the instabox CLI, never on a command line. The Cloudflare token
+# is stored on the box, so a separate one for it is safer than your main one. For a
+# box you'll throw away, make the Tailscale key ephemeral.
 #
 # Needs Node.js (for npx) and the instabox CLI signed in (npx instabox@latest login),
 # or INSTABOX_API_KEY. Written for the bash that ships with macOS (3.2).
@@ -38,13 +40,15 @@ info() { printf "  %s%s%s\n" "$D" "$*" "$N"; }
 step() { printf "\n%s→ %s%s\n" "$B" "$*" "$N"; }
 die()  { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
 
-usage="Usage: instabox.sh --name N [--domain D] [--size C/G] [--disk GB] [--services LIST] [--php V | --no-php] [--ref R]"
+usage="Usage: instabox.sh --name N [--domain D] [--size C/G] [--disk GB] [--services LIST] [--php V | --no-php] [--ref R] [--reuse-token]"
 
-# The instabox CLI: installed, or through npx. ib never reads this script's
-# stdin; ib_in is for the commands that are handed input on purpose.
+# The instabox CLI: installed, or a known version through npx (your keys pass
+# through it, so not whatever is newest). ib never reads this script's stdin;
+# ib_in is for the commands that are handed input on purpose.
+INSTABOX_CLI="${VHOSTY_INSTABOX_CLI:-instabox@0.8.85}"
 ib_in() {
   if command -v instabox >/dev/null 2>&1; then instabox "$@"
-  else npx -y instabox@latest "$@"; fi
+  else npx -y "$INSTABOX_CLI" "$@"; fi
 }
 ib() { ib_in "$@" </dev/null; }
 
@@ -65,7 +69,7 @@ ask_secret() {
 # Everything runs from main, called on the last line: piped into bash, the
 # whole script is read before any command can swallow the rest of it from stdin
 main() {
-  local name="" domain="" size="8/16" disk="100" services="" php="" ref="" d specs c g out free jid env cmd
+  local name="" domain="" size="8/16" disk="100" services="" php="" ref="" reuse_token=0 d specs c g out free jid env cmd
   while [ $# -gt 0 ]; do
     case "$1" in
       --name)     name="${2:-}"; shift 2 ;;
@@ -76,6 +80,7 @@ main() {
       --php)      php="${2:-}"; shift 2 ;;
       --no-php)   php="off"; shift ;;
       --ref)      ref="${2:-}"; shift 2 ;;
+      --reuse-token) reuse_token=1; shift ;;
       -h|--help)  echo "$usage"; exit 0 ;;
       *) die "$usage" ;;
     esac
@@ -99,10 +104,15 @@ main() {
   if ib get "$name" >/dev/null 2>&1; then die "There's already a machine called $name (instabox ls)"; fi
 
   step "Tokens"
-  if [ -z "${CF_API_TOKEN:-}" ] && [ -f "$HOME/.vhosty/.env" ]; then
+  # The token is stored on the box, a machine coding agents work on, and a
+  # Cloudflare token can't be limited to a subdomain: it can edit the whole
+  # zone. So a separate one is better than this computer's, which is only
+  # reused when asked.
+  if [ -z "${CF_API_TOKEN:-}" ] && [ "$reuse_token" = "1" ] && [ -f "$HOME/.vhosty/.env" ]; then
     CF_API_TOKEN="$(sed -n 's/^CF_API_TOKEN=//p' "$HOME/.vhosty/.env" | head -1)"
-    [ -z "$CF_API_TOKEN" ] || ok "Cloudflare token from ~/.vhosty/.env"
+    [ -z "$CF_API_TOKEN" ] || ok "Cloudflare token from ~/.vhosty/.env (--reuse-token)"
   fi
+  [ -n "${CF_API_TOKEN:-}" ] || info "A Cloudflare token just for this box is safer than your main one: it will live on the box."
   ask_secret CF_API_TOKEN "Cloudflare API token (Zone Read, DNS Edit)"
   ask_secret TS_AUTHKEY "Tailscale auth key (login.tailscale.com → Settings → Keys)"
   ok "Cloudflare and Tailscale"
@@ -154,8 +164,13 @@ main() {
   fi
   # A job, not a plain exec: exec stops at 10 minutes, and Docker images can take longer
   jid="$(ib exec --background "$name" -- "$cmd" 2>/dev/null | head -1)"
-  [ -n "$jid" ] || die "Couldn't start the setup on $name"
+  if [ -z "$jid" ]; then
+    ib exec "$name" -- 'rm -f ~/.vhosty-box-secrets' >/dev/null 2>&1 || true
+    die "Couldn't start the setup on $name"
+  fi
   if ! ib jobs logs "$name" "$jid" -f; then
+    # box-setup deletes the tokens once it reads them; it may not have got that far
+    ib exec "$name" -- 'rm -f ~/.vhosty-box-secrets' >/dev/null 2>&1 || true
     printf '\n'
     die "Setup on $name failed (see above). Fix it and run again on the box: instabox ssh $name, then: $cmd"
   fi

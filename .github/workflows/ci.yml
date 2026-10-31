@@ -60,6 +60,9 @@ jobs:
         env:
           VHOSTY_TEST_CADDY: ${{ runner.temp }}/caddy
           VHOSTY_TEST_BASH: /bin/bash
+          # Unix socket paths are limited to 104 bytes on macOS, and the
+          # default /var/folders/... temp folders are too long for them
+          TMPDIR: /tmp
         run: |
           /bin/bash --version | head -1
           PATH="/bin:/usr/bin:/usr/sbin:/sbin:$PATH" /bin/bash "$RUNNER_TEMP/bats/bin/bats" tests/

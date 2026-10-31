@@ -94,6 +94,23 @@ export PATH="$HOME/.vhosty/bin:$PATH"
 fpath=(~/.vhosty/completions $fpath)   # before compinit
 ```
 
+## Updating
+
+```bash
+vhosty update self        # vhosty itself: the latest release, then vhosty rebuild
+vhosty update             # vhosty, Caddy, and PHP-FPM on macOS
+```
+
+`update self` replaces `~/.vhosty/bin/vhosty` (and the zsh completion), then
+runs `vhosty rebuild` with the new version so its changes take effect. Your
+settings, sites and services stay as they are. `--ref main` installs changes that
+aren't released yet, and `--ref v0.3.0` a particular release. It won't install an
+older version over a newer one without `--force`. Installed from a clone? Update
+with `git pull && ./install.sh` instead, then `vhosty rebuild`.
+
+`vhosty doctor` tells you when there's a new release. It asks GitHub once per run;
+set `VHOSTY_UPDATE_CHECK=0` to turn that off.
+
 ## Usage
 
 | Command | What it does |
@@ -114,7 +131,7 @@ fpath=(~/.vhosty/completions $fpath)   # before compinit
 | `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
 | `vhosty prune` | Remove configs for sites whose folder is gone, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
-| `vhosty update [caddy]` | Re-download Caddy |
+| `vhosty update [self\|caddy\|php]` | Update vhosty to the latest release, and re-download Caddy (and PHP-FPM on macOS). See [Updating](#updating) |
 | `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
 | `vhosty rebuild` | Regenerate the config and reload the services |
 

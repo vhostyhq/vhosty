@@ -15,6 +15,7 @@
 set -euo pipefail
 
 VHOSTY_VERSION="0.3.0"
+VHOSTY_REPO="${VHOSTY_REPO:-vhostyhq/vhosty}"   # where `vhosty update self` gets releases
 
 # ---------------------------------------------------------------------------
 # Platform and locations
@@ -3038,20 +3039,93 @@ cmd_dns() {
   esac
 }
 
+# Latest release tag (v0.3.0), from where github.com/<repo>/releases/latest
+# redirects: no API rate limit, no jq. Fails offline or with no releases.
+latest_release() {
+  local u
+  u="$(curl -fsSLI --max-time 5 -o /dev/null -w '%{url_effective}' "https://github.com/$VHOSTY_REPO/releases/latest" 2>/dev/null)" || return 1
+  case "$u" in */releases/tag/?*) echo "${u##*/releases/tag/}" ;; *) return 1 ;; esac
+}
+
+# version_cmp A B: prints -1, 0 or 1. Dot-separated numbers; a leading v
+# and suffixes like -dev are ignored.
+version_cmp() {
+  local a="${1#v}" b="${2#v}" x y
+  while [ -n "$a" ] || [ -n "$b" ]; do
+    x="${a%%.*}"; x="${x%%[!0-9]*}"; x="${x:-0}"
+    y="${b%%.*}"; y="${y%%[!0-9]*}"; y="${y:-0}"
+    if [ "$x" -lt "$y" ]; then echo -1; return 0; fi
+    if [ "$x" -gt "$y" ]; then echo 1; return 0; fi
+    case "$a" in *.*) a="${a#*.}" ;; *) a="" ;; esac
+    case "$b" in *.*) b="${b#*.}" ;; *) b="" ;; esac
+  done
+  echo 0
+}
+
+cmd_update_self() {
+  local usage="Usage: vhosty update self [--ref TAG|main] [--force]"
+  local ref="" force=0 new comp ver
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ref) [ -n "${2:-}" ] || die "$usage"; ref="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -h|--help) echo "$usage"; return 0 ;;
+      *) die "$usage" ;;
+    esac
+  done
+  [ ! -L "$BIN_DIR/vhosty" ] || die "$BIN_DIR/vhosty links to $(readlink "$BIN_DIR/vhosty"). Update that instead (git pull)."
+  if [ -z "$ref" ]; then
+    ref="$(latest_release)" || die "Couldn't look up the latest release (offline?). Or install main: vhosty update self --ref main"
+    case "$(version_cmp "$ref" "$VHOSTY_VERSION")" in
+      0) if [ "$force" != "1" ]; then ok "vhosty $VHOSTY_VERSION is the latest release"; return 0; fi ;;
+      -1) [ "$force" = "1" ] || die "vhosty $VHOSTY_VERSION is newer than the latest release ($ref), so not downgrading. From a clone, update with: git pull && ./install.sh (or: vhosty update self --force)" ;;
+    esac
+  fi
+
+  # Into the same folder, then renamed over the old one: a running vhosty
+  # keeps reading its old copy, and a failed download changes nothing
+  mkdir -p "$BIN_DIR" "$VHOSTY_DIR/completions"
+  new="$BIN_DIR/.vhosty.new"; comp="$VHOSTY_DIR/completions/._vhosty.new"
+  TMP_PATHS="$TMP_PATHS $new $comp"
+  download "https://raw.githubusercontent.com/$VHOSTY_REPO/$ref/bin/vhosty" "$new" \
+    || die "Couldn't download vhosty $ref"
+  ver="$(sed -n 's/^VHOSTY_VERSION="\(.*\)"$/\1/p' "$new" | head -1)"
+  [ -n "$ver" ] && bash -n "$new" 2>/dev/null || die "What came from $ref doesn't look like vhosty. Not installing it."
+  chmod 755 "$new"
+  mv "$new" "$BIN_DIR/vhosty"
+  if curl -fsSL --retry 2 -o "$comp" "https://raw.githubusercontent.com/$VHOSTY_REPO/$ref/completions/_vhosty" 2>/dev/null; then
+    mv "$comp" "$VHOSTY_DIR/completions/_vhosty"
+  fi
+  ok "vhosty $VHOSTY_VERSION → $ver ($ref)"
+  case "$ref" in v[0-9]*) info "What's new: https://github.com/$VHOSTY_REPO/releases/tag/$ref" ;; esac
+
+  # Let the new version regenerate the config, so its changes take effect
+  if [ -f "$CONFIG_FILE" ] && svc_installed; then
+    cleanup_tmp
+    exec "$BIN_DIR/vhosty" rebuild
+  fi
+}
+
 cmd_update() {
-  need_config
-  case "${1:-all}" in
-    caddy) install_caddy ;;
+  local what="${1:-all}"
+  [ $# -eq 0 ] || shift
+  case "$what" in
+    self|vhosty) cmd_update_self "$@"; return ;;
+    caddy) need_config; install_caddy ;;
     php|php-fpm)
+      need_config
       php_enabled || die "PHP is turned off"
       is_macos || die "On Linux, PHP comes from apt: sudo apt update && sudo apt upgrade"
-      install_php_fpm "${2:-$(php_default)}" ;;
+      install_php_fpm "${1:-$(php_default)}" ;;
     all)
+      need_config
       install_caddy
       if php_enabled && is_macos; then install_php_fpm "$(php_default)"; fi ;;
-    *) die "Usage: vhosty update [caddy|php [8.x]]" ;;
+    *) die "Usage: vhosty update [self|caddy|php [8.x]]" ;;
   esac
   if svc_installed; then cmd_restart all; fi
+  # Last, since it hands over to the new version. Its errors are already shown.
+  if [ "$what" = "all" ]; then ( cmd_update_self ) || true; fi
 }
 
 cmd_paths() {
@@ -3261,7 +3335,7 @@ doctor_checks() {
   need_config
   FAILED=0
   is_macos && sudo -v
-  local ip probe resolved s st code o v name dir
+  local ip probe resolved s st code o v name dir latest
   ip="$(ts_ip)"
   probe="vhosty-doctor.$VHOSTY_DOMAIN"
   printf "%svhosty doctor%s  (*.%s)\n" "$B" "$N" "$VHOSTY_DOMAIN"
@@ -3352,6 +3426,17 @@ doctor_checks() {
     ok "https://$probe answered with HTTP $code"
   else
     bad "Couldn't reach https://$probe (TLS or connection failed)"
+  fi
+
+  head_ "vhosty"
+  if [ "${VHOSTY_UPDATE_CHECK:-1}" = "0" ]; then
+    ok "vhosty $VHOSTY_VERSION (update check off)"
+  elif ! latest="$(latest_release)"; then
+    info "vhosty $VHOSTY_VERSION (couldn't check for a newer release)"
+  elif [ "$(version_cmp "$latest" "$VHOSTY_VERSION")" = "1" ]; then
+    warn "vhosty ${latest#v} is out (you have $VHOSTY_VERSION). Run: vhosty update self"
+  else
+    ok "vhosty $VHOSTY_VERSION (latest release: ${latest#v})"
   fi
 
   echo
@@ -3455,7 +3540,7 @@ ${B}Config${N}
   vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply
   vhosty rebuild                     Regenerate config and reload services
   vhosty dns sync                    Point *.domain at this machine's Tailscale IP
-  vhosty update [caddy|php [8.x]]    Re-download Caddy (or PHP-FPM, on macOS)
+  vhosty update [self|caddy|php]     Update vhosty (latest release), Caddy, and PHP-FPM on macOS
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry
   vhosty doctor [--fix [--yes]]      Check DNS, certs, config, sites, services, and HTTPS; --fix repairs
@@ -3501,7 +3586,7 @@ main() {
     edit)               cmd_edit "${1:-config}" ;;
     rebuild)            cmd_rebuild ;;
     dns)                cmd_dns "${1:-sync}" ;;
-    update)             cmd_update "${1:-all}" "${2:-}" ;;
+    update)             cmd_update "$@" ;;
     validate|check)     need_config; cmd_validate "${1:-all}" ;;
     cert|certs)         cmd_cert ;;
     doctor|dr)          cmd_doctor "$@" ;;

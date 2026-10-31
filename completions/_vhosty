@@ -87,7 +87,7 @@ _vhosty() {
     'edit:Edit settings, PHP settings, or the token'
     'rebuild:Regenerate config and reload'
     'dns:Point *.domain at this machine'
-    'update:Re-download Caddy (or PHP-FPM on macOS)'
+    'update:Update vhosty, Caddy, and PHP-FPM on macOS'
     'validate:Check the generated config'
     'cert:Show the wildcard certificate'
     'doctor:Check everything end to end (--fix repairs)'
@@ -113,7 +113,7 @@ _vhosty() {
     edit)          _values 'file' config php env ;;
     validate)      _values 'config' caddy php ;;
     dns)           _values 'action' sync ;;
-    update)        _values 'what' caddy php ;;
+    update)        _values 'what' self caddy php ;;
     park|unpark)   _files -/ ;;
     link)          _arguments '1:folder:_files -/' '--name[Site name]:name:' ;;
     unlink)        _vhosty_links ;;

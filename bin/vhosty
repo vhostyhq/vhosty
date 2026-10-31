@@ -1442,6 +1442,7 @@ svc_reload() {
 svc_remove() {
   if is_linux; then
     sd disable --now --quiet "$1" 2>/dev/null || true
+    sd reset-failed "$1" 2>/dev/null || true   # or a failed unit is listed, and removed, every rebuild
   else
     if is_loaded "$1"; then sudo launchctl bootout "system/$(label_of "$1")" 2>/dev/null || true; fi
     sudo rm -f "$(plist_for "$1")"
@@ -1764,6 +1765,13 @@ cmd_link() {
   if [ -n "$existing" ] && [ "$existing" != "$dir" ]; then
     warn "$existing (parked) also answers to $name; the link takes over https://$name.$VHOSTY_DOMAIN"
   fi
+  # A parked site's own settings (pin, ini, extensions) belong to that
+  # folder: set them aside for unlink to put back, rather than carry them over
+  if [ "$SITE_LINKED" != "yes" ] && [ -f "$(site_file "$name")" ] && [ "$SITE_PATH" != "$dir" ]; then
+    mv "$(site_file "$name")" "$(site_file "$name").parked"
+    info "set aside $name's settings as a parked site; vhosty unlink $name brings them back"
+    site_load "$name"
+  fi
   SITE_PATH="$dir"
   SITE_LINKED="yes"
   site_save "$name"
@@ -1785,7 +1793,11 @@ cmd_unlink() {
   site_load "$name"
   [ "$SITE_LINKED" = "yes" ] || die "'$name' isn't linked. Run: vhosty links"
   parked="$(parked_dir_for "$name" || true)"
-  if [ -n "$parked" ] && [ "$parked" = "$SITE_PATH" ]; then
+  if [ -f "$(site_file "$name").parked" ]; then
+    # The parked site's settings, set aside by `vhosty link`
+    mv "$(site_file "$name").parked" "$(site_file "$name")"
+    info "restored $name's settings as a parked site"
+  elif [ -n "$parked" ] && [ "$parked" = "$SITE_PATH" ]; then
     # Still served from its parked folder: keep its pin and settings
     SITE_LINKED="no"
     site_save "$name"
@@ -2794,9 +2806,13 @@ pg_in() { # pg_in SERVICE 'snippet' [args, as $1..]
 }
 
 service_kind() { # image → mysql | postgres | volume
-  case "$1" in
-    *mysql*|*mariadb*|*percona*) echo mysql ;;
-    *postgres*|*pgvector*|*postgis*|*timescale*) echo postgres ;;
+  # By the image's own name, without registry, owner or tag: mysql:8.4 and
+  # pgvector/pgvector:pg18 are databases, prom/mysqld-exporter isn't
+  local base="${1##*/}"
+  base="${base%%[:@]*}"
+  case "$base" in
+    mysql|mysql-server|mariadb|percona|percona-server) echo mysql ;;
+    postgres|postgresql|pgvector|postgis|timescaledb|timescaledb-ha) echo postgres ;;
     *) echo volume ;;
   esac
 }
@@ -3176,7 +3192,7 @@ cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
 # ---------------------------------------------------------------------------
 cmd_sites() {
   need_config
-  local dir p name lname note re='^[A-Za-z0-9-]+$' linked
+  local dir p name lname note linked
   linked="$(cmd_links 2>/dev/null | grep https || true)"
   [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
   if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
@@ -3186,14 +3202,16 @@ cmd_sites() {
     for p in "$dir"/*/; do
       [ -d "$p" ] || continue
       name="$(basename "$p")"; lname="$(lower "$name")"; note=""
-      if [[ $name =~ $re ]] && [ "$name" != "$lname" ]; then
+      if valid_name "$lname" && [ "$name" != "$lname" ]; then
         if [ "$(parked_dir_for "$lname")" != "${p%/}" ]; then
           info "$name (not served: $(parked_dir_for "$lname") has the name $lname)"; continue
         fi
         grep -qF "@site_$lname host" "$CADDYFILE" 2>/dev/null || note="; run vhosty rebuild to serve it"
       fi
-      if ! [[ $name =~ $re ]]; then
-        info "$name (not a valid hostname: use letters, numbers, dashes)"
+      if ! valid_name "$lname"; then
+        info "$name (not a valid hostname: letters, numbers and dashes, no dash at either end)"
+      elif printf '%s' "$lname" | grep -qE '^[0-9]+$'; then
+        info "$name (a number: https://$lname.$VHOSTY_DOMAIN is the port route, not this folder)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
         site_load "$lname"
         printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")" "$note" "$N"
@@ -3472,7 +3490,7 @@ stale_sites() {
 
 # Generated files nothing uses any more: "path<TAB>why"
 prune_leftovers() {
-  local d v f keep
+  local d v f keep name
   keep=" $(php_versions_in_use | tr '\n' ' ') "
   for d in "$PHP_CONF_DIR"/*/; do
     [ -d "$d" ] || continue
@@ -3485,9 +3503,13 @@ prune_leftovers() {
     case "$keep" in *" $v "*) continue ;; esac
     [ "$(svc_state "php-$v")" = "running" ] || printf '%s\tPHP %s isn'"'"'t running\n' "$f" "$v"
   done
+  # By the sites, not the FPM configs on disk: those still list the pools
+  # of sites about to be pruned
   for f in "$RUN_DIR"/site-*.sock; do
     [ -e "$f" ] || continue
-    grep -qsF "listen = $f" "$PHP_CONF_DIR"/*/php-fpm.conf || printf '%s\tsocket for a pool that no longer exists\n' "$f"
+    name="${f##*/site-}"; name="${name%.sock}"
+    if site_folder "$name" >/dev/null && [ -n "$SITE_INI" ]; then continue; fi
+    printf '%s\tsocket for a pool that no longer exists\n' "$f"
   done
 }
 

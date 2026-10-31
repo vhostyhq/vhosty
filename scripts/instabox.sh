@@ -90,7 +90,7 @@ main() {
   printf '%s' "$size" | grep -qE '^[0-9]+/[0-9]+$' || die "--size: vCPUs/GB, like 8/16"
   printf '%s' "$disk" | grep -qE '^[0-9]+$' || die "--disk: GB, like 100"
   if [ -z "$domain" ] && [ -f "$HOME/.vhosty/config" ]; then
-    d="$(sed -n 's/^VHOSTY_DOMAIN="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$HOME/.vhosty/config" | head -1)"
+    d="$( . "$HOME/.vhosty/config" 2>/dev/null; printf '%s' "${VHOSTY_DOMAIN:-}")"
     [ -z "$d" ] || domain="$name.$d"
   fi
   [ -n "$domain" ] || die "--domain is required (no vhosty domain on this computer to build one from)"

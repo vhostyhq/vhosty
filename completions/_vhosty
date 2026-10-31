@@ -7,7 +7,13 @@ _vhosty_dir() { print -r -- "${VHOSTY_DIR:-$HOME/.vhosty}"; }
 
 _vhosty_config() { # _vhosty_config VHOSTY_PARKED → its value
   local config="$(_vhosty_dir)/config"
-  [ -f "$config" ] && sed -n "s/^$1=\"\(.*\)\"\$/\1/p" "$config"
+  # Loaded as vhosty loads it (values are written with printf %q, quoted or not)
+  [ -f "$config" ] && ( . "$config" 2>/dev/null; print -r -- "${(P)1}" )
+}
+
+_vhosty_backup_dir() {
+  local d="$(_vhosty_config VHOSTY_BACKUP_DIR)"
+  print -r -- "${d:-$(_vhosty_dir)/backups}"
 }
 
 # Parked folders' subfolders plus configured sites (links, pins)
@@ -157,13 +163,13 @@ _vhosty() {
       elif [ "${words[3]}" = "backup" ]; then
         _arguments '--to[Folder to save in]:folder:_files -/'
       elif [ "${words[3]}" = "restore" ]; then
-        _arguments '1:backup:_alternative "saved:saved backup:_files -/ -W $(_vhosty_dir)/backups" "folders:folder:_files -/"' '--into[Services folder]:folder:_files -/' '--replace-config[Use the backup'"'"'s compose.yaml and .env]' '--yes[Don'"'"'t ask]'
+        _arguments '1:backup:_alternative "saved:saved backup:_files -/ -W $(_vhosty_backup_dir)" "folders:folder:_files -/"' '--into[Services folder]:folder:_files -/' '--replace-config[Use the backup'"'"'s compose.yaml and .env]' '--yes[Don'"'"'t ask]'
       else
         _vhosty_docker_services
       fi ;;
     doctor|dr)     _values 'option' --fix --yes ;;
     prune)         _values 'option' --yes ;;
-    setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token]:token:' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--yes[Accept defaults]' ;;
+    setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token (CF_API_TOKEN is safer)]:token:' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--yes[Accept defaults]' '--overwrite-dns[Replace a *.domain record that is not vhosty'"'"'s]' ;;
   esac
 }
 

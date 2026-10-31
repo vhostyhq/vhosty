@@ -301,7 +301,7 @@ port_owner() {
     }' | sort -u | tr '\n' ' ' | sed 's/ $//' \
       | { IFS= read -r o || true
           # Caddy's port capability hides its sockets from ss; "?" is ours if it's running
-          if [ "$o" = "?" ] && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && [ "$(svc_state caddy)" = "running" ]; then o="caddy"; fi
+          if [ "$o" = "?" ] && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && svc_running caddy; then o="caddy"; fi
           printf '%s' "$o"; } || true
   fi
 }
@@ -1417,6 +1417,8 @@ svc_installed() {
   if is_linux; then [ -f "$UNIT_DIR/vhosty-caddy.service" ]; else [ -f "$(plist_for caddy)" ]; fi
 }
 
+svc_running() { [ "$(svc_state "$1")" = "running" ]; }
+
 svc_state() { # running | stopped | failed | ...
   local s
   if is_linux; then
@@ -1498,7 +1500,7 @@ svc_sync() {
 svc_apply() {
   local s
   for s in $(svc_all); do
-    if [ "$(svc_state "$s")" = "running" ]; then svc_reload "$s"; ok "reloaded $s"
+    if svc_running "$s"; then svc_reload "$s"; ok "reloaded $s"
     else svc_start "$s"; ok "started $s"; fi
   done
   mark_applied
@@ -1915,7 +1917,7 @@ cmd_stop() {
   need_config
   local s
   for s in $(svc_resolve "${1:-all}"); do
-    if [ "$(svc_state "$s")" = "running" ]; then svc_stop "$s"; ok "stopped $s"
+    if svc_running "$s"; then svc_stop "$s"; ok "stopped $s"
     else warn "$s isn't running"; fi
   done
 }
@@ -2177,7 +2179,7 @@ install_exts() { # install_exts VERSION ext...
   for e in "$@"; do
     if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded"; fi
   done
-  if [ "$(svc_state "php-$v")" = "running" ]; then svc_restart "php-$v"; ok "restarted php-$v"; fi
+  if svc_running "php-$v"; then svc_restart "php-$v"; ok "restarted php-$v"; fi
 }
 
 cmd_ext() {
@@ -2580,7 +2582,7 @@ cmd_services() {
 }
 
 services_status() { # [--no-header]
-  local svc st health ports bad_ports defined rows
+  local svc st health ports bad_ports defined rows s1 s2 s3 s4
   [ "${1:-}" = "--no-header" ] || printf "%sServices%s  %s\n" "$B" "$N" "$VHOSTY_SERVICES_DIR"
   rows="$(services_rows)"
   defined="$(dc config --services 2>/dev/null | sort)"
@@ -3276,6 +3278,7 @@ cmd_url() {
 # ---------------------------------------------------------------------------
 cmd_validate() {
   local target="${1:-all}" rc=0 v out
+  case "$target" in all|caddy|php|php-fpm) ;; *) die "Usage: vhosty validate [caddy|php]" ;; esac
   if [ "$target" = "all" ] || [ "$target" = "caddy" ]; then
     load_token
     if out="$(CF_API_TOKEN="$CF_API_TOKEN" "$CADDY_BIN" validate --config "$CADDYFILE" --adapter caddyfile 2>&1)"; then
@@ -3304,7 +3307,7 @@ cmd_edit() {
   need_config
   case "${1:-config}" in
     config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
-    php|ini|php.ini) INI_SCOPE="global"; cmd_ini_edit --global ;;
+    php|ini|php.ini) cmd_ini_edit --global ;;
     env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; svc_restart caddy; ok "restarted caddy" ;;
     *) die "Unknown file '$1' (use config, php, or env)" ;;
   esac
@@ -3533,7 +3536,7 @@ prune_leftovers() {
     [ -e "$f" ] || continue
     v="${f##*/php-}"; v="${v%.*}"
     case "$keep" in *" $v "*) continue ;; esac
-    [ "$(svc_state "php-$v")" = "running" ] || printf '%s\tPHP %s isn'"'"'t running\n' "$f" "$v"
+    svc_running "php-$v" || printf '%s\tPHP %s isn'"'"'t running\n' "$f" "$v"
   done
   # By the sites, not the FPM configs on disk: those still list the pools
   # of sites about to be pruned
@@ -3636,7 +3639,7 @@ doctor_fix() {
   fi
 
   if ! config_in_sync || ! config_applied; then need_rebuild=1; fi
-  for s in $(svc_all); do [ "$(svc_state "$s")" = "running" ] || need_rebuild=1; done
+  for s in $(svc_all); do svc_running "$s" || need_rebuild=1; done
   if is_linux && ! sd is-active --quiet vhosty-logs.timer 2>/dev/null; then need_rebuild=1; fi
   if [ "$need_rebuild" = "1" ] && svc_installed && fix_ok "regenerate config and start or reload services (vhosty rebuild)"; then
     cmd_rebuild; fixed=1
@@ -3879,7 +3882,8 @@ ${B}Docker services${N} ${D}(docker compose in VHOSTY_SERVICES_DIR)${N}
   vhosty services init [dir] [--only mysql,valkey,..]  Write a compose.yaml for MySQL, Postgres,
                                      Valkey, Meilisearch, Typesense and RustFS, sized for this machine
   vhosty services backup [--to DIR]  Dump the databases, archive the other volumes, copy the config
-  vhosty services restore <backup> [--yes]  Put a backup back: config, volumes, then databases
+  vhosty services restore <backup> [--into DIR] [--replace-config] [--yes]
+                                     Put a backup back: config, volumes, then databases
 
 ${B}Caddy and PHP-FPM${N}
   vhosty start   [caddy|php|php-8.x] Start services (default: all)

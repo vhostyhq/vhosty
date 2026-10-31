@@ -2986,16 +2986,44 @@ cmd_edit() {
   esac
 }
 
+# Days until a certificate expires, or nothing when the date can't be read
+cert_days_left() {
+  local end s
+  end="$(openssl x509 -in "$1" -noout -enddate 2>/dev/null | cut -d= -f2)"
+  [ -n "$end" ] || return 0
+  s="$(date -d "$end" +%s 2>/dev/null || date -j -f '%b %e %T %Y %Z' "$end" +%s 2>/dev/null)" || return 0
+  echo $(( (s - $(date +%s) + 43200) / 86400 ))
+}
+
+# Caddy renews when about 30 days are left, so fewer than this means
+# renewal has been failing (usually the Cloudflare token)
+CERT_WARN_DAYS=20
+
 cmd_cert() {
   need_config
-  local crt
+  local crt days left="" rc=0
   crt="$(find "$CADDY_CERTS" -name "wildcard_.$VHOSTY_DOMAIN.crt" 2>/dev/null | head -1 || true)"
   if [ -z "$crt" ]; then
     bad "No certificate for *.$VHOSTY_DOMAIN yet (check: vhosty logs caddy)"
     return 1
   fi
-  ok "certificate for *.$VHOSTY_DOMAIN"
+  if ! command -v openssl >/dev/null 2>&1; then
+    ok "certificate for *.$VHOSTY_DOMAIN (install openssl to check its expiry)"
+    return 0
+  fi
+  days="$(cert_days_left "$crt")"
+  [ -z "$days" ] || left=" in $days day$([ "$days" = "1" ] || echo s)"
+  if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+    bad "certificate for *.$VHOSTY_DOMAIN has expired: Caddy couldn't renew it"; rc=1
+    info "See why: vhosty logs caddy. A deleted or expired Cloudflare token is the usual cause: vhosty edit env"
+  elif ! openssl x509 -in "$crt" -noout -checkend $((CERT_WARN_DAYS * 86400)) >/dev/null 2>&1; then
+    warn "certificate for *.$VHOSTY_DOMAIN expires$left, and Caddy should have renewed it by now"
+    info "See why: vhosty logs caddy. A deleted or expired Cloudflare token is the usual cause: vhosty edit env"
+  else
+    ok "certificate for *.$VHOSTY_DOMAIN (expires$left)"
+  fi
   openssl x509 -in "$crt" -noout -issuer -enddate 2>/dev/null | sed 's/^/      /'
+  return $rc
 }
 
 cmd_dns() {

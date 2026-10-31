@@ -3631,4 +3631,5 @@ main() {
   esac
 }
 
-main "$@"
+# Run as a command; sourced (as the tests do), only define the functions
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

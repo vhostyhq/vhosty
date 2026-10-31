@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz | tar -xJ
+          sudo mv shellcheck-v0.11.0/shellcheck /usr/local/bin/
+      - name: ShellCheck
+        run: shellcheck --severity=warning bin/vhosty install.sh scripts/*.sh tests/helpers.bash
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: git clone --depth 1 --branch v1.12.0 https://github.com/bats-core/bats-core.git "$RUNNER_TEMP/bats"
+
+      # The integration tests run the generated Caddyfile in a real Caddy,
+      # built with the Cloudflare DNS plugin as vhosty downloads it
+      - name: Cache Caddy
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/caddy
+          key: caddy-cloudflare-${{ runner.os }}-${{ runner.arch }}-v2.11
+      - name: Download Caddy
+        run: |
+          if [ ! -x "$RUNNER_TEMP/caddy" ]; then
+            os=linux; [ "$RUNNER_OS" = macOS ] && os=darwin
+            arch=amd64; [ "$RUNNER_ARCH" = ARM64 ] && arch=arm64
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/caddy" \
+              "https://caddyserver.com/api/download?os=$os&arch=$arch&p=github.com%2Fcaddy-dns%2Fcloudflare"
+            chmod +x "$RUNNER_TEMP/caddy"
+          fi
+          "$RUNNER_TEMP/caddy" version
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VHOSTY_TEST_CADDY: ${{ runner.temp }}/caddy
+        run: '"$RUNNER_TEMP/bats/bin/bats" tests/'
+
+      # vhosty targets the bash 3.2 and BSD tools that ship with macOS, so put
+      # them ahead of anything Homebrew installed
+      - name: Test (macOS, bash 3.2)
+        if: runner.os == 'macOS'
+        env:
+          VHOSTY_TEST_CADDY: ${{ runner.temp }}/caddy
+          VHOSTY_TEST_BASH: /bin/bash
+        run: |
+          /bin/bash --version | head -1
+          PATH="/bin:/usr/bin:/usr/sbin:/sbin:$PATH" /bin/bash "$RUNNER_TEMP/bats/bin/bats" tests/

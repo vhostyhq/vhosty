@@ -1,0 +1,64 @@
+#!/usr/bin/env bats
+# The php shim: the version and settings of the site you're in
+
+load helpers
+
+setup_file() { :; }
+
+# Fake PHP binaries the shim finds in ~/.vhosty/bin: they print their version and arguments
+fake_php() {
+  mkdir -p "$VHOSTY_DIR/bin"
+  printf '#!/usr/bin/env bash\necho "php %s $*"\n' "$1" >"$VHOSTY_DIR/bin/php-$1"
+  chmod +x "$VHOSTY_DIR/bin/php-$1"
+}
+
+shim_setup() {
+  write_config 'VHOSTY_PHP_DEFAULT="9.9"'
+  fake_php 9.9
+  fake_php 9.8
+  printf 'memory_limit = 512M\n' >"$VHOSTY_DIR/php.ini"
+  vh write_shim
+}
+
+@test "outside every site, the shim runs the default version with the global settings" {
+  shim_setup
+  run bash -c "cd '$HOME' && '$VHOSTY_DIR/bin/php' -v"
+  [ "$output" = "php 9.9 -d memory_limit=512M -v" ]
+}
+
+@test "inside a pinned site, it runs that site's version and settings" {
+  shim_setup
+  php_site legacy
+  mkdir -p "$PARKED/legacy/app"
+  site_conf legacy "SITE_PATH=$PARKED/legacy
+SITE_PHP=9.8
+SITE_INI='max_execution_time=300'"
+  run bash -c "cd '$PARKED/legacy/app' && '$VHOSTY_DIR/bin/php' artisan"
+  [ "$output" = "php 9.8 -d memory_limit=512M -d max_execution_time=300 artisan" ]
+}
+
+@test "the deepest site wins" {
+  shim_setup
+  mkdir -p "$HOME/p/outer/inner"
+  site_conf outer "SITE_PATH=$HOME/p/outer
+SITE_PHP=9.9"
+  site_conf inner "SITE_PATH=$HOME/p/outer/inner
+SITE_PHP=9.8"
+  run bash -c "cd '$HOME/p/outer/inner' && '$VHOSTY_DIR/bin/php' x"
+  assert_contains "$output" "php 9.8"
+}
+
+@test "a folder that only starts like a site's path isn't inside it" {
+  shim_setup
+  mkdir -p "$HOME/p/app" "$HOME/p/app2"
+  site_conf app "SITE_PATH=$HOME/p/app
+SITE_PHP=9.8"
+  run bash -c "cd '$HOME/p/app2' && '$VHOSTY_DIR/bin/php' x"
+  assert_contains "$output" "php 9.9"
+}
+
+@test "VHOSTY_PHP_VERSION overrides the version for one command" {
+  shim_setup
+  run bash -c "cd '$HOME' && VHOSTY_PHP_VERSION=9.8 '$VHOSTY_DIR/bin/php' x"
+  assert_contains "$output" "php 9.8"
+}

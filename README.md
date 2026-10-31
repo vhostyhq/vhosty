@@ -353,6 +353,21 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 - Laravel's debug pages (`APP_DEBUG=true`) show environment details to anyone who can load them.
 - Domain names appear in public certificate logs. The wildcard certificate only reveals `*.yourdomain.dev`, not your folder names.
 
+## Development
+
+vhosty is one bash file, `bin/vhosty`, kept compatible with the bash 3.2 that
+ships with macOS. The tests use [bats](https://github.com/bats-core/bats-core):
+
+```bash
+bats tests/                      # needs bats-core 1.x
+shellcheck --severity=warning bin/vhosty install.sh scripts/*.sh
+```
+
+They run in a scratch home with a fake `tailscale`, so they don't touch your
+setup. `tests/caddy.bats` runs the generated Caddyfile in a real Caddy with the
+Cloudflare plugin (`VHOSTY_TEST_CADDY`, or the one vhosty installed); without one
+it's skipped. CI runs everything on Ubuntu and on macOS's bash 3.2.
+
 ## Uninstall
 
 ```bash

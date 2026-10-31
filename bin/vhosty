@@ -254,7 +254,10 @@ check_folder() { # check_folder DIR [parked]
   fi
 }
 
-parked_list() { printf '%s\n' "$VHOSTY_PARKED" | tr ':' '\n' | sed '/^$/d'; }
+parked_list() { # one per line; in bash, as it runs often
+  local p IFS=:
+  for p in $VHOSTY_PARKED; do [ -z "$p" ] || printf '%s\n' "$p"; done
+}
 
 # ---------------------------------------------------------------------------
 # System helpers
@@ -317,8 +320,8 @@ json_get() {
 }
 
 download() { # download URL DEST
-  if [ -t 2 ]; then curl -fSL --progress-bar --retry 2 -o "$2" "$1"
-  else curl -fsSL --retry 2 -o "$2" "$1"; fi
+  if [ -t 2 ]; then curl -fSL --progress-bar --retry 2 --connect-timeout 15 -o "$2" "$1"
+  else curl -fsSL --retry 2 --connect-timeout 15 -o "$2" "$1"; fi
 }
 
 open_url() {
@@ -465,7 +468,7 @@ caddy_allow_ports() {
 # system resolver (minimal Debian has no dig)
 resolve_a() {
   if command -v dig >/dev/null 2>&1; then
-    dig +short "$1" A 2>/dev/null | tail -1 || true
+    dig +short +time=2 +tries=1 "$1" A 2>/dev/null | tail -1 || true
   else
     getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 {print $1}' || true
   fi
@@ -552,7 +555,7 @@ php_cli_minor() {
 php_fpm_file() {
   local minor="$1" arch listing
   case "$(arch_name)" in amd64) arch="x86_64" ;; arm64) arch="aarch64" ;; esac
-  listing="$(curl -fsSL "$PHP_DOWNLOADS/")" || die "Couldn't reach $PHP_DOWNLOADS"
+  listing="$(curl -fsSL --connect-timeout 10 --max-time 30 "$PHP_DOWNLOADS/")" || die "Couldn't reach $PHP_DOWNLOADS"
   printf '%s' "$listing" \
     | grep -oE "php-$(printf '%s' "$minor" | sed 's/\./\\./')\.[0-9]+-fpm-macos-${arch}\.tar\.gz" \
     | sort -u | awk -F- '{split($2,v,"."); printf "%d %s\n", v[3], $0}' \
@@ -630,7 +633,12 @@ site_sock() { echo "$RUN_DIR/site-$1.sock"; }
 # the project folders.
 # ---------------------------------------------------------------------------
 valid_name() { printf '%s' "$1" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; }
-lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+lower() { # forks tr only when there's something to lower (it runs per folder)
+  case "$1" in
+    *[[:upper:]]*) printf '%s' "$1" | tr '[:upper:]' '[:lower:]' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 site_file() { echo "$SITES_DIR/$1.conf"; }
 
 site_names() {
@@ -722,8 +730,10 @@ case_sites() {
   while IFS= read -r p; do
     [ -n "$p" ] || continue
     for f in "$p"/*/; do
-      f="${f%/}"; name="$(lower "${f##*/}")"
-      [ -d "$f" ] && [ "$name" != "${f##*/}" ] && valid_name "$name" || continue
+      f="${f%/}"
+      case "${f##*/}" in *[[:upper:]]*) ;; *) continue ;; esac
+      name="$(lower "${f##*/}")"
+      [ -d "$f" ] && valid_name "$name" || continue
       case "$seen" in *" $name "*) continue ;; esac
       [ "$(parked_dir_for "$name")" = "$f" ] || continue
       { php_enabled && [ -f "$f/public/index.php" ]; } || [ -f "$f/index.html" ] || continue
@@ -759,9 +769,9 @@ static_hide() {
   printf '\t\t@%s {\n\t\t\tpath */.*\n\t\t\tnot path /.well-known/*\n\t\t}\n\t\terror @%s 404' "$1" "$1"
 }
 
-caddy_sites() {
+caddy_sites() { # caddy_sites "CASE_SITES"
   local name dir v sock
-  for name in $(site_names) $(case_sites); do
+  for name in $(site_names) $1; do
     site_load "$name"
     dir="$(site_dir "$name" || true)"
     if [ -z "$dir" ] || [ ! -d "$dir" ]; then
@@ -827,13 +837,14 @@ check_ports() {
 }
 
 write_caddyfile() {
-  local depth i=0 dir v ip bind name sites=""
+  local depth i=0 dir v ip bind name sites="" cased
   check_ports
   mkdir -p "$RUN_DIR"   # for the admin socket
   depth="$(domain_depth)"
   v="$(php_default)"
   # Configured sites whose folder exists, for the "no site found" page
-  for name in $(site_names) $(case_sites); do
+  cased="$(case_sites)"   # once: it globs every parked folder
+  for name in $(site_names) $cased; do
     dir="$(site_dir "$name" || true)"
     [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
   done
@@ -881,7 +892,7 @@ EOF
 		error "vhosty: port not open to the tailnet" 403
 	}
 EOF
-    caddy_sites
+    caddy_sites "$cased"
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue
       if php_enabled && [ -n "$v" ]; then
@@ -3353,9 +3364,18 @@ cmd_dns() {
 
 # Latest release tag (v0.3.0), from where github.com/<repo>/releases/latest
 # redirects: no API rate limit, no jq. Fails offline or with no releases.
+# The same, remembered for a day, for doctor (the lookup is most of its time)
+latest_release_cached() {
+  local f="$RUN_DIR/latest-release" tag
+  if [ -f "$f" ] && [ -n "$(find "$f" -mmin -1440 2>/dev/null)" ]; then cat "$f"; return 0; fi
+  tag="$(latest_release)" || return 1
+  { mkdir -p "$RUN_DIR" && printf '%s\n' "$tag" >"$f"; } 2>/dev/null || true
+  echo "$tag"
+}
+
 latest_release() {
   local u
-  u="$(curl -fsSLI --max-time 5 -o /dev/null -w '%{url_effective}' "https://github.com/$VHOSTY_REPO/releases/latest" 2>/dev/null)" || return 1
+  u="$(curl -fsSLI --connect-timeout 5 --max-time 8 -o /dev/null -w '%{url_effective}' "https://github.com/$VHOSTY_REPO/releases/latest" 2>/dev/null)" || return 1
   case "$u" in */releases/tag/?*) echo "${u##*/releases/tag/}" ;; *) return 1 ;; esac
 }
 
@@ -3754,7 +3774,7 @@ doctor_checks() {
   fi
 
   head_ "End to end"
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "https://$probe/" 2>/dev/null || true)"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 8 "https://$probe/" 2>/dev/null || true)"
   if [ -n "$code" ] && [ "$code" != "000" ]; then
     ok "https://$probe answered with HTTP $code"
   else
@@ -3764,7 +3784,7 @@ doctor_checks() {
   head_ "vhosty"
   if [ "${VHOSTY_UPDATE_CHECK:-1}" = "0" ]; then
     ok "vhosty $VHOSTY_VERSION (update check off)"
-  elif ! latest="$(latest_release)"; then
+  elif ! latest="$(latest_release_cached)"; then
     info "vhosty $VHOSTY_VERSION (couldn't check for a newer release)"
   elif [ "$(version_cmp "$latest" "$VHOSTY_VERSION")" = "1" ]; then
     warn "vhosty ${latest#v} is out (you have $VHOSTY_VERSION). Run: vhosty update self"

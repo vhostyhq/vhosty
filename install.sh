@@ -44,7 +44,7 @@ if [ -n "$src" ]; then
 else
   if [ -z "$REF" ]; then
     # github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>
-    REF="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    REF="$(curl -fsSLI --connect-timeout 10 --max-time 15 -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
     case "$REF" in
       */releases/tag/*) REF="${REF##*/releases/tag/}" ;;
       *) warn "Couldn't find the latest release, so installing main"; REF="main" ;;

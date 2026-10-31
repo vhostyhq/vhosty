@@ -64,3 +64,13 @@ installed_version() { sed -n 's/^VHOSTY_VERSION="\(.*\)"$/\1/p' "$VHOSTY_DIR/bin
   [ "$status" -ne 0 ]
   [ "$(cat "$VHOSTY_DIR/bin/vhosty")" = old ]
 }
+
+@test "doctor's release check asks GitHub at most once a day" {
+  stub curl 'echo x >>"$HOME/curl.calls"; printf "https://github.com/vhostyhq/vhosty/releases/tag/v9.9.9"'
+  [ "$(vh latest_release_cached)" = v9.9.9 ]
+  [ "$(vh latest_release_cached)" = v9.9.9 ]
+  [ "$(wc -l <"$HOME/curl.calls" | tr -d ' ')" = 1 ]
+  touch -t 202001010000 "$VHOSTY_DIR/run/latest-release"   # a stale answer is asked again
+  vh latest_release_cached >/dev/null
+  [ "$(wc -l <"$HOME/curl.calls" | tr -d ' ')" = 2 ]
+}

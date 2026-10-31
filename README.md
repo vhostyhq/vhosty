@@ -72,6 +72,11 @@ For another, set `VHOSTY_REF` to its tag, or to `main` for changes that aren't r
 `curl -fsSL … | VHOSTY_REF=v0.3.0 bash`. A clone installs whatever is checked out
 (`git checkout v0.3.0` first for a release).
 
+**On a cloud VM:** one command creates an [InstaBox](https://instabox.sh) machine and
+sets it up as a vhosty box, with Tailscale, PHP and Docker services. On any fresh Debian or
+Ubuntu VM (a droplet, a Hetzner server), `scripts/box-setup.sh` does the same setup. See
+[docs/instabox.md](docs/instabox.md).
+
 `vhosty setup` asks for your domain, token, and the folder to park, then:
 
 - downloads Caddy into `~/.vhosty/bin` (and PHP-FPM on macOS),

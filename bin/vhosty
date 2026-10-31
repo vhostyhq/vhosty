@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VHOSTY_VERSION="0.2.0"
+VHOSTY_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # Platform and locations

@@ -94,3 +94,12 @@ load helpers
   [ -f "$HOME/Backups/precious" ]
   [ -d "$HOME/keep" ]
 }
+
+@test "removing the last global PHP setting leaves an empty php.ini, not an error" {
+  printf 'memory_limit = 1G\n' >"$VHOSTY_DIR/php.ini"
+  run vh eval 'INI_SCOPE=global; ini_store ""'
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run vh ini_pairs "$VHOSTY_DIR/php.ini"
+  [ -z "$output" ]
+  [ ! -e "$VHOSTY_DIR/php.ini.tmp" ]
+}

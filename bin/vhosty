@@ -2221,7 +2221,7 @@ cmd_isolate() {
   site_save "$name"
   ok "$name now uses PHP $v (web and CLI)"
   missing_exts "$dir" "$v" | while IFS="$(printf '\t')" read -r e why; do
-    [ -n "$e" ] && warn "PHP $v is missing $e ($why). Run: vhosty ext install $e --php $v"
+    [ -z "$e" ] || warn "PHP $v is missing $e ($why). Run: vhosty ext install $e --php $v"
   done
   cmd_rebuild
 }
@@ -2278,7 +2278,7 @@ ini_store() { # ini_store "lines"
       echo "; vhosty: PHP settings for every site and every PHP version (web and CLI)."
       echo "; They apply on top of the distro's php.ini. After editing, run: vhosty rebuild"
       printf '%s\n' "$lines" | while IFS= read -r kv; do
-        [ -n "$kv" ] && printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"
+        [ -z "$kv" ] || printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"
       done
     } >"$PHP_INI.tmp"
     mv "$PHP_INI.tmp" "$PHP_INI"

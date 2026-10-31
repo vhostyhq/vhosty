@@ -99,13 +99,22 @@ die()   { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
 
 # Temp files and folders, removed when vhosty exits, errors included.
 # make_tmp VAR [-d] sets VAR (no subshell, so the path gets recorded).
+# One path per line: paths can have spaces (a backup folder like "Backups 2"),
+# and splitting them would hand rm -rf the pieces
 TMP_PATHS=""
-cleanup_tmp() { local p; for p in $TMP_PATHS; do rm -rf "$p"; done; }
+add_tmp() { TMP_PATHS="$TMP_PATHS
+$1"; }
+cleanup_tmp() {
+  local p
+  while IFS= read -r p; do [ -z "$p" ] || rm -rf -- "$p"; done <<EOF
+$TMP_PATHS
+EOF
+}
 trap cleanup_tmp EXIT
 make_tmp() {
   local _p
   _p="$(mktemp ${2:+"$2"})" || die "Couldn't create a temp file"
-  TMP_PATHS="$TMP_PATHS $_p"
+  add_tmp "$_p"
   printf -v "$1" '%s' "$_p"
 }
 
@@ -2697,7 +2706,7 @@ cmd_services_backup() { # [--to DIR]
   out="$root/services-$(date +%Y%m%d-%H%M%S)"
   [ ! -e "$out" ] || die "$out already exists"
   partial="$out.partial"
-  TMP_PATHS="$TMP_PATHS $partial"   # removed if anything fails
+  add_tmp "$partial"   # removed if anything fails
   umask 077   # dumps and keys: readable by you only
   mkdir -p "$partial/config"
   t0="$(date +%s)"
@@ -3148,7 +3157,7 @@ cmd_update_self() {
   # keeps reading its old copy, and a failed download changes nothing
   mkdir -p "$BIN_DIR" "$VHOSTY_DIR/completions"
   new="$BIN_DIR/.vhosty.new"; comp="$VHOSTY_DIR/completions/._vhosty.new"
-  TMP_PATHS="$TMP_PATHS $new $comp"
+  add_tmp "$new"; add_tmp "$comp"
   download "https://raw.githubusercontent.com/$VHOSTY_REPO/$ref/bin/vhosty" "$new" \
     || die "Couldn't download vhosty $ref"
   ver="$(sed -n 's/^VHOSTY_VERSION="\(.*\)"$/\1/p' "$new" | head -1)"

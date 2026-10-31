@@ -84,3 +84,13 @@ load helpers
   rm "$HOME/app/.env"
   run vh app_debug_on "$HOME/app"; [ "$status" -ne 0 ]
 }
+
+@test "temp paths with spaces are removed whole, and nothing else is" {
+  mkdir -p "$HOME/Backups 2/services.partial" "$HOME/Backups" "$HOME/keep"
+  touch "$HOME/Backups/precious"
+  cd "$HOME"
+  vh eval 'add_tmp "$HOME/Backups 2/services.partial"; add_tmp "$HOME/no such"; cleanup_tmp'
+  [ ! -e "$HOME/Backups 2/services.partial" ]
+  [ -f "$HOME/Backups/precious" ]
+  [ -d "$HOME/keep" ]
+}

@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-VHOSTY_VERSION="0.4.1"
+VHOSTY_VERSION="0.5.0"
 VHOSTY_REPO="${VHOSTY_REPO:-vhostyhq/vhosty}"   # where `vhosty update self` gets releases
 
 # ---------------------------------------------------------------------------

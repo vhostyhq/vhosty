@@ -381,7 +381,8 @@ in your [tailnet policy](https://tailscale.com/kb/1324/grants). Tag it with
 ## Development
 
 vhosty is one bash file, `bin/vhosty`, kept compatible with the bash 3.2 that
-ships with macOS. The tests use [bats](https://github.com/bats-core/bats-core):
+ships with macOS. [CONTRIBUTING.md](CONTRIBUTING.md) says what's in scope and how
+the code is kept. The tests use [bats](https://github.com/bats-core/bats-core):
 
 ```bash
 bats tests/                      # needs bats-core 1.x

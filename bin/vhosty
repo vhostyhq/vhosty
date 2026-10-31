@@ -397,13 +397,40 @@ dns_sync() {
 # ---------------------------------------------------------------------------
 # Caddy
 # ---------------------------------------------------------------------------
+# A tool from /usr/sbin or /sbin, which aren't on a normal user's PATH on Debian
+sbin_cmd() {
+  local c
+  for c in "$(command -v "$1" 2>/dev/null || true)" "/usr/sbin/$1" "/sbin/$1"; do
+    if [ -n "$c" ] && [ -x "$c" ]; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+
+caddy_can_bind() {
+  local g
+  g="$(sbin_cmd getcap)" || return 1
+  "$g" "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service
+}
+
 # Lets Caddy bind 80/443 as a normal user. Replacing the binary drops it, so
 # this runs again after every download.
 caddy_allow_ports() {
   is_linux || return 0
-  if getcap "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service; then return 0; fi
+  if caddy_can_bind; then return 0; fi
+  local sc
+  sc="$(sbin_cmd setcap)" || die "vhosty needs setcap: sudo apt install libcap2-bin"
   info "letting Caddy use ports 80 and 443 without root (asks for your password)"
-  sudo setcap cap_net_bind_service=+ep "$CADDY_BIN" || die "setcap failed"
+  sudo "$sc" cap_net_bind_service=+ep "$CADDY_BIN" || die "setcap failed"
+}
+
+# The IPv4 address a name resolves to: dig when it's installed, otherwise the
+# system resolver (minimal Debian has no dig)
+resolve_a() {
+  if command -v dig >/dev/null 2>&1; then
+    dig +short "$1" A 2>/dev/null | tail -1 || true
+  else
+    getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 {print $1}' || true
+  fi
 }
 
 install_caddy() {
@@ -1391,6 +1418,7 @@ cmd_setup() {
   ok "Tailscale IP: $ip"
   if is_linux; then
     command -v jq >/dev/null 2>&1 || die "vhosty needs jq: sudo apt install jq"
+    sbin_cmd setcap >/dev/null || die "vhosty needs setcap: sudo apt install libcap2-bin"
     command -v systemctl >/dev/null 2>&1 || die "vhosty on Linux needs systemd"
   fi
   o="$(port_owner 443)"
@@ -3268,7 +3296,7 @@ doctor_fix() {
   head_ "Fixing"
 
   ip="$(ts_ip)"
-  resolved="$(dig +short "vhosty-doctor.$VHOSTY_DOMAIN" A 2>/dev/null | tail -1 || true)"
+  resolved="$(resolve_a "vhosty-doctor.$VHOSTY_DOMAIN")"
   if [ -n "$ip" ] && [ "$resolved" != "$ip" ] && fix_ok "point *.$VHOSTY_DOMAIN at $ip (vhosty dns sync)"; then
     dns_sync; need_rebuild=1; fixed=1
   fi
@@ -3342,7 +3370,7 @@ doctor_checks() {
 
   head_ "Network"
   if [ -n "$ip" ]; then ok "Tailscale IP: $ip"; else bad "Tailscale isn't running, or its CLI wasn't found"; fi
-  resolved="$(dig +short "$probe" A 2>/dev/null | tail -1 || true)"
+  resolved="$(resolve_a "$probe")"
   if [ -z "$resolved" ]; then
     bad "*.$VHOSTY_DOMAIN doesn't resolve. Run: vhosty dns sync"
   elif [ -n "$ip" ] && [ "$resolved" != "$ip" ]; then
@@ -3355,7 +3383,9 @@ doctor_checks() {
   if [ -x "$CADDY_BIN" ]; then ok "binary: $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}')"; else bad "Caddy missing. Run: vhosty update caddy"; fi
   if "$CADDY_BIN" list-modules 2>/dev/null | grep -q dns.providers.cloudflare; then ok "Cloudflare DNS plugin"; else bad "Caddy is missing the Cloudflare plugin. Run: vhosty update caddy"; fi
   if is_linux; then
-    if getcap "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service; then ok "allowed to use ports 80 and 443"; else bad "Caddy can't bind 80/443. Run: vhosty setup"; fi
+    if ! sbin_cmd getcap >/dev/null; then warn "can't check that Caddy may use ports 80 and 443: sudo apt install libcap2-bin"
+    elif caddy_can_bind; then ok "allowed to use ports 80 and 443"
+    else bad "Caddy can't bind 80/443. Run: vhosty setup"; fi
   fi
   if [ -s "$SECRETS_FILE" ]; then ok "token file present"; else bad "Missing $SECRETS_FILE. Run: vhosty setup"; fi
   cmd_validate caddy || true

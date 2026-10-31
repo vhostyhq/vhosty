@@ -525,8 +525,7 @@ php_versions_in_use() {
   {
     php_default
     for name in $(site_names); do
-      site_load "$name"
-      [ -n "$SITE_PATH" ] && [ ! -d "$SITE_PATH" ] && continue   # folder gone (see: vhosty prune)
+      site_folder "$name" >/dev/null || continue   # gone or unparked (see: vhosty prune)
       [ -n "$SITE_PHP" ] && php_is_installed "$SITE_PHP" && echo "$SITE_PHP"
     done
   } | grep . | awk '!seen[$0]++' || true
@@ -691,11 +690,26 @@ EOF
   return 1
 }
 
-# Folder a site is served from: its configured path, else <parked>/<name>
+# Folder a site is served from: its configured path, else <parked>/<name>.
+# A parked site's config (a pin, settings) outlives unparking its folder, so
+# a site that isn't linked has a folder only while that folder is parked.
 site_dir() {
   site_load "$1"
-  if [ -n "$SITE_PATH" ]; then echo "$SITE_PATH"; return 0; fi
+  if [ -n "$SITE_PATH" ]; then
+    if [ "$SITE_LINKED" != "yes" ] && ! is_parked "${SITE_PATH%/*}"; then return 1; fi
+    echo "$SITE_PATH"; return 0
+  fi
   parked_dir_for "$1"
+}
+
+is_parked() { case ":$VHOSTY_PARKED:" in *":$1:"*) return 0 ;; esac; return 1; }
+
+# site_folder NAME: the folder the site is served from, if it's there now
+# (loads the site's config, like site_load)
+site_folder() {
+  local dir
+  site_load "$1"   # here, not just inside the $(site_dir) subshell below
+  dir="$(site_dir "$1")" && [ -d "$dir" ] && echo "$dir"
 }
 
 # Parked folders whose name has capitals (MyApp → myapp). Hostnames are
@@ -751,7 +765,7 @@ caddy_sites() {
     site_load "$name"
     dir="$(site_dir "$name" || true)"
     if [ -z "$dir" ] || [ ! -d "$dir" ]; then
-      printf '\n\t# Site: %s (skipped: folder %s not found)\n' "$name" "${dir:-?}"
+      printf '\n\t# Site: %s (skipped: its folder is gone, or no longer parked)\n' "$name"
       continue
     fi
     if php_enabled && { [ -f "$dir/public/index.php" ] || [ ! -f "$dir/index.html" ]; }; then
@@ -965,9 +979,8 @@ EOF
     # One pool per site with its own settings: a worker never serves another
     # site, so settings can't leak between sites. Idle pools have no workers.
     for name in $(site_names); do
-      site_load "$name"
+      site_folder "$name" >/dev/null || continue
       [ -n "$SITE_INI" ] && [ "$(site_php)" = "$v" ] || continue
-      [ -z "$SITE_PATH" ] || [ -d "$SITE_PATH" ] || continue
       cat <<EOF
 
 [site-$name]
@@ -3358,7 +3371,7 @@ EOF
 # ---------------------------------------------------------------------------
 # Command: prune (configs and leftovers for things that are gone)
 # ---------------------------------------------------------------------------
-# Site configs whose folder no longer exists
+# Site configs whose folder is gone, or no longer parked
 stale_sites() {
   local name dir
   for name in $(site_names); do
@@ -3414,7 +3427,7 @@ cmd_prune() {
   leftovers="$(prune_leftovers)"
   if [ -z "$stale" ] && [ -z "$leftovers" ]; then ok "nothing to prune"; return 0; fi
   if [ -n "$stale" ]; then
-    head_ "Sites whose folder is gone"
+    head_ "Sites whose folder is gone or no longer parked"
     for name in $stale; do printf '  %s\n' "$(describe_site "$name")"; done
   fi
   if [ -n "$leftovers" ]; then
@@ -3476,7 +3489,7 @@ doctor_fix() {
     dns_sync; need_rebuild=1; fixed=1
   fi
 
-  if [ -n "$(stale_sites)" ] && fix_ok "remove configs for sites whose folder is gone (vhosty prune)"; then
+  if [ -n "$(stale_sites)" ] && fix_ok "remove configs for sites whose folder is gone or no longer parked (vhosty prune)"; then
     cmd_prune --yes --no-rebuild; need_rebuild=1; fixed=1
   fi
 
@@ -3752,7 +3765,7 @@ ${B}Config${N}
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry
   vhosty doctor [--fix [--yes]]      Check DNS, certs, config, sites, services, and HTTPS; --fix repairs
-  vhosty prune [--yes]               Remove configs for sites whose folder is gone, and leftovers
+  vhosty prune [--yes]               Remove configs for sites whose folder is gone or unparked, and leftovers
   vhosty ip | domain | paths         Quick lookups
   vhosty version
 EOF

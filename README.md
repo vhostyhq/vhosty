@@ -139,7 +139,7 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
 | `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
-| `vhosty prune` | Remove configs for sites whose folder is gone, and generated files nothing uses |
+| `vhosty prune` | Remove configs for sites whose folder is gone or no longer parked, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
 | `vhosty update [self\|caddy\|php]` | Update vhosty to the latest release, and re-download Caddy (and PHP-FPM on macOS). See [Updating](#updating) |
 | `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |

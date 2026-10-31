@@ -64,7 +64,7 @@ caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
   site_conf gone "SITE_PATH=$HOME/nowhere
 SITE_LINKED=yes"
   run caddyfile
-  assert_contains "$output" "# Site: gone (skipped: folder $HOME/nowhere not found)"
+  assert_contains "$output" "# Site: gone (skipped: its folder is gone, or no longer parked)"
   refute_contains "$output" "@site_gone"
 }
 
@@ -190,4 +190,24 @@ b"; do
     [ "$status" -ne 0 ] || { echo "accepted: $bad" >&2; false; }
     assert_contains "$output" "VHOSTY_PORTS"
   done
+}
+
+@test "unparking a folder takes its pinned sites offline too" {
+  php_site escrow
+  site_conf escrow "SITE_PATH=$PARKED/escrow
+SITE_PHP=8.3
+SITE_INI='memory_limit=1G'"
+  mkdir -p "$HOME/Projects/thing"; echo hi >"$HOME/Projects/thing/index.html"
+  site_conf thing "SITE_PATH=$HOME/Projects/thing
+SITE_LINKED=yes"
+  run caddyfile
+  assert_contains "$output" "@site_escrow host"
+  write_config 'VHOSTY_PARKED=""'
+  run caddyfile
+  refute_contains "$output" "@site_escrow host"
+  assert_contains "$output" "@site_thing host"     # a link doesn't depend on parking
+  run vh stale_sites
+  [ "$output" = escrow ]
+  vh write_fpm_conf 8.4
+  refute_contains "$(cat "$VHOSTY_DIR/php/8.4/php-fpm.conf")" "[site-escrow]"
 }

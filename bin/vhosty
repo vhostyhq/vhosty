@@ -1512,6 +1512,21 @@ config_in_sync() {
   return $rc
 }
 
+# Why the generated files no longer match what vhosty would write now
+drift_reason() {
+  local ip
+  if [ -f "$ERROR_PAGE" ] && ! grep -qF "\$vhosty := \"$VHOSTY_VERSION\"" "$ERROR_PAGE"; then
+    echo "vhosty was updated since the config was generated"
+    return 0
+  fi
+  ip="$(ts_ip)"
+  if [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qF "default_bind $ip " "$CADDYFILE"; then
+    echo "this machine's Tailscale address changed (now $ip)"
+    return 0
+  fi
+  echo "settings changed since the last rebuild"
+}
+
 config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(generated_hash)" ]; }
 
 # ---------------------------------------------------------------------------
@@ -3654,7 +3669,7 @@ doctor_checks() {
 
   head_ "Config"
   if config_in_sync; then ok "generated files match ~/.vhosty settings"
-  else bad "settings changed since the last rebuild. Run: vhosty rebuild"; fi
+  else bad "$(drift_reason). Run: vhosty rebuild"; fi
   if config_applied; then ok "services are running the current config"
   elif svc_installed; then bad "services haven't loaded the current config. Run: vhosty rebuild"; fi
   for name in $(site_names); do

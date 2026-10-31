@@ -100,4 +100,11 @@ fi
 printf "\n  Tab completion (zsh): add this to ~/.zshrc, before compinit runs:\n"
 printf "    fpath=(%s/completions \$fpath)\n" "$VHOSTY_DIR"
 
-printf "\n%sNext:%s vhosty setup\n" "$B" "$N"
+# Already set up: regenerate the config with the new version, as
+# `vhosty update self` does, so its changes take effect
+if [ -f "$VHOSTY_DIR/config" ]; then
+  printf "\n%sApplying the new version%s\n" "$B" "$N"
+  "$VHOSTY_DIR/bin/vhosty" rebuild </dev/null || printf "  Couldn't rebuild. Run: vhosty rebuild\n"
+else
+  printf "\n%sNext:%s vhosty setup\n" "$B" "$N"
+fi

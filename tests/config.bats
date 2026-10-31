@@ -211,3 +211,13 @@ SITE_LINKED=yes"
   vh write_fpm_conf 8.4
   refute_contains "$(cat "$VHOSTY_DIR/php/8.4/php-fpm.conf")" "[site-escrow]"
 }
+
+@test "doctor's drift message says when it's vhosty itself that changed" {
+  vh write_configs
+  [ "$(vh drift_reason)" = "settings changed since the last rebuild" ]
+  sed -i.bak 's/\$vhosty := "[^"]*"/$vhosty := "0.0.1"/' "$VHOSTY_DIR/error.html"
+  [ "$(vh drift_reason)" = "vhosty was updated since the config was generated" ]
+  vh write_configs
+  stub tailscale 'case "$1" in ip) echo 100.64.0.99 ;; esac'
+  [ "$(vh drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
+}

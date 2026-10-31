@@ -1799,7 +1799,7 @@ cmd_links() {
 # Everything about one site
 cmd_site() {
   need_config
-  local name dir kind v source settings sock missing
+  local name dir kind v source settings sock missing blocker kv
   name="$(resolve_site "${1:-}")"
   site_load "$name"
   dir="$(site_dir "$name" || true)"
@@ -1824,8 +1824,11 @@ cmd_site() {
       printf '%s\n' "$SITE_INI" | while IFS= read -r kv; do printf "  %-10s %s = %s\n" "" "${kv%%=*}" "${kv#*=}"; done
     fi
     missing="$(missing_exts "$dir" "$(site_php)" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
-    printf "  %-10s %s%s\n" "Extensions" "${SITE_EXT:+declared: $SITE_EXT; }" \
-      "$([ -n "$missing" ] && echo "${R}missing: $missing${N} (vhosty ext install <ext>)" || echo "none missing")"
+    blocker="$(ext_check_blocker "$dir" "$(site_php)")"
+    if [ -n "$blocker" ]; then missing="${Y}can't check: $blocker${N}"
+    elif [ -n "$missing" ]; then missing="${R}missing: $missing${N} ($(ext_fix "<ext>" "$(site_php)"))"
+    else missing="none missing"; fi
+    printf "  %-10s %s%s\n" "Extensions" "${SITE_EXT:+declared: $SITE_EXT; }" "$missing"
     if app_debug_on "$dir"; then
       printf "  %-10s %s\n" "Debug" "${Y}APP_DEBUG=true${N}: its error pages show secrets to anyone on your tailnet"
     fi
@@ -2002,31 +2005,79 @@ ext_package() {
   esac
 }
 
-php_bin_for() { # CLI binary for a version
-  if is_linux && [ -x "/usr/bin/php$1" ]; then echo "/usr/bin/php$1"; else command -v php 2>/dev/null || true; fi
+# The PHP whose modules decide what a site has. Linux: the version's CLI,
+# which composer checks against (it has FPM's extensions, plus CLI-only ones
+# like pcntl that queue workers use). macOS: vhosty's FPM build, since there
+# is no CLI per version there.
+php_bin_for() {
+  if is_macos; then
+    if [ -x "$(fpm_bin "$1")" ]; then fpm_bin "$1"; fi
+  elif [ -x "/usr/bin/php$1" ]; then echo "/usr/bin/php$1"; fi
 }
 
-ext_loaded() { # ext_loaded 8.5 protobuf
-  local bin
+# Lists a version's modules once per run, into PHP_MODULES_<8_5>. Call it in
+# this shell (not inside $(...)) for the list to stick around.
+load_php_modules() {
+  local var="PHP_MODULES_${1//./_}" bin
+  [ -z "${!var:-}" ] || return 0
   bin="$(php_bin_for "$1")"
   [ -n "$bin" ] || return 1
-  "$bin" -r 'exit(extension_loaded($argv[1]) || extension_loaded(str_replace("-", " ", $argv[1])) ? 0 : 1);' "$2" 2>/dev/null
+  printf -v "$var" '%s' "$("$bin" -m 2>/dev/null | grep -v '^\[' | grep . | tr '[:upper:]' '[:lower:]')"
+  [ -n "${!var}" ]
+}
+forget_php_modules() { unset "PHP_MODULES_${1//./_}"; }
+
+ext_loaded() { # ext_loaded 8.5 protobuf
+  local var="PHP_MODULES_${1//./_}" e
+  load_php_modules "$1" || return 1
+  e="$(lower "$2")"
+  printf '%s\n' "${!var}" | grep -qxF -e "$e" -e "${e//-/ }"
+}
+
+# The extensions a composer.lock needs: every package's and the platform's
+# ext-* requirements, less what packages provide or replace (as composer
+# check-platform-reqs counts them), without running composer for each site
+lock_ext_reqs() {
+  [ -f "$1/composer.lock" ] || return 0
+  jq -r '
+    [(.packages // [])[], (."packages-dev" // [])[]] as $p
+    | ([$p[] | ((.provide // {}) + (.replace // {})) | keys[]] | map(select(startswith("ext-")))) as $given
+    | ([$p[] | (.require // {}) | keys[]] + ((.platform // {}) | keys) + ((."platform-dev" // {}) | keys))
+    | map(select(type == "string" and startswith("ext-"))) | unique - $given | .[] | sub("^ext-"; "")
+  ' "$1/composer.lock" 2>/dev/null
+}
+
+# Why a site's extensions can't be checked, if they can't
+ext_check_blocker() { # ext_check_blocker DIR VERSION
+  if [ -z "$(php_bin_for "$2")" ]; then
+    if is_macos; then echo "PHP $2 isn't installed (vhosty php install $2)"
+    else echo "no PHP $2 CLI to check against (sudo apt install php$2-cli)"; fi
+  elif [ -f "$1/composer.lock" ] && ! command -v jq >/dev/null 2>&1; then
+    echo "reading composer.lock needs jq"
+  fi
+}
+
+# What to do about a missing extension
+ext_fix() { # ext_fix EXT VERSION
+  if is_macos; then echo "vhosty's PHP $2 build for macOS doesn't include it."
+  else echo "Run: vhosty ext install $1 --php $2"; fi
 }
 
 # Missing extensions for a folder on a PHP version, one "ext<TAB>why" per line.
 # Reads SITE_EXT, so call site_load first (or clear SITE_EXT).
 missing_exts() { # missing_exts DIR VERSION
-  local dir="$1" v="$2" bin composer e
-  bin="$(php_bin_for "$v")"
-  [ -n "$bin" ] || return 0
-  composer="$(command -v composer 2>/dev/null || true)"
+  local dir="$1" v="$2" e
+  [ -z "$(ext_check_blocker "$dir" "$v")" ] || return 0
+  load_php_modules "$v" || return 0
+  local var="PHP_MODULES_${v//./_}"
+  # One awk for the whole list (a check per extension would fork for each)
   {
-    if [ -f "$dir/composer.lock" ] && [ -n "$composer" ]; then
-      (cd "$dir" && "$bin" "$composer" check-platform-reqs --lock --format=json 2>/dev/null) \
-        | jq -r '.[]? | select(.status == "missing") | .name | select(startswith("ext-")) | sub("^ext-"; "") + "\trequired by composer.lock"' 2>/dev/null || true
-    fi
-    for e in $SITE_EXT; do ext_loaded "$v" "$e" || printf '%s\tdeclared for this site\n' "$e"; done
-  } | awk -F'\t' '!seen[$1]++'
+    lock_ext_reqs "$dir" | sed 's/$/\trequired by composer.lock/'
+    for e in ${SITE_EXT:-}; do printf '%s\tdeclared for this site\n' "$e"; done
+  } | MODULES="${!var}" awk -F'\t' '
+    BEGIN { n = split(ENVIRON["MODULES"], m, "\n"); for (i = 1; i <= n; i++) have[m[i]] = 1 }
+    { e = tolower($1); s = e; gsub(/-/, " ", s) }
+    !(e in have) && !(s in have) && !seen[e]++'
 }
 
 # True when a Laravel app runs in debug mode: its error pages then show
@@ -2072,6 +2123,7 @@ install_exts() { # install_exts VERSION ext...
   # shellcheck disable=SC2086
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null || die "apt-get install failed"
   sudo systemctl disable --now "php$v-fpm" >/dev/null 2>&1 || true
+  forget_php_modules "$v"
   for e in "$@"; do
     if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded"; fi
   done
@@ -2088,7 +2140,8 @@ cmd_ext() {
     unrequire|rm|remove) cmd_ext_unrequire "$@" ;;
     install)            cmd_ext_install "$@" ;;
     check)              cmd_ext_check ;;
-    *) die "Usage: vhosty ext [list [site] | require <ext..> | unrequire <ext..> | install <ext..> [--php V] | check]" ;;
+    -*) die "Usage: vhosty ext [list] [site] | require <ext..> | unrequire <ext..> | install <ext..> [--php V] | check" ;;
+    *)                  cmd_ext_list "$sub" ;;   # vhosty ext <site>
   esac
 }
 
@@ -2112,9 +2165,11 @@ cmd_ext_list() {
   site_load "$name"
   v="$(site_php)"
   printf "%s%s%s  PHP %s\n" "$B" "$name" "$N" "$v"
+  line="$(ext_check_blocker "$dir" "$v")"
+  if [ -n "$line" ]; then warn "can't check the extensions: $line"; return 0; fi
   if [ -n "$SITE_EXT" ]; then
     for e in $SITE_EXT; do
-      if ext_loaded "$v" "$e"; then ok "$e (declared)"; else bad "$e (declared) missing. Run: vhosty ext install $e --php $v"; fi
+      if ext_loaded "$v" "$e"; then ok "$e (declared)"; else bad "$e (declared) missing. $(ext_fix "$e" "$v")"; fi
     done
   else
     info "no declared extensions (add one with: vhosty ext require <ext>)"
@@ -2122,7 +2177,7 @@ cmd_ext_list() {
   line="$(SITE_EXT="" missing_exts "$dir" "$v")"
   if [ -n "$line" ]; then
     printf '%s\n' "$line" | while IFS="$(printf '\t')" read -r e _; do
-      bad "$e (required by composer.lock) missing. Run: vhosty ext install $e --php $v"
+      bad "$e (required by composer.lock) missing. $(ext_fix "$e" "$v")"
     done
   elif [ -f "$dir/composer.lock" ]; then
     ok "everything composer.lock requires is installed"
@@ -2198,22 +2253,32 @@ EOF
   info "VHOSTY_ALLOW_DEBUG=\"yes\" to ~/.vhosty/config to stop this warning."
 }
 
-cmd_ext_check() {
-  local name dir v line e why any=0
+# Every PHP site's missing extensions, "name|version|ext|why" per line, and
+# "name|version|?|reason" for a site that can't be checked
+ext_report() {
+  local name dir v b
   while IFS="|" read -r name dir; do
     [ -n "$name" ] || continue
     site_load "$name"
     v="$(site_php)"
-    line="$(missing_exts "$dir" "$v")"
-    [ -n "$line" ] || continue
-    any=1
-    while IFS="$(printf '\t')" read -r e why; do
-      bad "$name (PHP $v) is missing $e, $why. Run: vhosty ext install $e --php $v"
-    done <<EOF
-$line
-EOF
+    b="$(ext_check_blocker "$dir" "$v")"
+    if [ -n "$b" ]; then echo "$name|$v|?|$b"; continue; fi
+    load_php_modules "$v" || continue   # once per version, before the subshells below
+    missing_exts "$dir" "$v" | sed "s/^/$name|$v|/; s/\t/|/"
   done <<EOF
 $(all_php_sites)
+EOF
+}
+
+cmd_ext_check() {
+  local name v e why any=0
+  while IFS="|" read -r name v e why; do
+    [ -n "$name" ] || continue
+    if [ "$e" = "?" ]; then warn "$name (PHP $v): can't check its extensions: $why"; continue; fi
+    any=1
+    bad "$name (PHP $v) is missing $e, $why. $(ext_fix "$e" "$v")"
+  done <<EOF
+$(ext_report)
 EOF
   [ "$any" = "1" ] || ok "every site has the extensions it needs"
 }
@@ -3460,17 +3525,7 @@ cmd_prune() {
 # doctor --fix
 # ---------------------------------------------------------------------------
 # "version ext" for every site's missing extensions
-missing_ext_pairs() {
-  local name dir v
-  while IFS="|" read -r name dir; do
-    [ -n "$name" ] || continue
-    site_load "$name"
-    v="$(site_php)"
-    missing_exts "$dir" "$v" | cut -f1 | sed "s/^/$v /"
-  done <<EOF
-$(all_php_sites)
-EOF
-}
+missing_ext_pairs() { ext_report | awk -F'|' '$3 != "?" {print $2, $3}'; }
 
 # Docker services that are defined but not running
 docker_down() {

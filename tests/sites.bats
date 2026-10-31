@@ -63,3 +63,17 @@ SITE_LINKED=yes"
   run vh case_sites
   [ -z "$output" ]
 }
+
+@test "vhosty url finds the site from deep inside it, or from a linked folder" {
+  php_site blog
+  mkdir -p "$PARKED/blog/app/Http"
+  run bash -c "cd '$PARKED/blog/app/Http' && VHOSTY_SRC='$ROOT/bin/vhosty' bash -c 'source \"\$VHOSTY_SRC\"; load_config; site_url'"
+  [ "$output" = "https://blog.test.example" ]
+  mkdir -p "$HOME/Projects/My Thing/src"
+  site_conf thing "SITE_PATH='$HOME/Projects/My Thing'
+SITE_LINKED=yes"
+  run bash -c "cd '$HOME/Projects/My Thing/src' && VHOSTY_SRC='$ROOT/bin/vhosty' bash -c 'source \"\$VHOSTY_SRC\"; load_config; site_url'"
+  [ "$output" = "https://thing.test.example" ]
+  [ "$(vh site_url 5173)" = "https://5173.test.example" ]
+  [ "$(vh site_url Escrow)" = "https://escrow.test.example" ]
+}

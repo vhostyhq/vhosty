@@ -3105,11 +3105,12 @@ EOF
   echo
 }
 
-site_url() {
+site_url() { # site_url [site|port]: with none, the site of the current folder
   need_config
-  local name="${1:-}"
-  [ -n "$name" ] || name="$(basename "$PWD")"
-  echo "https://$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]').$VHOSTY_DOMAIN"
+  local name
+  if [ -n "${1:-}" ]; then name="$(lower "$1")"
+  else name="$(site_from_dir "$PWD")" || die "$PWD isn't inside a site. Pass a site name or a port."; fi
+  echo "https://$name.$VHOSTY_DOMAIN"
 }
 
 cmd_open() {

@@ -3563,6 +3563,8 @@ cmd_update_self() {
   mv "$new" "$BIN_DIR/vhosty"
   [ ! -f "$comp" ] || mv "$comp" "$VHOSTY_DIR/completions/_vhosty"
   ok "vhosty $VHOSTY_VERSION → $ver ($ref)"
+  # doctor's day-long note of the latest release is out of date now
+  case "$ref" in v[0-9]*) { mkdir -p "$RUN_DIR" && printf '%s\n' "$ref" >"$RUN_DIR/latest-release"; } 2>/dev/null || true ;; esac
   case "$ref" in v[0-9]*) info "What's new: https://github.com/$VHOSTY_REPO/releases/tag/$ref" ;; esac
 
   # Let the new version regenerate the config, so its changes take effect

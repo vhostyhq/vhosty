@@ -33,6 +33,7 @@ shim_setup() {
   site_conf legacy "SITE_PATH=$PARKED/legacy
 SITE_PHP=9.8
 SITE_INI='max_execution_time=300'"
+  vh write_shim   # the shim has the sites written into it, at rebuild
   run bash -c "cd '$PARKED/legacy/app' && '$VHOSTY_DIR/bin/php' artisan"
   [ "$output" = "php 9.8 -d memory_limit=512M -d max_execution_time=300 artisan" ]
 }
@@ -41,9 +42,12 @@ SITE_INI='max_execution_time=300'"
   shim_setup
   mkdir -p "$HOME/p/outer/inner"
   site_conf outer "SITE_PATH=$HOME/p/outer
+SITE_LINKED=yes
 SITE_PHP=9.9"
   site_conf inner "SITE_PATH=$HOME/p/outer/inner
+SITE_LINKED=yes
 SITE_PHP=9.8"
+  vh write_shim
   run bash -c "cd '$HOME/p/outer/inner' && '$VHOSTY_DIR/bin/php' x"
   assert_contains "$output" "php 9.8"
 }
@@ -52,7 +56,9 @@ SITE_PHP=9.8"
   shim_setup
   mkdir -p "$HOME/p/app" "$HOME/p/app2"
   site_conf app "SITE_PATH=$HOME/p/app
+SITE_LINKED=yes
 SITE_PHP=9.8"
+  vh write_shim
   run bash -c "cd '$HOME/p/app2' && '$VHOSTY_DIR/bin/php' x"
   assert_contains "$output" "php 9.9"
 }
@@ -75,4 +81,35 @@ SITE_PHP=9.8"
   run timeout 5 env PATH="$VHOSTY_DIR/bin/:$HOME/binlink:$HOME/realphp:/usr/bin:/bin" "$VHOSTY_DIR/bin/php" -v
   [ "$status" -eq 0 ] || { echo "status $status: $output" >&2; false; }
   [ "$output" = "real php -v" ]
+}
+
+@test "a pin that isn't installed falls back to the default version, as the web does" {
+  shim_setup
+  php_site old
+  site_conf old "SITE_PATH=$PARKED/old
+SITE_PHP=7.4"
+  vh write_shim
+  run bash -c "cd '$PARKED/old' && '$VHOSTY_DIR/bin/php' x"
+  assert_contains "$output" "php 9.9"
+}
+
+@test "folders and settings with spaces and quotes are written into the shim safely" {
+  shim_setup
+  mkdir -p "$HOME/My Sites/it's here"
+  site_conf weird "SITE_PATH='$HOME/My Sites/it'\\''s here'
+SITE_LINKED=yes
+SITE_PHP=9.8
+SITE_INI='error_prepend_string=a \$(touch $HOME/pwned) b'"
+  vh write_shim
+  bash -n "$VHOSTY_DIR/bin/php"
+  run bash -c "cd \"$HOME/My Sites/it's here\" && '$VHOSTY_DIR/bin/php' x"
+  assert_contains "$output" "php 9.8"
+  assert_contains "$output" "error_prepend_string=a \$(touch $HOME/pwned) b"
+  [ ! -e "$HOME/pwned" ]
+}
+
+@test "the shim reads no files when it runs" {
+  shim_setup
+  # no sourcing, and no tools that read files, outside the comments
+  ! grep -v '^#' "$VHOSTY_DIR/bin/php" | grep -qE '(^|[;{&|] *)(\.|source|cat|sed|grep|awk) '
 }

@@ -221,3 +221,12 @@ SITE_LINKED=yes"
   stub tailscale 'case "$1" in ip) echo 100.64.0.99 ;; esac'
   [ "$(vh drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
 }
+
+@test "config_in_sync notices when the php shim is out of date" {
+  php_site escrow
+  vh write_configs
+  vh config_in_sync
+  echo "# edited" >>"$VHOSTY_DIR/bin/php"
+  run vh config_in_sync
+  [ "$status" -ne 0 ]
+}

@@ -349,8 +349,24 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 
 ## Security
 
-- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that.
-- Laravel's debug pages (`APP_DEBUG=true`) show environment details to anyone who can load them.
+- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that (below).
+- Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. `vhosty doctor` warns about sites in debug mode. If only you can reach the machine, add `VHOSTY_ALLOW_DEBUG="yes"` to `~/.vhosty/config` to silence it.
+
+To let only yourself reach the box's sites, tag the machine and grant HTTPS to it
+in your [tailnet policy](https://tailscale.com/kb/1324/grants). Tag it with
+`sudo tailscale up --advertise-tags=tag:devbox` (or in the admin console), then:
+
+```jsonc
+{
+  "tagOwners": { "tag:devbox": ["autogroup:admin"] },
+  "grants": [
+    // you, from any of your devices, to the box's sites
+    { "src": ["you@example.com"], "dst": ["tag:devbox"], "ip": ["tcp:443"] }
+    // ...your other grants. Tailscale's default policy allows everything to
+    // everyone; a box is only private once that default is narrowed.
+  ]
+}
+```
 - Domain names appear in public certificate logs. The wildcard certificate only reveals `*.yourdomain.dev`, not your folder names.
 
 ## Development

@@ -76,6 +76,7 @@ VHOSTY_LOG_MAX_MB="10"    # rotate a log once it's bigger than this
 VHOSTY_LOG_KEEP="5"       # rotated copies to keep (compressed)
 VHOSTY_BACKUP_DIR=""      # where `vhosty services backup` saves; empty = ~/.vhosty/backups
 VHOSTY_BACKUP_KEEP="7"    # backups to keep there
+VHOSTY_ALLOW_DEBUG=""     # yes = doctor doesn't warn about APP_DEBUG=true (only you on the tailnet)
 
 FAILED=0
 
@@ -172,6 +173,7 @@ VHOSTY_LOG_MAX_MB="$VHOSTY_LOG_MAX_MB"
 VHOSTY_LOG_KEEP="$VHOSTY_LOG_KEEP"
 VHOSTY_BACKUP_DIR="$VHOSTY_BACKUP_DIR"
 VHOSTY_BACKUP_KEEP="$VHOSTY_BACKUP_KEEP"
+VHOSTY_ALLOW_DEBUG="$VHOSTY_ALLOW_DEBUG"
 EOF
 }
 
@@ -1694,6 +1696,9 @@ cmd_site() {
     missing="$(missing_exts "$dir" "$(site_php)" | cut -f1 | tr '\n' ' ' | sed 's/ $//')"
     printf "  %-10s %s%s\n" "Extensions" "${SITE_EXT:+declared: $SITE_EXT; }" \
       "$([ -n "$missing" ] && echo "${R}missing: $missing${N} (vhosty ext install <ext>)" || echo "none missing")"
+    if app_debug_on "$dir"; then
+      printf "  %-10s %s\n" "Debug" "${Y}APP_DEBUG=true${N}: its error pages show secrets to anyone on your tailnet"
+    fi
   fi
   [ ! -f "$(site_file "$name")" ] || printf "  %-10s %s\n" "Config" "$(site_file "$name")"
 }
@@ -1894,6 +1899,13 @@ missing_exts() { # missing_exts DIR VERSION
   } | awk -F'\t' '!seen[$1]++'
 }
 
+# True when a Laravel app runs in debug mode: its error pages then show
+# environment details (passwords, keys) to anyone who can load them
+app_debug_on() {
+  [ -f "$1/.env" ] || return 1
+  grep -qiE '^[[:space:]]*APP_DEBUG[[:space:]]*=[[:space:]]*["'"'"']?(\(?true\)?|1|on|yes)["'"'"']?[[:space:]]*(#.*)?$' "$1/.env"
+}
+
 # Every PHP site: "name|dir" (configured sites first; they win over parked ones)
 all_php_sites() {
   local name dir p f seen=" "
@@ -2038,6 +2050,24 @@ cmd_ext_install() {
 }
 
 # Every site against its own PHP version. Used by doctor too.
+# doctor: a warning, not a failure, since debug mode on a dev box is often deliberate
+debug_sites_check() {
+  local line name dir on=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    name="${line%%|*}"; dir="${line#*|}"
+    if app_debug_on "$dir"; then on="$on $name"; fi
+  done <<EOF
+$(all_php_sites)
+EOF
+  if [ -z "$on" ]; then ok "no site runs with APP_DEBUG=true"; return 0; fi
+  if [ "$VHOSTY_ALLOW_DEBUG" = "yes" ]; then ok "APP_DEBUG=true on:$on (allowed: VHOSTY_ALLOW_DEBUG)"; return 0; fi
+  warn "APP_DEBUG=true on:$on"
+  info "Their error pages show secrets to anyone on your tailnet. Turn it off in their .env, or limit"
+  info "access with Tailscale (README: Security). Only you can reach this machine? Add"
+  info "VHOSTY_ALLOW_DEBUG=\"yes\" to ~/.vhosty/config to stop this warning."
+}
+
 cmd_ext_check() {
   local name dir v line e why any=0
   while IFS="|" read -r name dir; do
@@ -3419,6 +3449,8 @@ doctor_checks() {
   if php_enabled; then
     head_ "PHP extensions"
     cmd_ext_check
+    head_ "Debug mode"
+    debug_sites_check
   fi
 
   head_ "Services"

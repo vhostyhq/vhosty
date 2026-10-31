@@ -129,6 +129,12 @@ Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
 Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
 (`artisan serve`).
 
+When something isn't there, vhosty says what and why instead of showing a blank
+page: a name with no site lists the paths it checked and links to your sites; a
+port with nothing listening, or a PHP version that's down, shows what to run and
+reloads every 2 seconds until it comes up. Errors from your app itself (Laravel's
+500s, missing assets) pass through untouched.
+
 **Vite:** add [@vhosty/vite-plugin](https://github.com/vhostyhq/vite-plugin)
 (`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
 with no config. Laravel setup and mixed-content fixes are in
@@ -259,6 +265,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
 ├── .env                   Cloudflare token (mode 600)
 ├── Caddyfile              generated
+├── error.html             generated: the page for "no site", and PHP or a dev server down
 ├── php/<version>/         generated PHP-FPM config, one per version
 ├── bin/                   vhosty, caddy, php (the CLI shim)
 ├── completions/           zsh completion
@@ -305,7 +312,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 | 525 errors, or CORS errors on every asset | The DNS record is proxied (orange cloud). Run `vhosty dns sync`; it sets the record to DNS only. |
 | Site can't be reached | The device you're browsing from isn't on Tailscale, or the machine is asleep. |
 | Works on one network but not another | Some routers and DNS filters (Pi-hole, NextDNS) block public names that resolve to private IPs. Allowlist your domain there. |
-| `vhosty: no site found` (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
+| "No site called …" (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
 | 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
 | 502 on a port site | Nothing is listening on that port, or it only listens on another interface. |
 | A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |

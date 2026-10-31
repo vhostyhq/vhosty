@@ -1,0 +1,35 @@
+name: Release checksums
+
+# Attaches SHA256SUMS to every published release. `vhosty update self` and
+# install.sh check the files they download from a release against it.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach SHA256SUMS to (e.g. v0.5.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sums:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check the version matches the tag
+        run: |
+          v="$(sed -n 's/^VHOSTY_VERSION="\(.*\)"$/\1/p' bin/vhosty)"
+          [ "v$v" = "$TAG" ] || { echo "bin/vhosty says $v, the tag is $TAG"; exit 1; }
+      - name: Attach SHA256SUMS
+        run: |
+          { (cd bin && sha256sum vhosty); (cd completions && sha256sum _vhosty); } > SHA256SUMS
+          cat SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber

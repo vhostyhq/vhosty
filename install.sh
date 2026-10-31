@@ -51,9 +51,30 @@ else
     esac
   fi
   base="https://raw.githubusercontent.com/$REPO/$REF"
-  curl -fsSL "$base/bin/vhosty" -o "$VHOSTY_DIR/bin/vhosty" \
-    || die "Download failed. If the repo is private, clone it and run ./install.sh instead."
-  curl -fsSL "$base/completions/_vhosty" -o "$VHOSTY_DIR/completions/_vhosty" || true
+  # Downloaded next to the installed files, checked, then renamed over them
+  curl -fsSL --retry 2 --max-time 60 "$base/bin/vhosty" -o "$VHOSTY_DIR/bin/.vhosty.new" \
+    || { rm -f "$VHOSTY_DIR/bin/.vhosty.new"; die "Download failed. If the repo is private, clone it and run ./install.sh instead."; }
+  curl -fsSL --retry 2 --max-time 60 "$base/completions/_vhosty" -o "$VHOSTY_DIR/completions/._vhosty.new" \
+    || rm -f "$VHOSTY_DIR/completions/._vhosty.new"
+  grep -q '^VHOSTY_VERSION=' "$VHOSTY_DIR/bin/.vhosty.new" && bash -n "$VHOSTY_DIR/bin/.vhosty.new" 2>/dev/null \
+    || { rm -f "$VHOSTY_DIR/bin/.vhosty.new"; die "What came from $REF doesn't look like vhosty. Not installing it."; }
+  # Releases from 0.5.0 on publish SHA256SUMS
+  case "$REF" in
+    v[0-9]*)
+      if sums="$(curl -fsSL --retry 2 --max-time 20 "https://github.com/$REPO/releases/download/$REF/SHA256SUMS" 2>/dev/null)"; then
+        for pair in "bin/.vhosty.new vhosty" "completions/._vhosty.new _vhosty"; do
+          f="$VHOSTY_DIR/${pair% *}"; n="${pair#* }"
+          [ -f "$f" ] || continue
+          want="$(printf '%s\n' "$sums" | awk -v n="$n" '$2 == n || $2 == "*" n {print $1; exit}')"
+          if command -v sha256sum >/dev/null 2>&1; then got="$(sha256sum "$f" | cut -d' ' -f1)"; else got="$(shasum -a 256 "$f" | cut -d' ' -f1)"; fi
+          [ -n "$want" ] && [ "$got" = "$want" ] \
+            || { rm -f "$VHOSTY_DIR/bin/.vhosty.new" "$VHOSTY_DIR/completions/._vhosty.new"; die "$n from $REF doesn't match its published checksum. Not installing it."; }
+        done
+        ok "checksums match"
+      fi ;;
+  esac
+  mv "$VHOSTY_DIR/bin/.vhosty.new" "$VHOSTY_DIR/bin/vhosty"
+  [ ! -f "$VHOSTY_DIR/completions/._vhosty.new" ] || mv "$VHOSTY_DIR/completions/._vhosty.new" "$VHOSTY_DIR/completions/_vhosty"
   ok "downloaded $REPO@$REF"
 fi
 chmod +x "$VHOSTY_DIR/bin/vhosty"

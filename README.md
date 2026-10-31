@@ -88,8 +88,13 @@ Ubuntu VM (a droplet, a Hetzner server), `scripts/box-setup.sh` does the same se
 To run it without prompts:
 
 ```bash
-vhosty setup --domain box.example.com --token "$CF_TOKEN" --park ~/Sites --yes
+CF_API_TOKEN=... vhosty setup --domain box.example.com --park ~/Sites --yes
 ```
+
+The token can also be given with `--token`, but then it's in your shell history and,
+while setup runs, visible to other users of the machine. `--yes` won't replace a
+`*.domain` record that points somewhere other than a Tailscale address (a staging
+server, say); add `--overwrite-dns` if that's what you want.
 
 Add `~/.vhosty/bin` to the front of your `PATH` so `php` follows the site you're
 in (see [PHP versions](#php-versions)), and turn on tab completion (zsh):

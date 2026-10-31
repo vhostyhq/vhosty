@@ -343,12 +343,15 @@ copy_text() {
 # ---------------------------------------------------------------------------
 cf() { # cf METHOD PATH [JSON]
   local method="$1" path="$2" body="${3:-}"
-  if [ -n "$body" ]; then
-    curl -sS -X "$method" "$CF_API/$path" \
-      -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
-      --data "$body"
+  # The token reaches curl on stdin (-K -), not in its arguments, where any
+  # user on this machine could read it with ps
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$CF_API_TOKEN"
+    [ -z "$body" ] || printf 'header = "Content-Type: application/json"\n'
+  } | if [ -n "$body" ]; then
+    curl -sS -K - --connect-timeout 10 --max-time 30 -X "$method" "$CF_API/$path" --data "$body"
   else
-    curl -sS -X "$method" "$CF_API/$path" -H "Authorization: Bearer $CF_API_TOKEN"
+    curl -sS -K - --connect-timeout 10 --max-time 30 -X "$method" "$CF_API/$path"
   fi
 }
 
@@ -412,6 +415,10 @@ dns_sync() {
       warn "Something else (a staging server?) may rely on it. Consider a subdomain instead, like box.$VHOSTY_DOMAIN."
     else
       warn "Something else (a staging server?) may rely on it. Consider a different subdomain for vhosty."
+    fi
+    # --yes is for the questions with an obvious answer; this isn't one
+    if [ "${VHOSTY_YES:-}" = "1" ] && [ "${VHOSTY_OVERWRITE_DNS:-}" != "1" ]; then
+      die "Left $name unchanged: --yes doesn't replace a record vhosty didn't make. Add --overwrite-dns if you mean it."
     fi
     confirm "Point $name at this machine anyway?" N || die "Left $name unchanged."
   fi
@@ -1503,7 +1510,8 @@ cmd_setup() {
       --no-php) php="off"; shift ;;
       --php)    php="on"; shift ;;
       -y|--yes) yes=1; shift ;;
-      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--token T] [--park DIR] [--no-php] [--yes]" ;;
+      --overwrite-dns) export VHOSTY_OVERWRITE_DNS=1; shift ;;
+      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--park DIR] [--no-php] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
     esac
   done
   [ "$yes" = "1" ] && export VHOSTY_YES=1
@@ -3649,7 +3657,8 @@ usage() {
 ${B}vhosty${N} $VHOSTY_VERSION: Herd for your tailnet
 
 ${B}Setup${N}
-  vhosty setup [--domain D] [--token T] [--park DIR] [--no-php] [--yes]
+  vhosty setup [--domain D] [--park DIR] [--no-php] [--yes] [--overwrite-dns]
+                                     The token: CF_API_TOKEN=..., asked for, or --token T
   vhosty uninstall                   Remove the services (keeps your files)
 
 ${B}Sites${N}

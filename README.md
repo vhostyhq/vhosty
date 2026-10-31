@@ -67,6 +67,11 @@ Or in one line:
 curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | bash
 ```
 
+The one-liner installs the [latest release](https://github.com/vhostyhq/vhosty/releases).
+For another, set `VHOSTY_REF` to its tag, or to `main` for changes that aren't released yet:
+`curl -fsSL … | VHOSTY_REF=v0.3.0 bash`. A clone installs whatever is checked out
+(`git checkout v0.3.0` first for a release).
+
 `vhosty setup` asks for your domain, token, and the folder to park, then:
 
 - downloads Caddy into `~/.vhosty/bin` (and PHP-FPM on macOS),

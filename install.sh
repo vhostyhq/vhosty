@@ -5,17 +5,21 @@
 #   From a clone:   ./install.sh
 #   From the web:   curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/install.sh | bash
 #
+# From the web it installs the latest release. VHOSTY_REF picks another:
+# a tag (v0.3.0), or main for changes that aren't released yet.
+#
 # Then run: vhosty setup
 
 set -euo pipefail
 
 REPO="${VHOSTY_REPO:-vhostyhq/vhosty}"
-REF="${VHOSTY_REF:-main}"
+REF="${VHOSTY_REF:-}"
 VHOSTY_DIR="${VHOSTY_DIR:-$HOME/.vhosty}"
 LINK="/usr/local/bin/vhosty"
 
-if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; R=$'\033[31m'; N=$'\033[0m'; else B=""; G=""; R=""; N=""; fi
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'; else B=""; G=""; Y=""; R=""; N=""; fi
 ok()  { printf "  %s✓%s %s\n" "$G" "$N" "$*"; }
+warn() { printf "  %s!%s %s\n" "$Y" "$N" "$*"; }
 die() { printf "%serror:%s %s\n" "$R" "$N" "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
@@ -38,6 +42,14 @@ if [ -n "$src" ]; then
   cp "$src/completions/_vhosty" "$VHOSTY_DIR/completions/_vhosty"
   ok "copied from $src"
 else
+  if [ -z "$REF" ]; then
+    # github.com/<repo>/releases/latest redirects to .../releases/tag/<tag>
+    REF="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    case "$REF" in
+      */releases/tag/*) REF="${REF##*/releases/tag/}" ;;
+      *) warn "Couldn't find the latest release, so installing main"; REF="main" ;;
+    esac
+  fi
   base="https://raw.githubusercontent.com/$REPO/$REF"
   curl -fsSL "$base/bin/vhosty" -o "$VHOSTY_DIR/bin/vhosty" \
     || die "Download failed. If the repo is private, clone it and run ./install.sh instead."

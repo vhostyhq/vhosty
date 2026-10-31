@@ -73,9 +73,9 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
 
 @test "a port with nothing listening gets the 502 page, which reloads itself" {
   start_caddy
-  run get 59999
+  run get 5998
   [ "$(echo "$output" | tail -1)" = 502 ]
-  assert_contains "$output" "Nothing is running on port 59999"
+  assert_contains "$output" "Nothing is running on port 5998"
   assert_contains "$output" '<meta http-equiv="refresh" content="2">'
 }
 
@@ -159,4 +159,26 @@ SITE_LINKED=yes"
   [ "$perms" = "srw-------" ] || { echo "socket: $perms" >&2; false; }
   run "$CADDY" reload --config "$HOME/test.Caddyfile" --adapter caddyfile --force
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "a port outside VHOSTY_PORTS isn't proxied, and the page says how to open it" {
+  start_caddy
+  for port in 8125 2019 9200 99999999999999999999; do
+    run get "$port"
+    [ "$(echo "$output" | tail -1)" = 403 ] || { echo "$port: $output" >&2; false; }
+  done
+  run get 8125
+  assert_contains "$output" "Port 8125 isn't open to your tailnet"
+  assert_contains "$output" 'VHOSTY_PORTS="3000-5999 6006 8000-8099 8888 8125"'
+}
+
+@test "VHOSTY_PORTS opens the ports it lists" {
+  write_config 'VHOSTY_PORTS="7000-7010 9200"'
+  start_caddy
+  run get 9200
+  [ "$(echo "$output" | tail -1)" = 502 ]   # open, nothing listening
+  run get 7005
+  [ "$(echo "$output" | tail -1)" = 502 ]
+  run get 5173
+  [ "$(echo "$output" | tail -1)" = 403 ]
 }

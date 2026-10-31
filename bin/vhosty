@@ -77,6 +77,7 @@ VHOSTY_LOG_KEEP="5"       # rotated copies to keep (compressed)
 VHOSTY_BACKUP_DIR=""      # where `vhosty services backup` saves; empty = ~/.vhosty/backups
 VHOSTY_BACKUP_KEEP="7"    # backups to keep there
 VHOSTY_ALLOW_DEBUG=""     # yes = doctor doesn't warn about APP_DEBUG=true (only you on the tailnet)
+VHOSTY_PORTS="3000-5999 6006 8000-8099 8888"   # ports <port>.domain reaches (dev servers)
 
 FAILED=0
 
@@ -177,7 +178,7 @@ save_config() {
   {
     echo "# vhosty config. After editing, run: vhosty rebuild"
     for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
-      VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_ALLOW_DEBUG; do
+      VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_ALLOW_DEBUG VHOSTY_PORTS; do
       printf '%s=%q\n' "$k" "${!k}"
     done
   } >"$CONFIG_FILE"
@@ -779,8 +780,34 @@ EOF
   done
 }
 
+# A Caddy expression: true when the subdomain label $1 is a port in
+# VHOSTY_PORTS ("3000-5999 6006"). It reads the label itself rather than
+# the header_regexp capture, since matchers in one set run in no fixed order.
+port_expr() {
+  local l="{labels.$1}" r out=""
+  for r in $VHOSTY_PORTS; do
+    case "$r" in
+      *-*) out="$out || (int($l) >= ${r%-*} && int($l) <= ${r#*-})" ;;
+      *) out="$out || int($l) == $r" ;;
+    esac
+  done
+  printf '%s.matches("^[0-9]{1,5}$") && (%s)' "$l" "${out# || }"
+}
+
+# Checked before writing, in this shell: inside $(port_expr) a die would
+# only end the subshell
+check_ports() {
+  local r
+  for r in $VHOSTY_PORTS; do
+    case "$r" in
+      ''|*[!0-9-]*|-*|*-|*-*-*) die "VHOSTY_PORTS in ~/.vhosty/config: '$r' isn't a port or a range like 3000-3999" ;;
+    esac
+  done
+}
+
 write_caddyfile() {
   local depth i=0 dir v ip bind name sites=""
+  check_ports
   mkdir -p "$RUN_DIR"   # for the admin socket
   depth="$(domain_depth)"
   v="$(php_default)"
@@ -807,11 +834,30 @@ write_caddyfile() {
 		dns cloudflare {env.CF_API_TOKEN}
 	}
 
-	# Ports: 5173.$VHOSTY_DOMAIN → localhost:5173 (Vite and other dev servers)
-	@port header_regexp port Host ^(\d+)\.
+EOF
+    if [ -n "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ]; then
+      cat <<EOF
+
+	# Ports: 5173.$VHOSTY_DOMAIN → localhost:5173 (Vite and other dev servers),
+	# for the ports in VHOSTY_PORTS ($VHOSTY_PORTS)
+	@port {
+		header_regexp port Host ^(\d+)\.
+		expression \`$(port_expr "$depth")\`
+	}
 	handle @port {
 		vars vhosty_kind port
 		reverse_proxy localhost:{re.port.1}
+	}
+EOF
+    fi
+    cat <<EOF
+
+	# Other ports stay on this machine: whatever listens on localhost there
+	# (mail catchers, admin consoles) isn't meant for the tailnet
+	@port_closed header_regexp Host ^\d+\.
+	handle @port_closed {
+		vars vhosty_kind port_closed
+		error "vhosty: port not open to the tailnet" 403
 	}
 EOF
     caddy_sites
@@ -863,13 +909,14 @@ EOF
 	# vhosty's own error pages: no site, and PHP or a dev server not answering.
 	# Errors from inside a site (Laravel's 500s, missing assets) pass through.
 	handle_errors {
-		@vhosty expression {err.status_code} in [502, 503, 504] || {http.vars.vhosty_kind} == "nosite"
+		@vhosty expression {err.status_code} in [502, 503, 504] || {http.vars.vhosty_kind} in ["nosite", "port_closed"]
 		handle @vhosty {
 			vars {
 				vhosty_home "$VHOSTY_HOME_DIR"
 				vhosty_parked "$VHOSTY_PARKED"
 				vhosty_sites "${sites# }"
 				vhosty_php_on "$VHOSTY_PHP"
+				vhosty_ports "$VHOSTY_PORTS"
 			}
 			header Cache-Control no-store
 			root * /
@@ -1036,6 +1083,11 @@ summary { cursor: pointer; }
 </ul>
 {{- end}}
 <p class="muted">To serve a folder from somewhere else: <code>vhosty link ~/path/to/app --name {{html $label}}</code></p>
+{{- else if eq $kind "port_closed"}}
+<h1>Port {{html $label}} isn't open to your tailnet</h1>
+<p class="muted">vhosty only forwards the ports in <code>VHOSTY_PORTS</code> (<code>{{html (placeholder "http.vars.vhosty_ports")}}</code>), so anything else listening on this machine's <code>localhost</code>, like a mail catcher or an admin console, stays private to it.</p>
+<p>To open port {{html $label}}, add it in <code>~/.vhosty/config</code>, then run <code>vhosty rebuild</code>:</p>
+<pre>VHOSTY_PORTS="{{html (placeholder "http.vars.vhosty_ports")}} {{html $label}}"</pre>
 {{- else if eq $kind "port"}}
 <h1>Nothing is running on port {{html $label}}</h1>
 <p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $label}}</code>, but nothing answered there.</p>
@@ -1056,7 +1108,7 @@ vhosty logs php-{{html $php}}</pre>
 {{- if $retry}}
 <p class="waiting"><span class="dot"></span>Checking again every 2 seconds.</p>
 {{- end}}
-{{- if not $nosite}}
+{{- if not (or $nosite (eq $kind "port_closed"))}}
 <details><summary>Details</summary><pre>{{html (placeholder "http.error.message")}}</pre></details>
 {{- end}}
 </main>

@@ -156,7 +156,11 @@ Folders outside a parked directory can be linked one at a time:
 
 Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
 Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
-(`artisan serve`).
+(`artisan serve`). Only the ports in `VHOSTY_PORTS` are forwarded (by default
+`3000-5999 6006 8000-8099 8888`), so other things listening on the machine's
+localhost, like an admin console or a search engine, stay private to it. To open
+another, add it in `~/.vhosty/config` (`VHOSTY_PORTS="3000-5999 6006 8000-8099 8888 9001"`)
+and run `vhosty rebuild`.
 
 When something isn't there, vhosty says what and why instead of showing a blank
 page: a name with no site lists the paths it checked and links to your sites; a

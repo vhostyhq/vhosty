@@ -175,3 +175,19 @@ b"; do
   run caddyfile
   assert_contains "$output" "php_fastcgi \"unix/$VHOSTY_DIR/run/php-8.4.sock\""
 }
+
+@test "an empty VHOSTY_PORTS closes every port" {
+  write_config 'VHOSTY_PORTS=""'
+  run caddyfile
+  refute_contains "$output" "reverse_proxy localhost"
+  assert_contains "$output" "@port_closed"
+}
+
+@test "a bad VHOSTY_PORTS is refused, not written into the Caddyfile" {
+  for bad in "abc" "3000-" "-5" "1-2-3" "80;x"; do
+    write_config "VHOSTY_PORTS=\"$bad\""
+    run vh write_caddyfile
+    [ "$status" -ne 0 ] || { echo "accepted: $bad" >&2; false; }
+    assert_contains "$output" "VHOSTY_PORTS"
+  done
+}

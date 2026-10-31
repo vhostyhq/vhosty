@@ -68,23 +68,6 @@ load helpers
   [ "$(vh cert_days_left "$HOME/c.crt")" = 30 ]
 }
 
-@test "app_debug_on spots Laravel debug mode in a site's .env" {
-  mkdir -p "$HOME/app"
-  for v in true TRUE '"true"' "'true'" '(true)' 1 'true  # local only'; do
-    printf 'APP_NAME=x\nAPP_DEBUG=%s\n' "$v" >"$HOME/app/.env"
-    vh app_debug_on "$HOME/app" || { echo "missed APP_DEBUG=$v" >&2; false; }
-  done
-  for v in false 0 '' '"false"' 'truer'; do
-    printf 'APP_DEBUG=%s\n' "$v" >"$HOME/app/.env"
-    run vh app_debug_on "$HOME/app"
-    [ "$status" -ne 0 ] || { echo "wrongly flagged APP_DEBUG=$v" >&2; false; }
-  done
-  printf '# APP_DEBUG=true\nAPP_DEBUG=false\n' >"$HOME/app/.env"
-  run vh app_debug_on "$HOME/app"; [ "$status" -ne 0 ]
-  rm "$HOME/app/.env"
-  run vh app_debug_on "$HOME/app"; [ "$status" -ne 0 ]
-}
-
 @test "temp paths with spaces are removed whole, and nothing else is" {
   mkdir -p "$HOME/Backups 2/services.partial" "$HOME/Backups" "$HOME/keep"
   touch "$HOME/Backups/precious"

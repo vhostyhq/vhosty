@@ -389,7 +389,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 ## Security
 
 - Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that (below).
-- Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. `vhosty doctor` warns about sites in debug mode. If only you can reach the machine, add `VHOSTY_ALLOW_DEBUG="yes"` to `~/.vhosty/config` to silence it.
+- Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. That's fine when only you can reach the machine; if others can, limit access (below) or turn debug off.
 
 To let only yourself reach the box's sites, tag the machine and grant HTTPS to it
 in your [tailnet policy](https://tailscale.com/kb/1324/grants). Tag it with

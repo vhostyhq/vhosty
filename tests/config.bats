@@ -5,8 +5,8 @@ load helpers
 
 caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
 
-@test "Caddy listens on the Tailscale address and localhost only" {
-  run caddyfile
+@test "on Linux, Caddy listens on the Tailscale address and localhost only" {
+  run linux eval 'write_caddyfile && cat "$CADDYFILE"'
   assert_contains "$output" "default_bind 100.64.0.7 127.0.0.1 ::1"
 }
 
@@ -213,13 +213,14 @@ SITE_LINKED=yes"
 }
 
 @test "doctor's drift message says when it's vhosty itself that changed" {
-  vh write_configs
-  [ "$(vh drift_reason)" = "settings changed since the last rebuild" ]
+  linux write_configs
+  [ "$(linux drift_reason)" = "settings changed since the last rebuild" ]
   sed -i.bak 's/\$vhosty := "[^"]*"/$vhosty := "0.0.1"/' "$VHOSTY_DIR/error.html"
-  [ "$(vh drift_reason)" = "vhosty was updated since the config was generated" ]
-  vh write_configs
+  [ "$(linux drift_reason)" = "vhosty was updated since the config was generated" ]
+  # On Linux, Caddy listens on the Tailscale address, so a new one needs a rebuild
+  linux write_configs
   stub tailscale 'case "$1" in ip) echo 100.64.0.99 ;; esac'
-  [ "$(vh drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
+  [ "$(linux drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
 }
 
 @test "config_in_sync notices when the php shim is out of date" {

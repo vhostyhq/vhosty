@@ -20,11 +20,6 @@ setup() {
   brew_php php@8.4 8.4.27
 }
 
-# mac FUNCTION [ARGS...]: like vh, as if on macOS
-mac() {
-  VHOSTY_SRC="$ROOT/bin/vhosty" "${VHOSTY_TEST_BASH:-bash}" -c 'source "$VHOSTY_SRC"; PLATFORM=macos; trap cleanup_tmp EXIT; load_config; "$@"' vh "$@"
-}
-
 # brew_php FORMULA VERSION: a keg in Cellar, linked from opt/ as Homebrew does.
 # Its php -m lists MODULES (default: Core, pdo_pgsql).
 brew_php() {
@@ -219,7 +214,7 @@ VHOSTY_SERVE_HTTP_PORT="49080"'
 @test "on macOS, the ports are saved with the config; on Linux they aren't" {
   mac save_config
   grep -q '^VHOSTY_SERVE_PORT=48443$' "$VHOSTY_DIR/config"
-  vh save_config
+  linux save_config
   run grep -q SERVE "$VHOSTY_DIR/config"
   [ "$status" -ne 0 ]
 }
@@ -235,7 +230,7 @@ VHOSTY_SERVE_HTTP_PORT="49080"'
 }
 
 @test "on Linux, Caddy still listens on the Tailscale address and localhost" {
-  vh write_configs
+  linux write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"
   refute_contains "$caddyfile" "https_port"

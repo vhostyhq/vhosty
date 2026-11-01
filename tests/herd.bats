@@ -135,9 +135,9 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$output" "Herd's PHP settings"
 }
 
-@test "without VHOSTY_BACKEND, nothing changes" {
+@test "without VHOSTY_BACKEND, nothing changes (on Linux)" {
   write_config
-  vh write_configs
+  linux write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   refute_contains "$caddyfile" "Herd"
   assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"

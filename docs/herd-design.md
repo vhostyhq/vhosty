@@ -12,6 +12,9 @@ Herd's nginx (`tests/herd.bats`), and tried on a Mac with Herd. Three changes fr
   wildcard certificate. Setup and `rebuild` set it up, `doctor` checks it, `uninstall` removes
   it. Costs: Serve has to be enabled on the tailnet, no `http://` on the tailnet, and Caddy
   sees every client as 127.0.0.1. Root Caddy and a pf redirect were the alternatives.
+  Later the same applied to vhosty's own macOS mode, so the Serve code is now shared by both
+  backends, and Serve also forwards the tailnet's port 80 to a redirect on `127.0.0.1:48080`
+  ([macos-brew-design.md](macos-brew-design.md)).
 
 - **Secured sites:** Caddy connects to Herd on 443 with `tls_insecure_skip_verify` rather than
   trusting Herd's CA file, whose name and place aren't documented. The hop stays on this machine.

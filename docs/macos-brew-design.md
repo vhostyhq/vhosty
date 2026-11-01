@@ -1,6 +1,8 @@
 # vhosty on macOS with Homebrew PHP: design
 
-Status: sketch (2026-11-01), on the `macos-brew` branch (from `herd-backend`).
+Status: implemented on the `macos-brew` branch (from `herd-backend`), tested against a
+fake Homebrew and fake `tailscale` (`tests/macos.bats`), not yet on a real Mac. The
+"To verify on the Mac" list below still stands.
 
 Two changes to vhosty's own macOS mode (`VHOSTY_BACKEND=vhosty`), plus closing
 the gaps between Linux and macOS. The Herd backend keeps working as it does, and

@@ -63,13 +63,16 @@ else
   CADDY_CERTS="${XDG_DATA_HOME:-$VHOSTY_HOME_DIR/.local/share}/caddy/certificates"
 fi
 CF_API="https://api.cloudflare.com/client/v4"
-PHP_DOWNLOADS="https://dl.static-php.dev/static-php-cli/bulk"
 # Laravel Herd, for VHOSTY_BACKEND=herd (the overrides are for the tests)
 HERD_DIR="${VHOSTY_HERD_DIR:-$VHOSTY_HOME_DIR/Library/Application Support/Herd}"
 HERD_HTTP="${VHOSTY_HERD_HTTP:-127.0.0.1:80}"     # Herd's nginx
 HERD_HTTPS="${VHOSTY_HERD_HTTPS:-127.0.0.1:443}"
-# With Herd, Caddy's port on localhost; Tailscale Serve passes the tailnet's 443 to it
-HERD_PORT="${VHOSTY_HERD_PORT:-48443}"
+# macOS: Homebrew, for PHP (the override is for the tests)
+BREW_PREFIX="${VHOSTY_BREW_PREFIX:-}"
+BREW_PHP_TAP="shivammathur/php"
+BREW_EXT_TAP="shivammathur/extensions"
+# Extensions apt's PHP_PACKAGES have that Homebrew's PHP doesn't compile in
+BREW_PHP_EXTS="redis igbinary"
 
 # Defaults; ~/.vhosty/config overrides them
 VHOSTY_DOMAIN=""
@@ -87,6 +90,9 @@ VHOSTY_DNS="cloudflare"   # DNS provider: cloudflare digitalocean porkbun route5
 VHOSTY_DNS_PLUGIN=""      # custom: the Caddy plugin, e.g. github.com/caddy-dns/gandi
 VHOSTY_DNS_TLS=""         # custom: its Caddyfile line, e.g. dns gandi {env.GANDI_BEARER_TOKEN}
 VHOSTY_BACKEND="vhosty"   # vhosty: serve folders with vhosty's PHP-FPM; herd: forward to Laravel Herd (macOS)
+# macOS: Caddy's ports on localhost; Tailscale Serve passes the tailnet's 443 and 80 to them
+VHOSTY_SERVE_PORT="${VHOSTY_SERVE_PORT:-${VHOSTY_HERD_PORT:-48443}}"
+VHOSTY_SERVE_HTTP_PORT="${VHOSTY_SERVE_HTTP_PORT:-48080}"
 
 FAILED=0
 
@@ -191,6 +197,9 @@ save_config() {
       VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_BACKEND; do
       printf '%s=%q\n' "$k" "${!k}"
     done
+    if uses_serve; then
+      for k in VHOSTY_SERVE_PORT VHOSTY_SERVE_HTTP_PORT; do printf '%s=%q\n' "$k" "${!k}"; done
+    fi
   } >"$CONFIG_FILE"
 }
 
@@ -390,52 +399,6 @@ EOF
   echo "$best"
 }
 
-# With Herd, Caddy can't listen on the Tailscale address's port 443: macOS lets
-# an ordinary user listen below 1024 only on every address at once, and Herd has
-# localhost's. So Caddy listens on 127.0.0.1:$HERD_PORT, and Tailscale Serve
-# passes the tailnet's port 443 to it, still encrypted (Caddy's certificate is
-# the one browsers see). Serve keeps this across restarts.
-herd_serve_json() { # Serve's config, on one line
-  local t
-  t="$(tailscale_bin)"
-  [ -n "$t" ] || return 1
-  "$t" serve status --json 2>/dev/null | tr -d ' \t\r\n'
-}
-
-herd_serve_ok() {
-  herd_serve_json | grep -qE "\"443\":\\{[^}]*\"TCPForward\":\"127\\.0\\.0\\.1:$HERD_PORT\""
-}
-
-herd_serve_on() {
-  local t out target
-  herd_serve_ok && return 0
-  t="$(tailscale_bin)"
-  [ -n "$t" ] || die "Tailscale's CLI wasn't found. vhosty uses Tailscale Serve for the tailnet's port 443"
-  if herd_serve_json | grep -q '"443":'; then
-    warn "Tailscale Serve already uses port 443 on this machine:"
-    "$t" serve status 2>/dev/null | sed 's/^/      /' || true
-    # What it forwards to, so it can move to another port: "Proxy":"http://127.0.0.1:3773"
-    target="$(herd_serve_json | grep -oE '"Proxy":"[^"]+"' | head -1 | sed 's/^"Proxy":"//; s/"$//' || true)"
-    info "Replacing it turns that off. To keep it, move it to another port, before or after:"
-    info "  tailscale serve --bg --https=8443 ${target:-<what it serves>}"
-    info "(then it's at https://<this machine>.<tailnet>.ts.net:8443)"
-    confirm "Replace it with vhosty's (port 443 → Caddy)?" Y \
-      || die "Left Tailscale Serve alone, so the sites aren't reachable. Free port 443 (tailscale serve reset), then run: vhosty rebuild"
-    "$t" serve --https=443 off >/dev/null 2>&1 || "$t" serve --tcp=443 off >/dev/null 2>&1 || true
-  fi
-  out="$("$t" serve --bg --tcp=443 "tcp://127.0.0.1:$HERD_PORT" 2>&1)" \
-    || die "Tailscale Serve didn't take port 443: $out
-If Serve isn't enabled on your tailnet, the message above has the link to enable it. Then run: vhosty rebuild"
-  herd_serve_ok || die "Tailscale Serve didn't take port 443 (tailscale serve status). Free it (tailscale serve reset), then run: vhosty rebuild"
-}
-
-herd_serve_off() {
-  local t
-  herd_serve_ok || return 0
-  t="$(tailscale_bin)"
-  "$t" serve --tcp=443 off >/dev/null 2>&1 && ok "removed Tailscale Serve's port 443"
-}
-
 # Commands that are Herd's job with VHOSTY_BACKEND=herd
 herd_refuse() {
   local alt
@@ -528,10 +491,84 @@ herd_checks() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 "http://$HERD_HTTP/" 2>/dev/null || true)"
   if [ -n "$code" ] && [ "$code" != "000" ]; then ok "Herd's web server answers on $HERD_HTTP"
   else bad "Herd's web server isn't answering on $HERD_HTTP. Open Herd, or run: herd restart"; fi
-  if herd_serve_ok; then ok "Tailscale Serve: the tailnet's port 443 → Caddy (127.0.0.1:$HERD_PORT)"
-  else bad "Tailscale Serve isn't passing port 443 to Caddy (see: tailscale serve status). Run: vhosty rebuild"; fi
   n="$(herd_sites | grep -c . || true)"
   ok "$n Herd site$([ "$n" = 1 ] || echo s), as <name>.$(herd_tld) (vhosty sites lists them)"
+}
+
+# ---------------------------------------------------------------------------
+# Tailscale Serve (macOS). Caddy can't listen on the Tailscale address's
+# port 443 there: macOS lets an ordinary user listen below 1024 only on every
+# address at once, and Caddy runs as you. So Caddy listens on localhost's
+# VHOSTY_SERVE_PORT (https) and VHOSTY_SERVE_HTTP_PORT (redirects to https),
+# and Tailscale Serve passes the tailnet's 443 and 80 to them as plain TCP:
+# still encrypted, with Caddy's certificate. Serve keeps this across restarts.
+# ---------------------------------------------------------------------------
+uses_serve() { is_macos || herd_mode; }
+
+serve_json() { # Serve's config, on one line
+  local t
+  t="$(tailscale_bin)"
+  [ -n "$t" ] || return 1
+  "$t" serve status --json 2>/dev/null | tr -d ' \t\r\n'
+}
+
+serve_pairs() { echo "443:$VHOSTY_SERVE_PORT 80:$VHOSTY_SERVE_HTTP_PORT"; }
+
+serve_port_ok() { # serve_port_ok 443 48443 [JSON]
+  printf '%s' "${3:-$(serve_json)}" | grep -qE "\"$1\":\\{[^}]*\"TCPForward\":\"127\\.0\\.0\\.1:$2\""
+}
+
+serve_ok() {
+  local j pair
+  j="$(serve_json)" || return 1
+  for pair in $(serve_pairs); do serve_port_ok "${pair%%:*}" "${pair#*:}" "$j" || return 1; done
+}
+
+serve_on() {
+  local t out target pair p to
+  serve_ok && return 0
+  t="$(tailscale_bin)"
+  [ -n "$t" ] || die "Tailscale's CLI wasn't found. vhosty uses Tailscale Serve for the tailnet's ports 443 and 80"
+  for pair in $(serve_pairs); do
+    p="${pair%%:*}"; to="${pair#*:}"
+    serve_port_ok "$p" "$to" && continue
+    if serve_json | grep -q "\"$p\":"; then
+      warn "Tailscale Serve already uses port $p on this machine:"
+      "$t" serve status 2>/dev/null | sed 's/^/      /' || true
+      # What it forwards to, so it can move to another port: "Proxy":"http://127.0.0.1:3773"
+      target="$(serve_json | grep -oE '"Proxy":"[^"]+"' | head -1 | sed 's/^"Proxy":"//; s/"$//' || true)"
+      info "Replacing it turns that off. To keep it, move it to another port, before or after:"
+      info "  tailscale serve --bg --https=8443 ${target:-<what it serves>}"
+      info "(then it's at https://<this machine>.<tailnet>.ts.net:8443)"
+      confirm "Replace it with vhosty's (port $p → Caddy)?" Y \
+        || die "Left Tailscale Serve alone, so the sites aren't reachable. Free port $p (tailscale serve reset), then run: vhosty rebuild"
+      if [ "$p" = 443 ]; then "$t" serve --https=443 off >/dev/null 2>&1 || true
+      else "$t" serve --http="$p" off >/dev/null 2>&1 || true; fi
+      "$t" serve --tcp="$p" off >/dev/null 2>&1 || true
+    fi
+    out="$("$t" serve --bg --tcp="$p" "tcp://127.0.0.1:$to" 2>&1)" \
+      || die "Tailscale Serve didn't take port $p: $out
+If Serve isn't enabled on your tailnet, the message above has the link to enable it. Then run: vhosty rebuild"
+  done
+  serve_ok || die "Tailscale Serve didn't take ports 443 and 80 (tailscale serve status). Free them (tailscale serve reset), then run: vhosty rebuild"
+}
+
+# Removes vhosty's forwards only
+serve_off() {
+  local t j pair
+  t="$(tailscale_bin)"
+  [ -n "$t" ] || return 0
+  j="$(serve_json)" || return 0
+  for pair in $(serve_pairs); do
+    if serve_port_ok "${pair%%:*}" "${pair#*:}" "$j" && "$t" serve --tcp="${pair%%:*}" off >/dev/null 2>&1; then
+      ok "removed Tailscale Serve's port ${pair%%:*}"
+    fi
+  done
+}
+
+serve_check() { # for doctor
+  if serve_ok; then ok "Tailscale Serve: the tailnet's 443 and 80 → Caddy (127.0.0.1:$VHOSTY_SERVE_PORT, :$VHOSTY_SERVE_HTTP_PORT)"
+  else bad "Tailscale Serve isn't passing ports 443 and 80 to Caddy (see: tailscale serve status). Run: vhosty rebuild"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -812,9 +849,87 @@ caddy_installed() { # with the DNS provider's plugin
 # ---------------------------------------------------------------------------
 # PHP versions
 #   Linux: apt packages (phpX.Y-fpm), side by side
-#   macOS: static PHP-FPM builds in ~/.vhosty/bin/php-fpm-X.Y
+#   macOS: Homebrew (shivammathur/php: php@X.Y, and php for the newest stable),
+#   side by side. Older vhosty downloaded static PHP-FPM builds into
+#   ~/.vhosty/bin/php-fpm-X.Y; those keep working until moved to Homebrew.
 # ---------------------------------------------------------------------------
-fpm_bin() { if is_macos; then echo "$BIN_DIR/php-fpm-$1"; else echo "/usr/sbin/php-fpm$1"; fi; }
+brew_prefix() {
+  if [ -n "$BREW_PREFIX" ]; then echo "$BREW_PREFIX"
+  elif [ -x /opt/homebrew/bin/brew ]; then echo /opt/homebrew
+  else echo /usr/local; fi
+}
+
+brew_cmd() {
+  local b
+  b="$(brew_prefix)/bin/brew"
+  if [ -x "$b" ]; then echo "$b"; else command -v brew 2>/dev/null || true; fi
+}
+
+need_brew() {
+  [ -n "$(brew_cmd)" ] || die "vhosty's PHP on macOS comes from Homebrew. Install it (https://brew.sh), then run this again."
+  [ "$(id -u)" != 0 ] || die "Homebrew doesn't run as root. Run this without sudo."
+}
+
+# X.Y of the plain php keg (the newest stable), from where opt/php points:
+# ../Cellar/php/8.5.12_1 → 8.5
+brew_php_latest() {
+  local t
+  t="$(readlink "$(brew_prefix)/opt/php" 2>/dev/null)" || return 0
+  printf '%s\n' "${t##*/}" | grep -oE '^[0-9]+\.[0-9]+' || true
+}
+
+# The Homebrew keg for a version: opt/php@X.Y, or opt/php if it's that version
+brew_php_dir() {
+  local p
+  p="$(brew_prefix)/opt"
+  if [ -x "$p/php@$1/sbin/php-fpm" ]; then echo "$p/php@$1"
+  elif [ -x "$p/php/sbin/php-fpm" ] && [ "$(brew_php_latest)" = "$1" ]; then echo "$p/php"
+  else return 1; fi
+}
+
+brew_php_versions() {
+  local d
+  for d in "$(brew_prefix)"/opt/php@[0-9]*; do
+    [ -x "$d/sbin/php-fpm" ] && echo "${d##*/php@}"
+  done
+  [ ! -x "$(brew_prefix)/opt/php/sbin/php-fpm" ] || brew_php_latest
+}
+
+# Adds a tap, and trusts it where Homebrew asks for that (brew trust, newer
+# Homebrew), as the taps' READMEs say to
+brew_tap() {
+  local b
+  b="$(brew_cmd)"
+  "$b" tap "$1" >/dev/null 2>&1 || "$b" tap "$1" || die "brew tap $1 failed"
+  "$b" trust "$1" >/dev/null 2>&1 || true
+}
+
+# The formula a version is installed as (php@8.4, or php for the newest stable)
+brew_php_formula() {
+  local d
+  d="$(brew_php_dir "$1")" || return 1
+  echo "${d##*/}"
+}
+
+# An old static build: a regular file, where vhosty used to download it
+static_fpm() { [ -f "$BIN_DIR/php-fpm-$1" ] && [ ! -L "$BIN_DIR/php-fpm-$1" ] && [ -x "$BIN_DIR/php-fpm-$1" ]; }
+php_is_static() { is_macos && ! brew_php_dir "$1" >/dev/null && static_fpm "$1"; }
+
+fpm_bin() {
+  local d
+  if is_linux; then echo "/usr/sbin/php-fpm$1"
+  elif d="$(brew_php_dir "$1")"; then echo "$d/sbin/php-fpm"
+  else echo "$BIN_DIR/php-fpm-$1"; fi
+}
+
+# The version's CLI: what composer checks extensions against, and what the shim runs
+php_cli() {
+  local d
+  if is_linux; then echo "/usr/bin/php$1"
+  elif d="$(brew_php_dir "$1")"; then echo "$d/bin/php"
+  else return 1; fi
+}
+
 fpm_conf() { echo "$PHP_CONF_DIR/$1/php-fpm.conf"; }
 fpm_sock() { echo "$RUN_DIR/php-$1.sock"; }
 fpm_log() { echo "$LOG_DIR/php-$1.log"; }
@@ -823,11 +938,12 @@ php_installed_versions() { # newest first
   local f
   {
     if is_macos; then
-      for f in "$BIN_DIR"/php-fpm-*; do [ -x "$f" ] && echo "${f##*/php-fpm-}"; done
+      brew_php_versions
+      for f in "$BIN_DIR"/php-fpm-*; do static_fpm "${f##*/php-fpm-}" && echo "${f##*/php-fpm-}"; done
     else
       for f in /usr/sbin/php-fpm[0-9]*; do [ -x "$f" ] && echo "${f#/usr/sbin/php-fpm}"; done
     fi
-  } | grep -E '^[0-9]+\.[0-9]+$' | sort -t. -k1,1nr -k2,2nr || true
+  } | grep -E '^[0-9]+\.[0-9]+$' | sort -u | sort -t. -k1,1nr -k2,2nr || true
 }
 
 php_is_installed() { [ -x "$(fpm_bin "$1")" ]; }
@@ -859,46 +975,66 @@ valid_version() { printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+$' || die "'$1' is
 # PHP on PATH outside vhosty's shim, for picking a default on first setup
 php_cli_minor() {
   local p
-  for p in /usr/bin/php /usr/local/bin/php "$(command -v php 2>/dev/null || true)"; do
+  for p in /usr/bin/php /usr/local/bin/php /opt/homebrew/bin/php "$(command -v php 2>/dev/null || true)"; do
     [ -x "$p" ] || continue
+    [ "$p" -ef "$PHP_SHIM" ] && continue
     "$p" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null && return 0
   done
   return 0
 }
 
-# macOS: picks the newest static PHP-FPM build for a minor version (8.5 → php-8.5.x)
-php_fpm_file() {
-  local minor="$1" arch listing
-  case "$(arch_name)" in amd64) arch="x86_64" ;; arm64) arch="aarch64" ;; esac
-  listing="$(curl -fsSL --connect-timeout 10 --max-time 30 "$PHP_DOWNLOADS/")" || die "Couldn't reach $PHP_DOWNLOADS"
-  printf '%s' "$listing" \
-    | grep -oE "php-$(printf '%s' "$minor" | sed 's/\./\\./')\.[0-9]+-fpm-macos-${arch}\.tar\.gz" \
-    | sort -u | awk -F- '{split($2,v,"."); printf "%d %s\n", v[3], $0}' \
-    | sort -n | tail -1 | cut -d' ' -f2
+php_version_line() { # "8.4.14 (Homebrew)" for messages
+  local full
+  full="$("$(fpm_bin "$1")" -v 2>/dev/null | head -1 | awk '{print $2}')"
+  if php_is_static "$1"; then echo "$full (old static build)"
+  elif is_macos; then echo "$full (Homebrew $(brew_php_formula "$1"))"
+  else echo "$full"; fi
 }
 
+# macOS: brew install shivammathur/php/php@X.Y, the extensions apt's
+# PHP_PACKAGES have that it doesn't compile in, and any old static build of
+# that version goes. Linux: checks apt's (cmd_php_install installs it).
 install_php_fpm() { # install_php_fpm 8.5
-  local minor="${1:-}" file tmp found
+  local minor="${1:-}" b
   [ -n "$minor" ] || minor="$(php_cli_minor)"
   [ -n "$minor" ] || minor="8.5"
   if is_linux; then
-    php_is_installed "$minor" && { ok "PHP $minor ($("$(fpm_bin "$minor")" -v 2>/dev/null | head -1 | awk '{print $2}'))"; return 0; }
+    php_is_installed "$minor" && { ok "PHP $minor ($(php_version_line "$minor"))"; return 0; }
     die "PHP $minor isn't installed. Install it with apt (e.g. sudo apt install php$minor-fpm php$minor-cli)."
   fi
-  file="$(php_fpm_file "$minor")"
-  [ -n "$file" ] || die "No PHP $minor FPM build for this Mac at $PHP_DOWNLOADS. Try: vhosty update php <version>"
-  info "downloading $file"
-  make_tmp tmp -d
-  download "$PHP_DOWNLOADS/$file" "$tmp/php.tar.gz" || die "PHP-FPM download failed"
-  tar -xzf "$tmp/php.tar.gz" -C "$tmp"
-  found="$(find "$tmp" -type f -name php-fpm | head -1)"
-  [ -n "$found" ] || die "$file didn't contain a php-fpm binary"
+  need_brew
+  b="$(brew_cmd)"
+  if ! brew_php_dir "$minor" >/dev/null; then
+    info "installing PHP $minor with Homebrew ($BREW_PHP_TAP/php@$minor; takes a few minutes)"
+    brew_tap "$BREW_PHP_TAP"
+    "$b" install "$BREW_PHP_TAP/php@$minor" || die "brew install $BREW_PHP_TAP/php@$minor failed"
+    brew_php_dir "$minor" >/dev/null || die "Homebrew installed PHP, but not $minor. See: brew info $BREW_PHP_TAP/php@$minor"
+  fi
+  # vhosty runs its own FPM; Homebrew's (brew services) would take 127.0.0.1:9000
+  if launchctl list 2>/dev/null | grep -qF "homebrew.mxcl.$(brew_php_formula "$minor")"; then
+    "$b" services stop "$(brew_php_formula "$minor")" >/dev/null 2>&1 && ok "stopped Homebrew's own PHP-FPM for $minor (brew services)"
+  fi
+  if static_fpm "$minor"; then rm -f "$BIN_DIR/php-fpm-$minor"; ok "removed vhosty's old static build of PHP $minor"; fi
+  ok "PHP $(php_version_line "$minor")"
+  local e missing=""
+  for e in $BREW_PHP_EXTS; do ext_loaded "$minor" "$e" || missing="$missing $e"; done
+  # shellcheck disable=SC2086
+  [ -z "$missing" ] || install_exts "$minor" $missing
+}
+
+# macOS: ~/.vhosty/bin/php-X.Y for each Homebrew version, like Linux's
+# /usr/bin/phpX.Y; links to versions that are gone are removed
+brew_link_clis() {
+  local v f
+  is_macos || return 0
   mkdir -p "$BIN_DIR"
-  chmod +x "$found"
-  xattr -d com.apple.quarantine "$found" 2>/dev/null || true
-  mv "$found" "$(fpm_bin "$minor")"
-  rm -rf "$tmp"
-  ok "$("$(fpm_bin "$minor")" -v 2>/dev/null | head -1)"
+  for f in "$BIN_DIR"/php-[0-9]*; do
+    [ -L "$f" ] || continue
+    [ -e "$f" ] && brew_php_dir "${f##*/php-}" >/dev/null || rm -f "$f"
+  done
+  for v in $(brew_php_versions); do
+    ln -sfn "$(php_cli "$v")" "$BIN_DIR/php-$v"
+  done
 }
 
 # vhosty 0.1 on macOS kept one build at bin/php-fpm. Give it a versioned name.
@@ -907,7 +1043,7 @@ migrate_php_fpm() {
   is_macos && [ -x "$BIN_DIR/php-fpm" ] || return 0
   v="$("$BIN_DIR/php-fpm" -v 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1,2)"
   [ -n "$v" ] || return 0
-  [ -e "$(fpm_bin "$v")" ] || mv "$BIN_DIR/php-fpm" "$(fpm_bin "$v")"
+  [ -e "$(fpm_bin "$v")" ] || mv "$BIN_DIR/php-fpm" "$BIN_DIR/php-fpm-$v"
 }
 
 # ---------------------------------------------------------------------------
@@ -1218,8 +1354,8 @@ write_caddyfile() {
     done
   fi
   # Listen on the Tailscale address (and localhost) only, not the LAN.
-  # With Herd: a high port on localhost, behind Tailscale Serve (herd_serve_on)
-  if herd_mode; then
+  # macOS: high ports on localhost, behind Tailscale Serve (serve_on)
+  if uses_serve; then
     bind="127.0.0.1"
   else
     ip="$(ts_ip)"
@@ -1231,10 +1367,13 @@ write_caddyfile() {
 {
 	default_bind $bind
 EOF
-    if herd_mode; then
+    if uses_serve; then
       cat <<EOF
-	# Herd has ports 80 and 443; Tailscale Serve passes the tailnet's 443 here
-	https_port $HERD_PORT
+	# macOS keeps ports below 1024 on one address for root; Tailscale Serve
+	# passes the tailnet's 443 and 80 to these. Caddy's own redirects would
+	# point at :$VHOSTY_SERVE_PORT, so the http:// block below does them.
+	http_port $VHOSTY_SERVE_HTTP_PORT
+	https_port $VHOSTY_SERVE_PORT
 	auto_https disable_redirects
 EOF
     fi
@@ -1243,6 +1382,16 @@ EOF
 	# not localhost:2019, where every account on this machine could
 	admin "unix/$RUN_DIR/caddy-admin.sock|0600"
 }
+EOF
+    if uses_serve; then
+      cat <<EOF
+
+http://*.$VHOSTY_DOMAIN {
+	redir https://{host}{uri} permanent
+}
+EOF
+    fi
+    cat <<EOF
 
 *.$VHOSTY_DOMAIN {
 	tls {
@@ -1507,7 +1656,7 @@ write_error_page() {
 # so `php`, `php artisan` and `composer` match what the browser gets.
 # Standalone and quick: it reads the config files directly.
 write_shim() {
-  local def bash_bin global="" kv branches
+  local def bash_bin global="" kv branches brew
   mkdir -p "$BIN_DIR"
   def="$(php_default)"
   bash_bin="/bin/bash"; [ -x "$bash_bin" ] || bash_bin="$BASH"
@@ -1545,6 +1694,14 @@ SHIM
     printf 'def=%s\nv=$def site=()\n' "$(printf '%q' "$def")"
     printf 'case "$PWD/" in\n%s\nesac\n' "$branches"
     printf 'shim=%s\n' "$(printf '%q' "$PHP_SHIM")"
+    # macOS: Homebrew's opt/php@X.Y, and opt/php, which is the newest stable
+    # (lv, known now: the shim doesn't run brew)
+    if is_macos; then
+      brew="$(brew_prefix)"
+      printf 'brew=%s lv=%s\n' "$(printf '%q' "$brew")" "$(brew_php_latest)"
+    else
+      printf 'brew= lv=\n'
+    fi
     cat <<SHIM
 # The site's version, else (a pin that isn't installed) the default, as the
 # web does; VHOSTY_PHP_VERSION means exactly that version
@@ -1552,7 +1709,9 @@ versions="\$v \$def"
 [ -z "\${VHOSTY_PHP_VERSION:-}" ] || versions="\$VHOSTY_PHP_VERSION"
 real=""
 for v in \$versions; do
-  for c in "/usr/bin/php\$v" "/usr/local/bin/php\$v" $(printf '%q' "$BIN_DIR")/php-"\$v"; do
+  b=""; [ -z "\$brew" ] || b="\$brew/opt/php@\$v/bin/php"
+  l=""; [ -z "\$brew" ] || [ "\$v" != "\$lv" ] || l="\$brew/opt/php/bin/php"
+  for c in "/usr/bin/php\$v" "/usr/local/bin/php\$v" $(printf '%q' "$BIN_DIR")/php-"\$v" \$b \$l; do
     [ -x "\$c" ] && { real="\$c"; break 2; }
   done
 done
@@ -1751,10 +1910,47 @@ EOF
   sudo chmod 644 "$dest"
 }
 
+# link.vhosty.logs: vhosty logs rotate, daily at 04:10 (like Linux's
+# vhosty-logs.timer). A run missed while the Mac slept happens on waking.
+write_logs_plist() {
+  local dest
+  dest="$(plist_for logs)"
+  sudo tee "$dest" >/dev/null <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(label_of logs)</string>
+  <key>UserName</key><string>$VHOSTY_USER</string>
+  <key>WorkingDirectory</key><string>$VHOSTY_DIR</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BIN_DIR/vhosty</string>
+    <string>logs</string>
+    <string>rotate</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>HOME</key><string>$VHOSTY_HOME_DIR</string></dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>10</integer></dict>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>
+EOF
+  sudo chown root:wheel "$dest"
+  sudo chmod 644 "$dest"
+}
+
+logs_scheduled() { # log rotation runs on its own
+  if is_linux; then sd is-active --quiet vhosty-logs.timer 2>/dev/null
+  else is_loaded logs; fi
+}
+
 # Daemons for services vhosty no longer runs, including 0.1's link.vhosty.php-fpm
 launchd_stale() {
   local f name keep
-  keep=" $(svc_all | tr '\n' ' ') "
+  keep=" $(svc_all | tr '\n' ' ') logs "
   for f in "$DAEMON_DIR/$LABEL_PREFIX".*.plist; do
     [ -f "$f" ] || continue
     name="${f##*/$LABEL_PREFIX.}"; name="${name%.plist}"
@@ -1834,14 +2030,15 @@ svc_sync() {
     sd enable --now --quiet vhosty-logs.timer
     for s in $(sd_stale_php | sort -u); do svc_remove "$s"; ok "stopped $s (no longer used)"; done
   else
-    # No scheduler without another root daemon, so rotate whenever services are set up
-    rotate_logs >/dev/null
     sudo -v
     for s in $(launchd_stale); do svc_remove "$s"; ok "removed $(label_of "$s") (no longer used)"; done
     for s in $(svc_all); do
       if is_loaded "$s"; then sudo launchctl bootout "system/$(label_of "$s")" 2>/dev/null || true; fi
       write_plist "$s"
     done
+    if is_loaded logs; then sudo launchctl bootout "system/$(label_of logs)" 2>/dev/null || true; fi
+    write_logs_plist
+    sudo launchctl bootstrap system "$(plist_for logs)" 2>/dev/null || true
     sleep 1
   fi
 }
@@ -1896,7 +2093,7 @@ drift_reason() {
     return 0
   fi
   ip="$(ts_ip)"
-  if ! herd_mode && [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qE "default_bind ${ip//./\\.}( |\$)" "$CADDYFILE"; then
+  if ! uses_serve && [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qE "default_bind ${ip//./\\.}( |\$)" "$CADDYFILE"; then
     echo "this machine's Tailscale address changed (now $ip)"
     return 0
   fi
@@ -1909,7 +2106,7 @@ config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(g
 # Commands: setup
 # ---------------------------------------------------------------------------
 cmd_setup() {
-  local domain="" token="" park="" php="" dns="" backend="" yes=0 ip o v
+  local domain="" token="" park="" php="" dns="" backend="" yes=0 ip o p v
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) domain="$2"; shift 2 ;;
@@ -1945,22 +2142,26 @@ cmd_setup() {
   elif is_macos && herd_installed && ! herd_mode; then
     info "Laravel Herd is installed. vhosty can stay out of its way: Herd keeps serving"
     info "your sites, and vhosty makes each one https://<name>.<domain> on your tailnet."
-    info "(The alternative is to quit Herd and let vhosty serve the folders itself.)"
+    info "(The alternative: vhosty serves your folders itself, with PHP from Homebrew.)"
     if confirm "Use Herd for the sites?" Y; then VHOSTY_BACKEND="herd"; else VHOSTY_BACKEND="vhosty"; fi
   fi
   if herd_mode; then
     is_macos || die "--herd is for macOS, where Laravel Herd runs"
     herd_installed || die "Herd isn't set up here ($(herd_valet)/config.json not found). Install Herd and open it once: https://herd.laravel.com"
     ok "Herd: sites are <name>.$(herd_tld) (Caddy forwards <name>.<domain> to them)"
-  else
-    o="$(port_owner 443)"
-    if [ -n "$o" ] && [ "$o" != "caddy" ]; then
-      warn "port 443 is in use by: $o"
-      warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."
-      warn "(Herd on a Mac? vhosty setup --herd keeps it and forwards to it.)"
+  fi
+  # The ports Caddy needs: 443 (and 80) on Linux; on macOS, localhost's high
+  # ports behind Tailscale Serve, so Herd or Valet can keep 80 and 443
+  if uses_serve; then o="$VHOSTY_SERVE_PORT $VHOSTY_SERVE_HTTP_PORT"; else o="443"; fi
+  for p in $o; do
+    v="$(port_owner "$p")"
+    if [ -n "$v" ] && [ "$v" != "caddy" ]; then
+      warn "port $p is in use by: $v"
+      if uses_serve; then warn "vhosty's Caddy needs it. Free it, or pick another: VHOSTY_SERVE_PORT / VHOSTY_SERVE_HTTP_PORT in ~/.vhosty/config."
+      else warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."; fi
       confirm "Continue anyway?" N || exit 1
     fi
-  fi
+  done
   migrate_config
   migrate_php_fpm
 
@@ -2023,7 +2224,17 @@ cmd_setup() {
     if php_enabled; then
       v="$(php_default)"
       [ -n "$v" ] || v="$(php_cli_minor)"
-      php_is_installed "${v:-none}" || install_php_fpm "$v"
+      if is_macos; then
+        info "PHP comes from Homebrew ($BREW_PHP_TAP), one version per site if you like."
+        need_brew
+        # Older vhosty's static builds: move the ones in use to Homebrew
+        for o in $( { echo "${v:-8.5}"; php_versions_in_use; } | awk '!seen[$0]++'); do
+          if php_is_static "$o" || ! php_is_installed "$o"; then install_php_fpm "$o"; fi
+        done
+        brew_link_clis
+      else
+        php_is_installed "${v:-none}" || install_php_fpm "$v"
+      fi
       v="$(php_default)"
       [ -n "$v" ] || die "No PHP-FPM found"
       VHOSTY_PHP_DEFAULT="$v"
@@ -2059,12 +2270,13 @@ cmd_setup() {
   svc_sync
   svc_apply
 
-  if herd_mode; then
+  if uses_serve; then
     step "Tailscale Serve"
-    info "Herd has ports 80 and 443 here, so Tailscale Serve passes the tailnet's"
-    info "port 443 to Caddy on 127.0.0.1:$HERD_PORT (still encrypted, with vhosty's certificate)."
-    herd_serve_on
-    ok "the tailnet's port 443 → Caddy"
+    info "macOS lets only root listen on port 443 of one address, so Tailscale Serve passes"
+    info "the tailnet's ports 443 and 80 to Caddy on 127.0.0.1:$VHOSTY_SERVE_PORT and :$VHOSTY_SERVE_HTTP_PORT"
+    info "(still encrypted, with vhosty's certificate)."
+    serve_on
+    ok "the tailnet's ports 443 and 80 → Caddy"
   fi
 
   step "Waiting for the certificate"
@@ -2283,13 +2495,14 @@ cmd_site() {
 
 cmd_rebuild() {
   need_config
+  ! php_enabled || brew_link_clis
   write_configs
   ok "regenerated config"
   if svc_installed; then
     cmd_validate >/dev/null || { cmd_validate || true; die "Not applying. Fix the errors above."; }
     svc_sync
     svc_apply
-    ! herd_mode || herd_serve_on
+    ! uses_serve || serve_on
   fi
 }
 
@@ -2338,8 +2551,12 @@ cmd_status() {
     else bad "$s $st (run: vhosty start, or see: vhosty logs $s)"; fi
   done
   head_ "Listening"
-  p=443; ! herd_mode || p="$HERD_PORT"
+  p=443; ! uses_serve || p="$VHOSTY_SERVE_PORT"
   o="$(port_owner "$p")"; if [ -n "$o" ]; then ok "$p → $o"; else bad "nothing listening on $p"; fi
+  if uses_serve; then
+    if serve_ok; then ok "Tailscale Serve: 443 → $VHOSTY_SERVE_PORT, 80 → $VHOSTY_SERVE_HTTP_PORT"
+    else bad "Tailscale Serve isn't passing 443 and 80 to Caddy (run: vhosty rebuild)"; fi
+  fi
   for v in $(php_versions_in_use); do
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v → $(fpm_sock "$v")"; else bad "no socket for PHP $v"; fi
   done
@@ -2379,7 +2596,8 @@ cmd_php_list() {
     esac
     printf "  %sPHP %s%s  %s%s%s%s\n" "$B" "$v" "$N" \
       "$([ "$v" = "$def" ] && echo "default, ")" "FPM $st" \
-      "$([ -n "$pins" ] && echo ", pinned: $pins")" ""
+      "$([ -n "$pins" ] && echo ", pinned: $pins")" \
+      "$(if php_is_static "$v"; then echo " ${Y}(old static build: vhosty php install $v moves it to Homebrew)${N}"; fi)"
   done
 }
 
@@ -2389,7 +2607,16 @@ cmd_php_install() {
   valid_version "$v"
   if is_macos; then
     install_php_fpm "$v"
-    info "macOS: this is PHP-FPM for sites; the CLI shim uses the php on your PATH"
+    # Extensions sites have declared (vhosty ext require)
+    pkgs=""
+    for e in $(for n in $(site_names); do site_load "$n"; echo "$SITE_EXT"; done | tr ' ' '\n' | grep . | sort -u); do
+      ext_loaded "$v" "$e" || pkgs="$pkgs $e"
+    done
+    # shellcheck disable=SC2086
+    [ -z "$pkgs" ] || install_exts "$v" $pkgs
+    brew_link_clis
+    ok "PHP $v installed ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') available; this one's CLI: php-$v)"
+    if svc_installed && svc_running "php-$v"; then cmd_rebuild; fi
   else
     for e in $PHP_PACKAGES; do pkgs="$pkgs php$v-$e"; done
     # Extensions sites have declared (vhosty ext require)
@@ -2452,14 +2679,14 @@ ext_package() {
   esac
 }
 
-# The PHP whose modules decide what a site has. Linux: the version's CLI,
-# which composer checks against (it has FPM's extensions, plus CLI-only ones
-# like pcntl that queue workers use). macOS: vhosty's FPM build, since there
-# is no CLI per version there.
+# The PHP whose modules decide what a site has: the version's CLI, which
+# composer checks against (it has FPM's extensions, plus CLI-only ones like
+# pcntl that queue workers use). An old static build on macOS has no CLI, so
+# its FPM binary.
 php_bin_for() {
-  if is_macos; then
-    if [ -x "$(fpm_bin "$1")" ]; then fpm_bin "$1"; fi
-  elif [ -x "/usr/bin/php$1" ]; then echo "/usr/bin/php$1"; fi
+  local c
+  if c="$(php_cli "$1")" && [ -x "$c" ]; then echo "$c"
+  elif php_is_static "$1"; then fpm_bin "$1"; fi
 }
 
 # Lists a version's modules once per run, into PHP_MODULES_<8_5>. Call it in
@@ -2506,7 +2733,7 @@ ext_check_blocker() { # ext_check_blocker DIR VERSION
 
 # What to do about a missing extension
 ext_fix() { # ext_fix EXT VERSION
-  if is_macos; then echo "vhosty's PHP $2 build for macOS doesn't include it."
+  if php_is_static "$2"; then echo "PHP $2 is vhosty's old static build, which can't add extensions. Move it to Homebrew: vhosty php install $2"
   else echo "Run: vhosty ext install $1 --php $2"; fi
 }
 
@@ -2552,8 +2779,8 @@ EOF
 install_exts() { # install_exts VERSION ext...
   local v="$1" e pkgs=""
   shift
-  is_linux || die "On macOS, PHP-FPM is a static build with a fixed set of extensions"
   php_is_installed "$v" || die "PHP $v isn't installed. Run: vhosty php install $v"
+  if is_macos; then install_exts_brew "$v" "$@"; return 0; fi
   for e in "$@"; do
     pkgs="$pkgs php$v-$(ext_package "$e")"
     apt-cache show "php$v-$(ext_package "$e")" >/dev/null 2>&1 \
@@ -2566,6 +2793,39 @@ install_exts() { # install_exts VERSION ext...
   forget_php_modules "$v"
   for e in "$@"; do
     if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded"; fi
+  done
+  if svc_running "php-$v"; then svc_restart "php-$v"; ok "restarted php-$v"; fi
+}
+
+# macOS: shivammathur/extensions' <ext>@X.Y when there is one (it writes
+# etc/php/X.Y/conf.d/20-<ext>.ini, which FPM and the CLI read), else pecl
+# with that version's own pecl
+install_exts_brew() { # install_exts_brew VERSION ext...
+  local v="$1" e b f d
+  shift
+  php_is_static "$v" && die "PHP $v is vhosty's old static build, which can't add extensions. Move it to Homebrew first: vhosty php install $v"
+  need_brew
+  b="$(brew_cmd)"
+  d="$(brew_php_dir "$v")"
+  brew_tap "$BREW_EXT_TAP"
+  for e in "$@"; do
+    e="$(lower "$e")"
+    if ext_loaded "$v" "$e"; then ok "PHP $v: $e (already there)"; continue; fi
+    f="$BREW_EXT_TAP/$e@$v"
+    if "$b" info "$f" >/dev/null 2>&1; then
+      info "installing $f"
+      "$b" install "$f" || die "brew install $f failed"
+    elif [ -x "$d/bin/pecl" ]; then
+      info "no $f formula; installing $e with PHP $v's pecl"
+      # pecl asks about build options; the defaults
+      printf '\n' | "$d/bin/pecl" install "$e" || die "pecl install $e failed (PHP $v)"
+    else
+      die "No $f formula, and no pecl for PHP $v ($d/bin/pecl). Install '$e' another way."
+    fi
+  done
+  forget_php_modules "$v"
+  for e in "$@"; do
+    if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded (see: $(brew_prefix)/etc/php/$v/conf.d)"; fi
   done
   if svc_running "php-$v"; then svc_restart "php-$v"; ok "restarted php-$v"; fi
 }
@@ -2639,8 +2899,8 @@ cmd_ext_require() {
   v="$(site_php)"
   for e in $EXT_ARGS; do ext_loaded "$v" "$e" || missing="$missing $e"; done
   # shellcheck disable=SC2086
-  if [ -n "$missing" ] && is_linux; then install_exts "$v" $missing
-  elif [ -n "$missing" ]; then warn "missing on PHP $v:$missing"; fi
+  if [ -n "$missing" ] && ! php_is_static "$v"; then install_exts "$v" $missing
+  elif [ -n "$missing" ]; then warn "missing on PHP $v:$missing. $(ext_fix "<ext>" "$v")"; fi
 }
 
 cmd_ext_unrequire() {
@@ -3733,7 +3993,7 @@ cmd_dns() {
     sync)
       dns_point
       # Caddy listens on the Tailscale IP, so a new IP needs a new Caddyfile
-      if svc_installed && ! herd_mode && ! grep -q "default_bind $(ts_ip) " "$CADDYFILE" 2>/dev/null; then cmd_rebuild; fi
+      if svc_installed && ! uses_serve && ! grep -q "default_bind $(ts_ip) " "$CADDYFILE" 2>/dev/null; then cmd_rebuild; fi
       ;;
     *) die "Usage: vhosty dns sync" ;;
   esac
@@ -3840,8 +4100,36 @@ cmd_update_self() {
   fi
 }
 
+# Upgrades one PHP version in place: Linux, its installed apt packages;
+# macOS, its Homebrew formula and extension formulas (an old static build
+# moves to Homebrew). The caller restarts the services.
+update_php() { # update_php 8.4
+  local v="$1" pkgs b f
+  if is_linux; then
+    pkgs="$(dpkg-query -W -f='${Package} ${Status}\n' "php$v-*" 2>/dev/null | awk '/ installed$/ {print $1}' | tr '\n' ' ')"
+    [ -n "$pkgs" ] || die "PHP $v isn't installed from apt. Run: vhosty php install $v"
+    info "upgrading PHP $v with apt (asks for your password)"
+    sudo apt-get update -qq || die "apt-get update failed"
+    # shellcheck disable=SC2086
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade $pkgs >/dev/null || die "apt-get install failed"
+    sudo systemctl disable --now "php$v-fpm" >/dev/null 2>&1 || true
+    ok "PHP $(php_version_line "$v")"
+    return 0
+  fi
+  if php_is_static "$v" || ! brew_php_dir "$v" >/dev/null; then install_php_fpm "$v"; return 0; fi
+  need_brew
+  b="$(brew_cmd)"
+  f="$(brew_php_formula "$v")"
+  # The extension formulas built for this version (redis@8.4, ...)
+  pkgs="$("$b" list --formula -1 2>/dev/null | grep -E "^[a-z0-9_-]+@$(printf '%s' "$v" | sed 's/\./\\./')\$" | grep -v '^php@' | tr '\n' ' ' || true)"
+  info "upgrading $f${pkgs:+ and $pkgs}with Homebrew"
+  # shellcheck disable=SC2086
+  "$b" upgrade "$f" $pkgs || die "brew upgrade failed"
+  ok "PHP $(php_version_line "$v")"
+}
+
 cmd_update() {
-  local what="${1:-all}"
+  local what="${1:-all}" v
   [ $# -eq 0 ] || shift
   case "$what" in
     self|vhosty) cmd_update_self "$@"; return ;;
@@ -3850,12 +4138,12 @@ cmd_update() {
       need_config
       ! herd_mode || die "Herd manages PHP here. Update it in Herd."
       php_enabled || die "PHP is turned off"
-      is_macos || die "On Linux, PHP comes from apt: sudo apt update && sudo apt upgrade"
-      install_php_fpm "${1:-$(php_default)}" ;;
+      if [ -n "${1:-}" ]; then valid_version "$1"; update_php "$1"
+      else for v in $(php_versions_in_use); do update_php "$v"; done; fi ;;
     all)
       need_config
       install_caddy
-      if php_enabled && is_macos; then install_php_fpm "$(php_default)"; fi ;;
+      if php_enabled; then for v in $(php_versions_in_use); do update_php "$v"; done; fi ;;
     *) die "Usage: vhosty update [self|caddy|php [8.x]]" ;;
   esac
   if svc_installed; then cmd_restart all; fi
@@ -3883,6 +4171,8 @@ EOF
   else
     printf "  Services      %s\n" "$(plist_for caddy)"
     for s in $(svc_all); do [ "$s" = caddy ] || printf "                %s\n" "$(plist_for "$s")"; done
+    printf "                %s (log rotation)\n" "$(plist_for logs)"
+    if php_enabled; then printf "  PHP           %s/opt/php@<version> (Homebrew), its php.ini in %s/etc/php/<version>\n" "$(brew_prefix)" "$(brew_prefix)"; fi
   fi
   printf "  Certificates  %s\n" "$CADDY_CERTS"
 }
@@ -4011,9 +4301,10 @@ doctor_fix() {
     cmd_prune --yes --no-rebuild; need_rebuild=1; fixed=1
   fi
 
-  if php_enabled && is_linux; then
+  if php_enabled; then
     pairs="$(missing_ext_pairs | sort -u)"
     for v in $(printf '%s\n' "$pairs" | cut -d' ' -f1 | grep . | sort -u); do
+      ! php_is_static "$v" || continue
       exts="$(printf '%s\n' "$pairs" | awk -v v="$v" '$1 == v {print $2}' | tr '\n' ' ' | sed 's/ $//')"
       # shellcheck disable=SC2086
       if fix_ok "install on PHP $v: $exts (vhosty ext install)"; then install_exts "$v" $exts; fixed=1; fi
@@ -4022,7 +4313,8 @@ doctor_fix() {
 
   if ! config_in_sync || ! config_applied; then need_rebuild=1; fi
   for s in $(svc_all); do svc_running "$s" || need_rebuild=1; done
-  if is_linux && ! sd is-active --quiet vhosty-logs.timer 2>/dev/null; then need_rebuild=1; fi
+  if svc_installed && ! logs_scheduled; then need_rebuild=1; fi
+  if svc_installed && uses_serve && ! serve_ok; then need_rebuild=1; fi
   if [ "$need_rebuild" = "1" ] && svc_installed && fix_ok "regenerate config and start or reload services (vhosty rebuild)"; then
     cmd_rebuild; fixed=1
   fi
@@ -4110,8 +4402,9 @@ doctor_checks() {
   if php_enabled; then
     head_ "PHP"
     for v in $(php_versions_in_use); do
-      if php_is_installed "$v"; then ok "PHP $v: $("$(fpm_bin "$v")" -v 2>/dev/null | head -1 | awk '{print $2}')"
-      else bad "PHP $v isn't installed"; fi
+      if php_is_static "$v"; then bad "PHP $v is vhosty's old static build: no pdo_pgsql, can't add extensions. Move it to Homebrew: vhosty php install $v"
+      elif php_is_installed "$v"; then ok "PHP $(php_version_line "$v")"
+      else bad "PHP $v isn't installed. Run: vhosty php install $v"; fi
     done
     cmd_validate php || true
   fi
@@ -4141,9 +4434,14 @@ doctor_checks() {
   if is_linux; then
     if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
     else bad "services won't start until you log in. Run: vhosty setup"; fi
-    if sd is-active --quiet vhosty-logs.timer 2>/dev/null; then
-      ok "logs rotate daily over $VHOSTY_LOG_MAX_MB MB ($(du -sh "$LOG_DIR" 2>/dev/null | awk '{print $1}') now)"
-    elif svc_installed; then bad "log rotation timer isn't running. Run: vhosty rebuild"; fi
+  fi
+  if logs_scheduled; then
+    ok "logs rotate daily over $VHOSTY_LOG_MAX_MB MB ($(du -sh "$LOG_DIR" 2>/dev/null | awk '{print $1}') now)"
+  elif svc_installed; then bad "log rotation isn't scheduled. Run: vhosty rebuild"; fi
+  if is_macos && php_enabled; then
+    # Homebrew's own FPM (brew services) listens on 127.0.0.1:9000, RustFS's port
+    o="$(launchctl list 2>/dev/null | awk '$3 ~ /^homebrew\.mxcl\.php/ {print $3}' | tr '\n' ' ' | sed 's/ $//' || true)"
+    if [ -n "$o" ]; then warn "Homebrew runs its own PHP-FPM too ($o), on 127.0.0.1:9000. vhosty doesn't need it: brew services stop ${o#homebrew.mxcl.}"; fi
   fi
   for s in $(svc_all); do
     st="$(svc_state "$s")"
@@ -4151,8 +4449,9 @@ doctor_checks() {
     elif svc_installed; then bad "$s $st. Run: vhosty start (logs: vhosty logs $s)"
     else bad "$s not installed. Run: vhosty setup"; fi
   done
-  p=443; ! herd_mode || p="$HERD_PORT"
+  p=443; ! uses_serve || p="$VHOSTY_SERVE_PORT"
   o="$(port_owner "$p")"; if [ -n "$o" ]; then ok "$p → $o"; else bad "nothing listening on $p"; fi
+  ! uses_serve || serve_check
   for v in $(php_versions_in_use); do
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v socket"; else bad "no socket for PHP $v"; fi
   done
@@ -4210,10 +4509,10 @@ cmd_uninstall() {
     ok "removed the systemd user services"
     info "Linger stays on (other user services may need it). To turn it off: sudo loginctl disable-linger $VHOSTY_USER"
   else
-    for s in $(svc_all) $(launchd_stale); do
+    for s in $(svc_all) logs $(launchd_stale); do
       if [ -f "$(plist_for "$s")" ]; then svc_remove "$s"; ok "removed $(label_of "$s")"; fi
     done
-    ! herd_mode || herd_serve_off
+    serve_off
   fi
   dns_provider
   info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record at $DNS_NAME."
@@ -4248,7 +4547,7 @@ ${B}Sites${N}
 
 ${B}PHP${N}
   vhosty php [list]                  Installed versions, the default, and pins
-  vhosty php install <version>       Install a PHP version (apt on Linux)
+  vhosty php install <version>       Install a PHP version (apt on Linux, Homebrew on macOS)
   vhosty php default [version]       Show or set the default version
   vhosty php which [site]            The version a site uses (default: current folder)
   vhosty isolate <version> [site]    Pin a site to a version (default: current folder)
@@ -4257,7 +4556,7 @@ ${B}PHP${N}
   vhosty ext [site]                  A site's extensions: declared and required by composer.lock
   vhosty ext require <ext..> [..]    A site needs an extension composer doesn't require (e.g. protobuf)
   vhosty ext unrequire <ext..> [..]  Remove that again
-  vhosty ext install <ext..> [--php V]  Install extensions (apt) and restart PHP-FPM
+  vhosty ext install <ext..> [--php V]  Install extensions (apt; Homebrew or pecl on macOS), restart PHP-FPM
   vhosty ext check                   Check every site against its PHP version
   ${D}php, php artisan and composer use the site's version inside its folder.${N}
 
@@ -4287,14 +4586,14 @@ ${B}Caddy and PHP-FPM${N}
   vhosty restart [caddy|php|php-8.x] Validate config, then restart
   vhosty status                      Service state, PIDs, and sockets
   vhosty logs [service] [N]          Show the last N log lines (default 100)
-  vhosty logs rotate [--force]       Rotate logs over VHOSTY_LOG_MAX_MB (daily on Linux)
+  vhosty logs rotate [--force]       Rotate logs over VHOSTY_LOG_MAX_MB (runs daily on its own)
   vhosty tail [service]              Follow logs live
 
 ${B}Config${N}
   vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply
   vhosty rebuild                     Regenerate config and reload services
   vhosty dns sync                    Point *.domain at this machine (Cloudflare), or show the record
-  vhosty update [self|caddy|php]     Update vhosty (latest release), Caddy, and PHP-FPM on macOS
+  vhosty update [self|caddy|php [V]] Update vhosty (latest release), Caddy, and the PHP versions in use
   vhosty validate                    Check the generated config
   vhosty cert                        Show the wildcard certificate and expiry
   vhosty doctor [--fix [--yes]]      Check DNS, certs, config, sites, services, and HTTPS; --fix repairs

@@ -35,12 +35,13 @@ herd_config() {
 herd_site() { mkdir -p "$HOME/Herd/$1"; }
 secure() { touch "$VALET/Certificates/$1.test.crt"; }
 
-@test "with Herd, Caddy listens on localhost's port 48443, not 80 or 443" {
+@test "with Herd, Caddy listens on localhost's ports 48443 and 48080, not 80 or 443" {
   vh write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   run grep -E '^\s*default_bind' "$VHOSTY_DIR/Caddyfile"
   [ "$output" = "$(printf '\tdefault_bind 127.0.0.1')" ]
   assert_contains "$caddyfile" "https_port 48443"
+  assert_contains "$caddyfile" "http_port 48080"
   assert_contains "$caddyfile" "auto_https disable_redirects"
 }
 
@@ -69,64 +70,6 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   stub tailscale 'exit 1'
   vh write_configs
   [ "$(cat "$VHOSTY_DIR/Caddyfile")" = "$before" ]
-}
-
-# A fake tailscale whose Serve config is a file, printed the way the real one is
-serve_stub() {
-  printf '%s\n' "${1:-{\}}" >"$HOME/serve.json"
-  stub tailscale '
-st="$HOME/serve.json"
-echo "$*" >>"$HOME/tailscale.log"
-case "$*" in
-  ip*) echo 100.64.0.7 ;;
-  "serve status --json") cat "$st" ;;
-  "serve status") echo "(serve status)" ;;
-  "serve --bg --tcp=443 tcp://127.0.0.1:48443")
-    printf "{\n  \"TCP\": {\n    \"443\": {\n      \"TCPForward\": \"127.0.0.1:48443\"\n    }\n  }\n}\n" >"$st" ;;
-  "serve --https=443 off"|"serve --tcp=443 off") echo "{}" >"$st" ;;
-  *) echo "unexpected: $*" >&2; exit 1 ;;
-esac'
-}
-
-@test "with Herd, Tailscale Serve passes the tailnet's port 443 to Caddy" {
-  serve_stub
-  vh herd_serve_on
-  vh herd_serve_ok
-  assert_contains "$(cat "$HOME/tailscale.log")" "serve --bg --tcp=443 tcp://127.0.0.1:48443"
-}
-
-@test "Tailscale Serve already passing 443 to Caddy is left alone" {
-  serve_stub '{"TCP":{"443":{"TCPForward":"127.0.0.1:48443"}}}'
-  vh herd_serve_on
-  refute_contains "$(cat "$HOME/tailscale.log")" "--bg"
-}
-
-@test "something else on Tailscale Serve's 443 is replaced, once you say yes" {
-  serve_stub '{"TCP":{"443":{"HTTPS":true}},"Web":{"box.tail1.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8000"}}}}}'
-  run vh herd_serve_on </dev/null   # no terminal: the default, yes
-  [ "$status" -eq 0 ]
-  assert_contains "$output" "already uses port 443"
-  assert_contains "$output" "Replacing it turns that off"
-  assert_contains "$output" "tailscale serve --bg --https=8443 http://127.0.0.1:8000"
-  assert_contains "$(cat "$HOME/tailscale.log")" "serve --https=443 off"
-  vh herd_serve_ok
-}
-
-@test "Tailscale Serve refusing (Serve not enabled) stops with its message" {
-  serve_stub
-  stub tailscale 'case "$*" in ip*) echo 100.64.0.7 ;; "serve status --json") echo "{}" ;; *) echo "Serve is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/serve" >&2; exit 1 ;; esac'
-  run vh herd_serve_on
-  [ "$status" -ne 0 ]
-  assert_contains "$output" "Serve is not enabled on your tailnet"
-}
-
-@test "uninstall's Serve cleanup only removes vhosty's forward" {
-  serve_stub '{"TCP":{"443":{"HTTPS":true}}}'
-  vh herd_serve_off
-  [ ! -f "$HOME/tailscale.log" ] || refute_contains "$(cat "$HOME/tailscale.log")" "off"
-  serve_stub '{"TCP":{"443":{"TCPForward":"127.0.0.1:48443"}}}'
-  vh herd_serve_off
-  assert_contains "$(cat "$HOME/tailscale.log")" "serve --tcp=443 off"
 }
 
 @test "with Herd, there's no PHP-FPM and no php shim" {
@@ -259,7 +202,7 @@ PY
 # The generated config over plain HTTP on a high port, as in caddy.bats
 start_caddy() {
   vh write_configs
-  sed -e '/^\tadmin /d' -e '/^\thttps_port /d' -e '/^\tauto_https /d' -e "s/^\tdefault_bind .*/\tadmin off\n\tauto_https off\n\tdefault_bind 127.0.0.1/" \
+  sed -e '/^\tadmin /d' -e '/^\thttps\{0,1\}_port /d' -e '/^\tauto_https /d' -e '/^http:\/\//,/^}/d' -e "s/^\tdefault_bind .*/\tadmin off\n\tauto_https off\n\tdefault_bind 127.0.0.1/" \
       -e "s/^\*\.test\.example {/http:\/\/*.test.example:$PORT {/" \
       -e '/^\ttls {/,/^\t}/d' "$VHOSTY_DIR/Caddyfile" >"$HOME/test.Caddyfile"
   "$CADDY" run --config "$HOME/test.Caddyfile" --adapter caddyfile >"$HOME/caddy.log" 2>&1 &

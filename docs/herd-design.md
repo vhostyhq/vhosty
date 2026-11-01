@@ -1,7 +1,17 @@
 # vhosty in front of Herd: design sketch
 
 Status: implemented (`VHOSTY_BACKEND=herd`, `vhosty setup --herd`), tested against stand-ins for
-Herd's nginx (`tests/herd.bats`), not yet on a Mac with Herd. Two changes from the sketch below:
+Herd's nginx (`tests/herd.bats`), and tried on a Mac with Herd. Three changes from the sketch below:
+
+- **Listening:** Caddy can't listen on the Tailscale address's port 443. Since Mojave, macOS lets
+  an ordinary user listen below 1024 only on every address at once; one particular address
+  (`100.x.y.z:443`) still needs root, and Caddy runs as the user (`bind: permission denied` on
+  the first real try). So Caddy listens on `127.0.0.1:48443` (`https_port`, redirects off), and
+  Tailscale Serve forwards the tailnet's port 443 to it as plain TCP
+  (`tailscale serve --bg --tcp=443 tcp://127.0.0.1:48443`): TLS still ends at Caddy, with the
+  wildcard certificate. Setup and `rebuild` set it up, `doctor` checks it, `uninstall` removes
+  it. Costs: Serve has to be enabled on the tailnet, no `http://` on the tailnet, and Caddy
+  sees every client as 127.0.0.1. Root Caddy and a pf redirect were the alternatives.
 
 - **Secured sites:** Caddy connects to Herd on 443 with `tls_insecure_skip_verify` rather than
   trusting Herd's CA file, whose name and place aren't documented. The hop stays on this machine.

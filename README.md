@@ -148,10 +148,18 @@ escrow.test (Herd, on the Mac)  →  https://escrow.yourdomain.dev (any tailnet 
 vhosty setup --herd
 ```
 
-Setup offers this on its own when it finds Herd. vhosty's Caddy then listens on the
-Tailscale address only, so it doesn't collide with Herd's nginx on localhost, and
-forwards `<name>.yourdomain.dev` to Herd as `<name>.test` (Herd's TLD, read from its
-config). A site you add in Herd works right away; `vhosty sites` lists them.
+Setup offers this on its own when it finds Herd. Caddy forwards
+`<name>.yourdomain.dev` to Herd as `<name>.test` (Herd's TLD, read from its config).
+A site you add in Herd works right away; `vhosty sites` lists them.
+
+Herd has ports 80 and 443, and macOS lets only root listen on a low port of one
+particular address, so Caddy listens on `127.0.0.1:48443` and
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's port 443
+to it. The connection stays encrypted end to end with vhosty's certificate; Serve
+only forwards it. Setup sets this up (`tailscale serve status` shows it), so Serve
+has to be enabled on your tailnet: if it isn't, setup prints Tailscale's link to
+enable it. Anything you had on Serve's port 443 is replaced, after asking. There's
+no `http://` on the tailnet: use `https://`.
 
 Laravel builds links and redirects from the host it sees, which is `escrow.test`.
 For it to use the tailnet address instead, trust the proxy so it reads Caddy's
@@ -165,8 +173,8 @@ For it to use the tailnet address instead, trust the proxy so it reads Caddy's
 
 Port sites (`https://5173.yourdomain.dev`) and `vhosty services` work as usual.
 The PHP commands (`php`, `isolate`, `ini`, `ext`) and `park`/`link` point you to
-Herd's own. Herd's nginx has to listen on 127.0.0.1 only, as it does unless you
-changed it; `vhosty doctor` checks that, and that Herd is answering.
+Herd's own. `vhosty doctor` checks that Herd is answering and that Serve forwards
+to Caddy; `vhosty uninstall` removes the Serve forward too.
 
 ## Updating
 

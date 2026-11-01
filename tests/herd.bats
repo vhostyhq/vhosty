@@ -106,6 +106,8 @@ esac'
   run vh herd_serve_on </dev/null   # no terminal: the default, yes
   [ "$status" -eq 0 ]
   assert_contains "$output" "already uses port 443"
+  assert_contains "$output" "Replacing it turns that off"
+  assert_contains "$output" "tailscale serve --bg --https=8443 http://127.0.0.1:8000"
   assert_contains "$(cat "$HOME/tailscale.log")" "serve --https=443 off"
   vh herd_serve_ok
 }

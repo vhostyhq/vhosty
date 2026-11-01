@@ -407,13 +407,18 @@ herd_serve_ok() {
 }
 
 herd_serve_on() {
-  local t out
+  local t out target
   herd_serve_ok && return 0
   t="$(tailscale_bin)"
   [ -n "$t" ] || die "Tailscale's CLI wasn't found. vhosty uses Tailscale Serve for the tailnet's port 443"
   if herd_serve_json | grep -q '"443":'; then
     warn "Tailscale Serve already uses port 443 on this machine:"
     "$t" serve status 2>/dev/null | sed 's/^/      /' || true
+    # What it forwards to, so it can move to another port: "Proxy":"http://127.0.0.1:3773"
+    target="$(herd_serve_json | grep -oE '"Proxy":"[^"]+"' | head -1 | sed 's/^"Proxy":"//; s/"$//' || true)"
+    info "Replacing it turns that off. To keep it, move it to another port, before or after:"
+    info "  tailscale serve --bg --https=8443 ${target:-<what it serves>}"
+    info "(then it's at https://<this machine>.<tailnet>.ts.net:8443)"
     confirm "Replace it with vhosty's (port 443 → Caddy)?" Y \
       || die "Left Tailscale Serve alone, so the sites aren't reachable. Free port 443 (tailscale serve reset), then run: vhosty rebuild"
     "$t" serve --https=443 off >/dev/null 2>&1 || "$t" serve --tcp=443 off >/dev/null 2>&1 || true

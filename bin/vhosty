@@ -64,6 +64,10 @@ else
 fi
 CF_API="https://api.cloudflare.com/client/v4"
 PHP_DOWNLOADS="https://dl.static-php.dev/static-php-cli/bulk"
+# Laravel Herd, for VHOSTY_BACKEND=herd (the overrides are for the tests)
+HERD_DIR="${VHOSTY_HERD_DIR:-$VHOSTY_HOME_DIR/Library/Application Support/Herd}"
+HERD_HTTP="${VHOSTY_HERD_HTTP:-127.0.0.1:80}"     # Herd's nginx
+HERD_HTTPS="${VHOSTY_HERD_HTTPS:-127.0.0.1:443}"
 
 # Defaults; ~/.vhosty/config overrides them
 VHOSTY_DOMAIN=""
@@ -80,6 +84,7 @@ VHOSTY_PORTS="3000-5999 6006 8000-8099 8888"   # ports <port>.domain reaches (de
 VHOSTY_DNS="cloudflare"   # DNS provider: cloudflare digitalocean porkbun route53, or custom
 VHOSTY_DNS_PLUGIN=""      # custom: the Caddy plugin, e.g. github.com/caddy-dns/gandi
 VHOSTY_DNS_TLS=""         # custom: its Caddyfile line, e.g. dns gandi {env.GANDI_BEARER_TOKEN}
+VHOSTY_BACKEND="vhosty"   # vhosty: serve folders with vhosty's PHP-FPM; herd: forward to Laravel Herd (macOS)
 
 FAILED=0
 
@@ -181,7 +186,7 @@ save_config() {
     echo "# vhosty config. After editing, run: vhosty rebuild"
     for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
       VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_PORTS \
-      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS; do
+      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_BACKEND; do
       printf '%s=%q\n' "$k" "${!k}"
     done
   } >"$CONFIG_FILE"
@@ -277,7 +282,8 @@ dns_provider() {
   DNS_MODULE="dns.providers.$name"
 }
 
-php_enabled() { [ "$VHOSTY_PHP" = "on" ]; }
+# With Herd, Herd runs PHP: vhosty has no PHP-FPM, shim or PHP commands
+php_enabled() { ! herd_mode && [ "$VHOSTY_PHP" = "on" ]; }
 
 # Number of labels in the domain = which {labels.N} holds the site name.
 # vhosty.link → 2, box.example.com → 3
@@ -308,6 +314,186 @@ check_folder() { # check_folder DIR [parked]
 parked_list() { # one per line; in bash, as it runs often
   local p IFS=:
   for p in $VHOSTY_PARKED; do [ -z "$p" ] || printf '%s\n' "$p"; done
+}
+
+# ---------------------------------------------------------------------------
+# Laravel Herd (VHOSTY_BACKEND=herd): Herd serves the sites on this Mac as
+# <name>.test, and vhosty's Caddy forwards https://<name>.domain to them.
+# Herd keeps PHP, its versions and extensions, and its own parked folders
+# and links; vhosty adds the tailnet, the certificate and the DNS record.
+# ---------------------------------------------------------------------------
+herd_mode() { [ "$VHOSTY_BACKEND" = "herd" ]; }
+herd_valet() { echo "$HERD_DIR/config/valet"; }
+herd_installed() { [ -f "$(herd_valet)/config.json" ]; }
+
+herd_tld() {
+  local t=""
+  if herd_installed; then t="$(json_get tld <"$(herd_valet)/config.json" 2>/dev/null || true)"; fi
+  printf '%s' "${t:-test}"
+}
+
+# Herd's parked folders, one per line. jq ships with macOS 15 and later;
+# before that, a plain read of config.json's "paths" list.
+herd_paths() {
+  local f
+  f="$(herd_valet)/config.json"
+  [ -f "$f" ] || return 0
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.paths[]? | strings' "$f" 2>/dev/null || true
+  else
+    tr -d '\n' <"$f" | sed -n 's/.*"paths"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p' | tr ',' '\n' \
+      | sed -n 's/^[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' | sed 's#\\/#/#g' || true
+  fi
+}
+
+# Herd's sites: "name|folder|linked or parked", one per line. A link wins
+# over a parked folder with the same name, as in Herd.
+herd_sites() {
+  local p d
+  {
+    for p in "$(herd_valet)/Sites"/*; do
+      [ -e "$p" ] || continue
+      printf '%s|%s|linked\n' "$(lower "${p##*/}")" "$(cd "$p" 2>/dev/null && pwd -P || echo "$p")"
+    done
+    while IFS= read -r d; do
+      [ -n "$d" ] && [ -d "$d" ] || continue
+      for p in "$d"/*/; do
+        [ -d "$p" ] || continue
+        p="${p%/}"
+        printf '%s|%s|parked\n' "$(lower "${p##*/}")" "$p"
+      done
+    done <<EOF
+$(herd_paths)
+EOF
+  } | awk -F'|' '!seen[$1]++'
+}
+
+# Secured in Herd (herd secure): it has a certificate from Herd's CA
+herd_secured() { [ -f "$(herd_valet)/Certificates/$1.$(herd_tld).crt" ]; }
+
+# The Herd site a folder is in: the deepest site folder that contains it
+herd_site_from_dir() {
+  local dir name path kind best="" len=0
+  dir="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  while IFS='|' read -r name path kind; do
+    [ -n "$name" ] || continue
+    path="$(cd "$path" 2>/dev/null && pwd -P)" || continue
+    case "$dir/" in
+      "$path/"*) if [ "${#path}" -gt "$len" ]; then best="$name"; len="${#path}"; fi ;;
+    esac
+  done <<EOF
+$(herd_sites)
+EOF
+  [ -n "$best" ] || return 1
+  echo "$best"
+}
+
+# Something (other than Caddy) listening on every address on port 80 or 443,
+# like Herd's nginx changed to serve the LAN: then Caddy can't have the
+# Tailscale address's ports
+herd_ports_everywhere() {
+  is_macos || return 1
+  lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null \
+    | awk '$1 != "caddy" && ($9 ~ /^\*:(80|443)$/ || $9 ~ /^\[::\]:(80|443)$/) {print $1 " on " $9}' | sort -u | grep .
+}
+
+# Commands that are Herd's job with VHOSTY_BACKEND=herd
+herd_refuse() {
+  local alt
+  case "$1" in
+    park) alt="herd park" ;;
+    unpark) alt="herd forget" ;;
+    parked) alt="herd parked" ;;
+    link) alt="herd link" ;;
+    unlink) alt="herd unlink" ;;
+    links) alt="herd links" ;;
+    site|info) alt="vhosty sites, or herd links" ;;
+    isolate) alt="herd isolate" ;;
+    unisolate) alt="herd unisolate" ;;
+    isolated) alt="herd isolated" ;;
+    php) alt="herd use, or Herd's PHP settings" ;;
+    ini|ext|exts|extension|extensions) alt="Herd's PHP settings" ;;
+    *) return 0 ;;
+  esac
+  die "Herd serves the sites on this machine (VHOSTY_BACKEND=herd), so this is Herd's job. Use: $alt"
+}
+
+# Herd: <name>.domain → <name>.test, served by Herd's nginx on localhost.
+# Herd redirects a secured site from http:// to https://, so those go to 443.
+# Their certificate is from Herd's own CA, which there's no need to check on
+# a hop that stays on this machine. Caddy sends X-Forwarded-Host and -Proto,
+# which an app that trusts the proxy uses for its URLs.
+herd_routes() { # herd_routes DEPTH
+  local l="{labels.$1}" tld
+  tld="$(herd_tld)"
+  cat <<EOF
+
+	# Herd ($HERD_DIR): <name>.$VHOSTY_DOMAIN → <name>.$tld
+	@herd_secured file {
+		root "$(herd_valet)/Certificates"
+		try_files $l.$tld.crt
+	}
+	handle @herd_secured {
+		vars {
+			vhosty_kind herd
+			vhosty_herd_tld $tld
+		}
+		reverse_proxy https://$HERD_HTTPS {
+			header_up Host $l.$tld
+			transport http {
+				tls_server_name $l.$tld
+				tls_insecure_skip_verify
+			}
+		}
+	}
+
+	handle {
+		vars {
+			vhosty_kind herd
+			vhosty_herd_tld $tld
+		}
+		reverse_proxy http://$HERD_HTTP {
+			header_up Host $l.$tld
+		}
+	}
+EOF
+}
+
+herd_list_sites() {
+  local name path kind tld note any=0
+  tld="$(herd_tld)"
+  head_ "Herd sites (<name>.$tld)"
+  while IFS='|' read -r name path kind; do
+    [ -n "$name" ] || continue
+    path="$(printf '%s' "$path" | sed "s#^$VHOSTY_HOME_DIR/#~/#")"
+    case "$name" in
+      *.*) info "$name (has a dot: *.$VHOSTY_DOMAIN only covers one level)"; continue ;;
+    esac
+    if printf '%s' "$name" | grep -qE '^[0-9]+$'; then
+      info "$name (a number: https://$name.$VHOSTY_DOMAIN is the port route)"; continue
+    fi
+    any=1
+    note="$kind"; herd_secured "$name" || note="$note, not secured"
+    printf "  https://%s.%s  %s(%s) %s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$note" "$path" "$N"
+  done <<EOF
+$(herd_sites)
+EOF
+  [ "$any" = "1" ] || info "No Herd sites yet. Add some with: herd park <folder>, or herd link"
+  echo
+}
+
+herd_checks() {
+  local code n o
+  if herd_installed; then ok "Herd's config: $(herd_valet)"
+  else bad "Herd isn't set up ($(herd_valet)/config.json not found). Install Herd, or open it once"; fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 "http://$HERD_HTTP/" 2>/dev/null || true)"
+  if [ -n "$code" ] && [ "$code" != "000" ]; then ok "Herd's web server answers on $HERD_HTTP"
+  else bad "Herd's web server isn't answering on $HERD_HTTP. Open Herd, or run: herd restart"; fi
+  if o="$(herd_ports_everywhere)"; then
+    bad "listening on every address: $(printf '%s' "$o" | tr '\n' ',' | sed 's/,$//; s/,/, /g'). Caddy needs ports 80 and 443 on the Tailscale address; Herd's nginx should listen on 127.0.0.1 only"
+  fi
+  n="$(herd_sites | grep -c . || true)"
+  ok "$n Herd site$([ "$n" = 1 ] || echo s), as <name>.$(herd_tld) (vhosty sites lists them)"
 }
 
 # ---------------------------------------------------------------------------
@@ -902,6 +1088,57 @@ EOF
   done
 }
 
+# Parked folders: PHP (public/index.php) or static (index.html), then the
+# "no site" page for everything else
+caddy_parked() { # caddy_parked PHP_VERSION DEPTH
+  local v="$1" depth="$2" dir i=0
+  while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    if php_enabled && [ -n "$v" ]; then
+      cat <<EOF
+
+	# Parked: $dir (PHP $v, e.g. Laravel)
+	@php$i file {
+		root "$dir/{labels.$depth}/public"
+		try_files index.php
+	}
+	handle @php$i {
+		vars {
+			vhosty_kind php
+			vhosty_php $v
+		}
+		root * "$dir/{labels.$depth}/public"
+		php_fastcgi "unix/$(fpm_sock "$v")"
+		file_server
+	}
+EOF
+    fi
+    cat <<EOF
+
+	# Parked: $dir (static: index.html at the folder root)
+	@static$i file {
+		root "$dir/{labels.$depth}"
+		try_files index.html
+	}
+	handle @static$i {
+		root * "$dir/{labels.$depth}"
+$(static_hide "dot$i")
+		file_server
+	}
+EOF
+    i=$((i + 1))
+  done <<EOF
+$(parked_list)
+EOF
+  cat <<EOF
+
+	handle {
+		vars vhosty_kind nosite
+		error "vhosty: no site found for {host}" 404
+	}
+EOF
+}
+
 # A Caddy expression: true when the subdomain label $1 is a port in
 # VHOSTY_PORTS ("3000-5999 6006"). It reads the label itself rather than
 # the header_regexp capture, since matchers in one set run in no fixed order.
@@ -928,21 +1165,29 @@ check_ports() {
 }
 
 write_caddyfile() {
-  local depth i=0 dir v ip bind name sites="" cased
+  local depth dir v ip bind name sites="" cased=""
   check_ports
   dns_provider
   mkdir -p "$RUN_DIR"   # for the admin socket
   depth="$(domain_depth)"
   v="$(php_default)"
   # Configured sites whose folder exists, for the "no site found" page
-  cased="$(case_sites)"   # once: it globs every parked folder
-  for name in $(site_names) $cased; do
-    dir="$(site_dir "$name" || true)"
-    [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
-  done
+  if ! herd_mode; then
+    cased="$(case_sites)"   # once: it globs every parked folder
+    for name in $(site_names) $cased; do
+      dir="$(site_dir "$name" || true)"
+      [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
+    done
+  fi
   # Listen on the Tailscale address (and localhost) only, not the LAN
   ip="$(ts_ip)"
-  bind="127.0.0.1 ::1"; [ -z "$ip" ] || bind="$ip $bind"
+  if herd_mode; then
+    # Herd's nginx has localhost's ports 80 and 443, so only the tailnet
+    [ -n "$ip" ] || die "Tailscale isn't running. With Herd, vhosty listens on the Tailscale address only (Herd has localhost)"
+    bind="$ip"
+  else
+    bind="127.0.0.1 ::1"; [ -z "$ip" ] || bind="$ip $bind"
+  fi
   {
     cat <<EOF
 # Generated by vhosty. Don't edit: change ~/.vhosty/config, then run \`vhosty rebuild\`.
@@ -984,51 +1229,13 @@ EOF
 		error "vhosty: port not open to the tailnet" 403
 	}
 EOF
-    caddy_sites "$cased"
-    while IFS= read -r dir; do
-      [ -n "$dir" ] || continue
-      if php_enabled && [ -n "$v" ]; then
-        cat <<EOF
-
-	# Parked: $dir (PHP $v, e.g. Laravel)
-	@php$i file {
-		root "$dir/{labels.$depth}/public"
-		try_files index.php
-	}
-	handle @php$i {
-		vars {
-			vhosty_kind php
-			vhosty_php $v
-		}
-		root * "$dir/{labels.$depth}/public"
-		php_fastcgi "unix/$(fpm_sock "$v")"
-		file_server
-	}
-EOF
-      fi
-      cat <<EOF
-
-	# Parked: $dir (static: index.html at the folder root)
-	@static$i file {
-		root "$dir/{labels.$depth}"
-		try_files index.html
-	}
-	handle @static$i {
-		root * "$dir/{labels.$depth}"
-$(static_hide "dot$i")
-		file_server
-	}
-EOF
-      i=$((i + 1))
-    done <<EOF
-$(parked_list)
-EOF
+    if herd_mode; then
+      herd_routes "$depth"
+    else
+      caddy_sites "$cased"
+      caddy_parked "$v" "$depth"
+    fi
     cat <<EOF
-
-	handle {
-		vars vhosty_kind nosite
-		error "vhosty: no site found for {host}" 404
-	}
 
 	# vhosty's own error pages: no site, and PHP or a dev server not answering.
 	# Errors from inside a site (Laravel's 500s, missing assets) pass through.
@@ -1215,6 +1422,11 @@ summary { cursor: pointer; }
 <h1>Nothing is running on port {{html $label}}</h1>
 <p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $label}}</code>, but nothing answered there.</p>
 <p>Start the dev server for port {{html $label}}. It has to listen on <code>localhost</code>, which Vite, Next.js and <code>artisan serve</code> do by default.</p>
+{{- else if and (eq $kind "herd") (ne $status "504")}}
+<h1>Herd isn't answering</h1>
+<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to Herd on this machine, as <code>{{html $label}}.{{html (placeholder "http.vars.vhosty_herd_tld")}}</code>, but Herd's web server didn't answer.</p>
+<p>Open Herd, or restart it:</p>
+<pre>herd restart</pre>
 {{- else if and (eq $kind "php") (ne $status "504")}}
 <h1>PHP {{html $php}} isn't answering</h1>
 <p class="muted">Caddy couldn't reach PHP-FPM for <strong>{{html .Host}}</strong>.</p>
@@ -1638,7 +1850,7 @@ drift_reason() {
     return 0
   fi
   ip="$(ts_ip)"
-  if [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qF "default_bind $ip " "$CADDYFILE"; then
+  if [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qE "default_bind ${ip//./\\.}( |\$)" "$CADDYFILE"; then
     echo "this machine's Tailscale address changed (now $ip)"
     return 0
   fi
@@ -1651,7 +1863,7 @@ config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(g
 # Commands: setup
 # ---------------------------------------------------------------------------
 cmd_setup() {
-  local domain="" token="" park="" php="" dns="" yes=0 ip o v
+  local domain="" token="" park="" php="" dns="" backend="" yes=0 ip o v
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) domain="$2"; shift 2 ;;
@@ -1660,9 +1872,11 @@ cmd_setup() {
       --dns)    dns="$2"; shift 2 ;;
       --no-php) php="off"; shift ;;
       --php)    php="on"; shift ;;
+      --herd)   backend="herd"; shift ;;
+      --no-herd) backend="vhosty"; shift ;;
       -y|--yes) yes=1; shift ;;
       --overwrite-dns) export VHOSTY_OVERWRITE_DNS=1; shift ;;
-      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
+      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--herd|--no-herd] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
     esac
   done
   [ "$yes" = "1" ] && export VHOSTY_YES=1
@@ -1680,11 +1894,29 @@ cmd_setup() {
     sbin_cmd setcap >/dev/null || die "vhosty needs setcap: sudo apt install libcap2-bin"
     command -v systemctl >/dev/null 2>&1 || die "vhosty on Linux needs systemd"
   fi
-  o="$(port_owner 443)"
-  if [ -n "$o" ] && [ "$o" != "caddy" ]; then
-    warn "port 443 is in use by: $o"
-    warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."
-    confirm "Continue anyway?" N || exit 1
+  if [ -n "$backend" ]; then
+    VHOSTY_BACKEND="$backend"
+  elif is_macos && herd_installed && ! herd_mode; then
+    info "Laravel Herd is installed. vhosty can stay out of its way: Herd keeps serving"
+    info "your sites, and vhosty makes each one https://<name>.<domain> on your tailnet."
+    info "(The alternative is to quit Herd and let vhosty serve the folders itself.)"
+    if confirm "Use Herd for the sites?" Y; then VHOSTY_BACKEND="herd"; else VHOSTY_BACKEND="vhosty"; fi
+  fi
+  if herd_mode; then
+    is_macos || die "--herd is for macOS, where Laravel Herd runs"
+    herd_installed || die "Herd isn't set up here ($(herd_valet)/config.json not found). Install Herd and open it once: https://herd.laravel.com"
+    ok "Herd: sites are <name>.$(herd_tld) (Caddy forwards <name>.<domain> to them)"
+    if o="$(herd_ports_everywhere)"; then
+      die "Listening on every address: $(printf '%s' "$o" | tr '\n' ' '). Caddy needs ports 80 and 443 on the Tailscale address, so Herd's nginx has to listen on 127.0.0.1 only."
+    fi
+  else
+    o="$(port_owner 443)"
+    if [ -n "$o" ] && [ "$o" != "caddy" ]; then
+      warn "port 443 is in use by: $o"
+      warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."
+      warn "(Herd on a Mac? vhosty setup --herd keeps it and forwards to it.)"
+      confirm "Continue anyway?" N || exit 1
+    fi
   fi
   migrate_config
   migrate_php_fpm
@@ -1725,34 +1957,37 @@ cmd_setup() {
     dns_credentials
   fi
 
-  step "Parked folders"
-  info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
-  [ -n "$park" ] || park="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
-  park="$(expand_tilde "$park")"
-  check_folder "$park" parked
-  [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
-  park="$(cd "$park" && pwd)"
-  case ":$VHOSTY_PARKED:" in
-    *":$park:"*) ;;
-    *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
-  esac
-  parked_list | while IFS= read -r o; do ok "parked $o"; done
+  # With Herd, Herd has the folders and PHP
+  if ! herd_mode; then
+    step "Parked folders"
+    info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
+    [ -n "$park" ] || park="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
+    park="$(expand_tilde "$park")"
+    check_folder "$park" parked
+    [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
+    park="$(cd "$park" && pwd)"
+    case ":$VHOSTY_PARKED:" in
+      *":$park:"*) ;;
+      *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
+    esac
+    parked_list | while IFS= read -r o; do ok "parked $o"; done
 
-  step "PHP"
-  if [ -z "$php" ]; then
-    if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
-  fi
-  VHOSTY_PHP="$php"
-  if php_enabled; then
-    v="$(php_default)"
-    [ -n "$v" ] || v="$(php_cli_minor)"
-    php_is_installed "${v:-none}" || install_php_fpm "$v"
-    v="$(php_default)"
-    [ -n "$v" ] || die "No PHP-FPM found"
-    VHOSTY_PHP_DEFAULT="$v"
-    ok "default PHP: $v ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') installed)"
-    write_default_php_ini
-    info "PHP settings for every site: $PHP_INI"
+    step "PHP"
+    if [ -z "$php" ]; then
+      if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
+    fi
+    VHOSTY_PHP="$php"
+    if php_enabled; then
+      v="$(php_default)"
+      [ -n "$v" ] || v="$(php_cli_minor)"
+      php_is_installed "${v:-none}" || install_php_fpm "$v"
+      v="$(php_default)"
+      [ -n "$v" ] || die "No PHP-FPM found"
+      VHOSTY_PHP_DEFAULT="$v"
+      ok "default PHP: $v ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') installed)"
+      write_default_php_ini
+      info "PHP settings for every site: $PHP_INI"
+    fi
   fi
   save_config
 
@@ -1792,7 +2027,12 @@ cmd_setup() {
   done
   [ $n -lt 45 ] || warn "no certificate yet. Check: vhosty logs caddy"
 
-  printf "\n%sDone.%s Folders in %s are live at https://<folder>.%s\n" "$G" "$N" "$park" "$VHOSTY_DOMAIN"
+  if herd_mode; then
+    printf "\n%sDone.%s Herd's sites are live at https://<name>.%s (see: vhosty sites)\n" "$G" "$N" "$VHOSTY_DOMAIN"
+    printf "For links and redirects on that address, Laravel has to trust the proxy (see the README).\n"
+  else
+    printf "\n%sDone.%s Folders in %s are live at https://<folder>.%s\n" "$G" "$N" "$park" "$VHOSTY_DOMAIN"
+  fi
   printf "Dev servers on a port are at https://<port>.%s (e.g. 5173 for Vite).\n" "$VHOSTY_DOMAIN"
   printf "Run %svhosty doctor%s any time to check everything.\n" "$B" "$N"
 }
@@ -3294,6 +3534,7 @@ cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
 # ---------------------------------------------------------------------------
 cmd_sites() {
   need_config
+  if herd_mode; then herd_list_sites; return 0; fi
   local dir p name lname note linked
   linked="$(cmd_links 2>/dev/null | grep https || true)"
   [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
@@ -3333,6 +3574,7 @@ site_url() { # site_url [site|port]: with none, the site of the current folder
   need_config
   local name
   if [ -n "${1:-}" ]; then name="$(lower "$1")"
+  elif herd_mode; then name="$(herd_site_from_dir "$PWD")" || die "$PWD isn't inside a Herd site. Pass a site name or a port."
   else name="$(site_from_dir "$PWD")" || die "$PWD isn't inside a site. Pass a site name or a port."; fi
   echo "https://$name.$VHOSTY_DOMAIN"
 }
@@ -3386,7 +3628,7 @@ cmd_edit() {
   need_config
   case "${1:-config}" in
     config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
-    php|ini|php.ini) cmd_ini_edit --global ;;
+    php|ini|php.ini) herd_refuse ini; cmd_ini_edit --global ;;
     env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; svc_restart caddy; ok "restarted caddy" ;;
     *) die "Unknown file '$1' (use config, php, or env)" ;;
   esac
@@ -3553,6 +3795,7 @@ cmd_update() {
     caddy) need_config; install_caddy ;;
     php|php-fpm)
       need_config
+      ! herd_mode || die "Herd manages PHP here. Update it in Herd."
       php_enabled || die "PHP is turned off"
       is_macos || die "On Linux, PHP comes from apt: sudo apt update && sudo apt upgrade"
       install_php_fpm "${1:-$(php_default)}" ;;
@@ -3806,6 +4049,11 @@ doctor_checks() {
   cmd_validate caddy || true
   cmd_cert || true
 
+  if herd_mode; then
+    head_ "Herd"
+    herd_checks
+  fi
+
   if php_enabled; then
     head_ "PHP"
     for v in $(php_versions_in_use); do
@@ -3924,10 +4172,11 @@ usage() {
 ${B}vhosty${N} $VHOSTY_VERSION: Herd for your tailnet
 
 ${B}Setup${N}
-  vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--yes] [--overwrite-dns]
+  vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--herd] [--yes] [--overwrite-dns]
                                      PROVIDER: cloudflare (default), digitalocean, porkbun, route53,
                                      custom. Credentials from the environment (CF_API_TOKEN=...),
-                                     saved, or asked for
+                                     saved, or asked for. --herd (macOS): keep Laravel Herd serving
+                                     the sites, and forward <name>.domain to <name>.test
   vhosty uninstall                   Remove the services (keeps your files)
 
 ${B}Sites${N}
@@ -4007,6 +4256,7 @@ main() {
   local cmd="${1:-help}"
   if [ $# -gt 0 ]; then shift; fi
   load_config
+  if herd_mode; then herd_refuse "$cmd"; fi
 
   case "$cmd" in
     setup)              cmd_setup "$@" ;;

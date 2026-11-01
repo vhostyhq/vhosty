@@ -38,7 +38,7 @@ your phone ──tailnet──▶ dev box (100.x.y.z)
 - **[Tailscale](https://tailscale.com/download)** on this machine and on every device you'll browse from.
 - **A domain whose DNS is on [Cloudflare](https://cloudflare.com)**, or on another provider vhosty supports (see [DNS providers](#dns-providers)). It can be one you own or a new one, and it doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
 - **An API token for it.** For Cloudflare: *Zone → Read* and *DNS → Edit* for that domain, created at dash.cloudflare.com → My Profile → API Tokens with the "Edit zone DNS" template.
-- **Ports 80 and 443 free.** Herd, Valet, nginx and Apache use them, so stop those first.
+- **Ports 80 and 443 free.** Herd, Valet, nginx and Apache use them, so stop those first. Using Herd on a Mac? vhosty can keep it instead: see [With Laravel Herd](#with-laravel-herd-macos).
 
 **Linux** (tested on Ubuntu 26.04): systemd, `curl`, `jq`, and PHP from apt. Ubuntu
 ships one PHP version; for several side by side, add Ondřej Surý's repo
@@ -133,6 +133,40 @@ in (see [PHP versions](#php-versions)), and turn on tab completion (zsh):
 export PATH="$HOME/.vhosty/bin:$PATH"
 fpath=(~/.vhosty/completions $fpath)   # before compinit
 ```
+
+## With Laravel Herd (macOS)
+
+If you use [Laravel Herd](https://herd.laravel.com), vhosty can leave it in charge.
+Herd keeps serving your sites (its PHP versions, extensions, parked folders and
+links, `herd secure`), and vhosty makes each one reachable on your tailnet:
+
+```
+escrow.test (Herd, on the Mac)  →  https://escrow.yourdomain.dev (any tailnet device)
+```
+
+```bash
+vhosty setup --herd
+```
+
+Setup offers this on its own when it finds Herd. vhosty's Caddy then listens on the
+Tailscale address only, so it doesn't collide with Herd's nginx on localhost, and
+forwards `<name>.yourdomain.dev` to Herd as `<name>.test` (Herd's TLD, read from its
+config). A site you add in Herd works right away; `vhosty sites` lists them.
+
+Laravel builds links and redirects from the host it sees, which is `escrow.test`.
+For it to use the tailnet address instead, trust the proxy so it reads Caddy's
+`X-Forwarded-Host` and `X-Forwarded-Proto`. In `bootstrap/app.php`:
+
+```php
+->withMiddleware(function (Middleware $middleware) {
+    $middleware->trustProxies(at: ['127.0.0.1', '::1']);
+})
+```
+
+Port sites (`https://5173.yourdomain.dev`) and `vhosty services` work as usual.
+The PHP commands (`php`, `isolate`, `ini`, `ext`) and `park`/`link` point you to
+Herd's own. Herd's nginx has to listen on 127.0.0.1 only, as it does unless you
+changed it; `vhosty doctor` checks that, and that Herd is answering.
 
 ## Updating
 

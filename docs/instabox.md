@@ -19,12 +19,16 @@ curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/scripts/instab
   | bash -s -- --name alice --domain alice.example.com --services mysql,valkey
 ```
 
+Turn on [Tailscale Serve](https://tailscale.com/kb/1312/serve) for your tailnet first
+(once, in the admin console): vhosty puts Caddy behind it, and setup runs
+unattended here, so it can't stop to show you the link.
+
 It asks for anything it doesn't have, then:
 
 1. creates the machine `alice`: always on, 8 vCPU / 16 GB and a 100 GB disk, where your plan allows,
 2. hands it your tokens through the instabox CLI (never on a command line; the box deletes them once read),
 3. runs [`box-setup.sh`](../scripts/box-setup.sh) on it, which:
-   - installs what vhosty needs that the image lacks (`setcap`),
+   - installs the packages vhosty needs (`curl`, `jq`, `git`),
    - moves Docker's images and volumes to `/data`, the big disk (the root disk is 16 GB),
    - installs Tailscale and joins your tailnet as `alice`,
    - installs vhosty (the latest release) and PHP (8.4 from Debian),

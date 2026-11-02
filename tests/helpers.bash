@@ -40,8 +40,13 @@ EOF
 # vh FUNCTION [ARGS...]: runs one of bin/vhosty's functions in a fresh bash
 # with the script's own options (set -euo pipefail) and the scratch config
 vh() {
-  VHOSTY_SRC="$ROOT/bin/vhosty" "${VHOSTY_TEST_BASH:-bash}" -c 'source "$VHOSTY_SRC"; trap cleanup_tmp EXIT; load_config; "$@"' vh "$@"
+  VHOSTY_SRC="$ROOT/bin/vhosty" "${VHOSTY_TEST_BASH:-bash}" -c 'source "$VHOSTY_SRC"; PLATFORM="${VHOSTY_TEST_PLATFORM:-$PLATFORM}"; trap cleanup_tmp EXIT; load_config; "$@"' vh "$@"
 }
+
+# linux / mac FUNCTION [ARGS...]: like vh, as if on that platform, whichever
+# one the tests run on (CI runs them on both)
+linux() { VHOSTY_TEST_PLATFORM=linux vh "$@"; }
+mac() { VHOSTY_TEST_PLATFORM=macos vh "$@"; }
 
 # site_conf NAME 'KEY=value lines': writes ~/.vhosty/sites/NAME.conf
 site_conf() {

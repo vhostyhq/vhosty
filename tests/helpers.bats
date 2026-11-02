@@ -37,14 +37,6 @@ load helpers
   [ "$output" = "$(printf 'a=3\nb=2')" ]
 }
 
-@test "sbin_cmd finds tools in /usr/sbin when they aren't on the PATH" {
-  [ -x /usr/sbin/getcap ] || [ -x /sbin/getcap ] || skip "no getcap on this machine"
-  run env PATH="$HOME/stubs:/usr/bin:/bin" bash -c "source '$ROOT/bin/vhosty'; sbin_cmd getcap"
-  [ "$status" -eq 0 ]
-  case "$output" in /usr/sbin/getcap|/sbin/getcap) ;; *) false ;; esac
-  run vh sbin_cmd no-such-tool-here
-  [ "$status" -ne 0 ]
-}
 
 @test "resolve_a uses dig when it's installed" {
   stub dig 'echo 100.64.0.7'

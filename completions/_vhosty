@@ -38,12 +38,12 @@ _vhosty_links() {
   (( ${#links} )) && _values 'link' $links
 }
 
-# Installed PHP versions (apt on Linux, static builds on macOS)
+# Installed PHP versions: apt on Linux; on macOS, the php-X.Y links vhosty
+# keeps to Homebrew's, and old static builds
 _vhosty_php_versions() {
   local -a versions
-  versions=( /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) )
-  versions=( ${versions#php-fpm} ); versions=( ${versions#-} )
-  (( ${#versions} )) && _values 'version' $versions
+  versions=( ${(f)"$(_vhosty_php_versions_raw)"} )
+  (( ${#versions} )) && _values 'version' ${(u)versions}
 }
 
 _vhosty_services() {
@@ -52,7 +52,8 @@ _vhosty_services() {
   _values 'service' $svcs
 }
 _vhosty_php_versions_raw() {
-  print -l /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) | sed 's/^php-fpm-*//'
+  print -l /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) "$(_vhosty_dir)"/bin/php-[0-9]*(N:t) \
+    | sed 's/^php-fpm-*//; s/^php-//' | sort -u
 }
 
 _vhosty_docker_services() {
@@ -93,7 +94,7 @@ _vhosty() {
     'edit:Edit settings, PHP settings, or the token'
     'rebuild:Regenerate config and reload'
     'dns:Point *.domain at this machine'
-    'update:Update vhosty, Caddy, and PHP-FPM on macOS'
+    'update:Update vhosty, Caddy, and PHP'
     'validate:Check the generated config'
     'cert:Show the wildcard certificate'
     'doctor:Check everything end to end (--fix repairs)'
@@ -169,7 +170,7 @@ _vhosty() {
       fi ;;
     doctor|dr)     _values 'option' --fix --yes ;;
     prune)         _values 'option' --yes ;;
-    setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token (CF_API_TOKEN is safer)]:token:' '--dns[DNS provider]:provider:(cloudflare digitalocean porkbun route53 custom)' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--yes[Accept defaults]' '--overwrite-dns[Replace a *.domain record that is not vhosty'"'"'s]' ;;
+    setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token (CF_API_TOKEN is safer)]:token:' '--dns[DNS provider]:provider:(cloudflare digitalocean porkbun route53 custom)' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--herd[Keep Laravel Herd serving the sites (macOS)]' '--no-herd[Serve the folders with vhosty, not Herd]' '--yes[Accept defaults]' '--overwrite-dns[Replace a *.domain record that is not vhosty'"'"'s]' ;;
   esac
 }
 

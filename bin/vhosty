@@ -1486,6 +1486,11 @@ EOF
 $(printf '%s\n' "$DNS_TLS" | sed 's/^/		/')
 	}
 
+	# Compress text (HTML, JS, CSS, JSON) on its way over the tailnet. Vite's dev
+	# server sends its modules uncompressed, about 5x the bytes. Responses that
+	# are already compressed pass through as they are.
+	encode zstd gzip
+
 EOF
     if [ -n "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ]; then
       cat <<EOF

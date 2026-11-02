@@ -53,6 +53,18 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   assert_contains "$output" "<h1>hi</h1>"
 }
 
+@test "text is compressed for clients that accept it, and not for those that don't" {
+  static_site hello
+  printf 'body { color: red; }\n%.0s' $(seq 1 200) >"$PARKED/hello/app.css"
+  start_caddy
+  run curl -s -o /dev/null -D - -H "Host: hello.test.example" -H "Accept-Encoding: zstd, gzip" "http://127.0.0.1:$PORT/app.css"
+  assert_contains "$output" "Content-Encoding: zstd"
+  run curl -s -o /dev/null -D - -H "Host: hello.test.example" -H "Accept-Encoding: gzip" "http://127.0.0.1:$PORT/app.css"
+  assert_contains "$output" "Content-Encoding: gzip"
+  run curl -s -o /dev/null -D - -H "Host: hello.test.example" "http://127.0.0.1:$PORT/app.css"
+  refute_contains "$output" "Content-Encoding"
+}
+
 @test "a name with no site gets the 404 page, listing the sites that work" {
   static_site hello
   static_site other

@@ -280,3 +280,71 @@ VHOSTY_SERVE_HTTP_PORT="49080"'
   mac serve_allow_user
   [ ! -f "$HOME/sudo.log" ]
 }
+
+# --- Serve not set up yet, on an older Linux install ------------------------------
+
+# Serve not enabled on the tailnet; Caddy with the port capability older vhosty gave it
+serve_disabled() {
+  stub tailscale 'case "$*" in ip*) echo 100.64.0.7 ;; "serve status --json") echo "{}" ;; "debug prefs") echo "{\"OperatorUser\": \"$USER\"}" ;; *) echo "Serve is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/serve" >&2; exit 1 ;; esac'
+  stub getcap 'echo "$1 cap_net_bind_service=ep"'
+}
+
+# rebuild with services installed, their management stubbed out
+rebuild() {
+  $1 eval 'svc_installed() { :; }; cmd_validate() { :; }; svc_sync() { :; }; svc_apply() { echo applied; }; cmd_rebuild'
+}
+
+@test "older Linux install: Serve not set up puts Caddy back on the Tailscale address, and says why" {
+  serve_disabled
+  run rebuild linux
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_contains "$output" "Serve is not enabled on your tailnet"
+  assert_contains "$output" "The sites still work"
+  [ -f "$VHOSTY_DIR/serve-fallback" ]
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"
+  refute_contains "$caddyfile" "https_port"
+  refute_contains "$caddyfile" "proxy_protocol"
+  refute_contains "$caddyfile" "http://*."
+  # status and doctor say so
+  assert_contains "$(linux serve_check)" "Caddy is still on this machine's Tailscale address"
+  # and a site change keeps it there
+  linux write_configs
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "default_bind 100.64.0.7 127.0.0.1 ::1"
+}
+
+@test "once Serve can be set up, rebuild moves Caddy behind it and drops the fallback" {
+  serve_disabled
+  rebuild linux >/dev/null
+  [ -f "$VHOSTY_DIR/serve-fallback" ]
+  serve_stub
+  stub getcap 'echo "$1 cap_net_bind_service=ep"'
+  run rebuild linux
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -f "$VHOSTY_DIR/serve-fallback" ]
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "default_bind 127.0.0.1"
+  serve_has "443 127.0.0.1:48443 2" "80 127.0.0.1:48080 2"
+}
+
+@test "without the port capability, or on a Mac, Serve not set up stops rebuild" {
+  serve_disabled
+  stub getcap 'echo "$1"'
+  run rebuild linux
+  [ "$status" -ne 0 ]
+  [ ! -f "$VHOSTY_DIR/serve-fallback" ]
+  serve_disabled
+  run rebuild mac
+  [ "$status" -ne 0 ]
+  [ ! -f "$VHOSTY_DIR/serve-fallback" ]
+}
+
+@test "the fallback Caddyfile is valid, and its address change shows as drift" {
+  serve_disabled
+  rebuild linux >/dev/null
+  if [ -x "$CADDY" ]; then
+    CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
+    [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  fi
+  stub tailscale 'case "$1" in ip) echo 100.64.0.99 ;; esac'
+  [ "$(linux drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
+}

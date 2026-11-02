@@ -561,10 +561,14 @@ serve_on() {
       else "$t" serve --http="$p" off >/dev/null 2>&1 || true; fi
       "$t" serve --tcp="$p" off >/dev/null 2>&1 || true
     fi
-    out="$("$t" serve --bg --tcp="$p" --proxy-protocol=2 "tcp://127.0.0.1:$to" 2>&1)" \
-      || die "Tailscale Serve didn't take port $p: $out
+    if ! out="$("$t" serve --bg --tcp="$p" --proxy-protocol=2 "tcp://127.0.0.1:$to" 2>&1)"; then
+      case "$out" in
+        *"not defined"*proxy-protocol*) die "This Tailscale is too old for vhosty (its serve has no --proxy-protocol). Update Tailscale, then run: vhosty rebuild" ;;
+      esac
+      die "Tailscale Serve didn't take port $p: $out
 If Serve isn't enabled on your tailnet, the message above has the link to enable it.$(is_linux && printf '\nIf it says access denied, let your account manage Tailscale: sudo tailscale set --operator=%s' "$VHOSTY_USER")
 Then run: vhosty rebuild"
+    fi
   done
   serve_ok || die "Tailscale Serve didn't take ports 443 and 80 (tailscale serve status). Free them (tailscale serve reset), then run: vhosty rebuild"
 }

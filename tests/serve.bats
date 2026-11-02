@@ -242,6 +242,15 @@ VHOSTY_SERVE_HTTP_PORT="49080"'
   done
 }
 
+@test "a Tailscale without --proxy-protocol says to update it" {
+  stub tailscale 'case "$*" in ip*) echo 100.64.0.7 ;; "serve status --json") echo "{}" ;; *) echo "flag provided but not defined: -proxy-protocol" >&2; exit 2 ;; esac'
+  for p in $PLATFORMS; do
+    run $p serve_on
+    [ "$status" -ne 0 ]
+    assert_contains "$output" "Update Tailscale"
+  done
+}
+
 @test "uninstall's Serve cleanup only removes vhosty's forwards, old or new" {
   for p in $PLATFORMS; do
     serve_stub "$T3_ON_443"

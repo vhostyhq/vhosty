@@ -19,6 +19,10 @@ curl -fsSL https://raw.githubusercontent.com/vhostyhq/vhosty/main/scripts/instab
   | bash -s -- --name alice --domain alice.example.com --services mysql,valkey
 ```
 
+Turn on [Tailscale Serve](https://tailscale.com/kb/1312/serve) for your tailnet first
+(once, in the admin console): vhosty puts Caddy behind it, and setup runs
+unattended here, so it can't stop to show you the link.
+
 It asks for anything it doesn't have, then:
 
 1. creates the machine `alice`: always on, 8 vCPU / 16 GB and a 100 GB disk, where your plan allows,

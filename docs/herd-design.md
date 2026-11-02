@@ -11,7 +11,8 @@ Herd's nginx (`tests/herd.bats`), and tried on a Mac with Herd. Three changes fr
   (`tailscale serve --bg --tcp=443 tcp://127.0.0.1:48443`): TLS still ends at Caddy, with the
   wildcard certificate. Setup and `rebuild` set it up, `doctor` checks it, `uninstall` removes
   it. Costs: Serve has to be enabled on the tailnet, no `http://` on the tailnet, and Caddy
-  sees every client as 127.0.0.1. Root Caddy and a pf redirect were the alternatives.
+  sees every client as 127.0.0.1 (both since fixed: port 80 is forwarded, and Serve sends a
+  PROXY header that Caddy reads). Root Caddy and a pf redirect were the alternatives.
   Later the same applied to vhosty's own macOS mode, so the Serve code is now shared by both
   backends, and Serve also forwards the tailnet's port 80 to a redirect on `127.0.0.1:48080`
   ([macos-brew-design.md](macos-brew-design.md)).

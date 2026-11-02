@@ -160,8 +160,8 @@ Effects:
 | | Linux | macOS | |
 |---|---|---|---|
 | Services | systemd user units, no sudo | launchd daemons (sudo to manage) | Only daemons start before login on macOS |
-| Listening | Tailscale IP + localhost, 80/443 | localhost high ports, Serve forwards 80/443 | macOS low-port rule |
-| Client address in PHP | the tailnet device's IP | 127.0.0.1 | Serve's TCP forward. See follow-ups |
+| Listening | localhost high ports, Serve forwards 80/443 | same | *Was:* Linux bound the Tailscale IP's 80/443 (setcap); now the same everywhere |
+| Client address in PHP | the tailnet device's IP | same | Serve's PROXY header (`--proxy-protocol=2`) |
 | Log rotation | `vhosty-logs.timer`, daily | **new:** `link.vhosty.logs`, a launchd daemon running `vhosty logs rotate` daily (was: only when services are set up) | |
 | PHP source | apt | Homebrew | |
 | Herd backend | n/a | `--herd` | Herd is macOS-only |

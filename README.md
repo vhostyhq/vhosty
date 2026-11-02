@@ -5,9 +5,9 @@ domain, reachable from your phone, laptop, or any device on your
 [Tailscale](https://tailscale.com) network.
 
 ```
-~/Sites/escrow   →  https://escrow.yourdomain.dev
-~/Sites/kudos    →  https://kudos.yourdomain.dev
-localhost:5173   →  https://5173.yourdomain.dev
+~/Sites/myspace    →  https://myspace.yourdomain.dev
+~/Sites/geocities  →  https://geocities.yourdomain.dev
+localhost:5173     →  https://5173.yourdomain.dev
 ```
 
 - Real HTTPS: a trusted Let's Encrypt wildcard certificate, with no browser warnings and no local CA to install.
@@ -319,7 +319,7 @@ it for one command. Each version's own CLI is there too: `php8.4` on Linux,
 ```bash
 vhosty ini                                  # global settings, plus the current site's
 vhosty ini set memory_limit -1 --global     # every site, web and CLI
-cd ~/Sites/kudos && vhosty ini set max_execution_time 300   # just this site
+cd ~/Sites/myspace && vhosty ini set max_execution_time 300   # just this site
 vhosty ini set upload_max_filesize 1G --site escrow
 vhosty ini unset max_execution_time
 vhosty ini edit [--global | --site NAME]
@@ -345,7 +345,7 @@ shows up in `vhosty doctor` instead of as a 500:
   the project; they're stored in `~/.vhosty/sites/<name>.conf`.
 
 ```bash
-cd ~/Sites/kudos && vhosty ext require protobuf   # declare (and install if missing)
+cd ~/Sites/myspace && vhosty ext require protobuf # declare (and install if missing)
 vhosty ext                                        # this site: declared and required
 vhosty ext check                                  # every site
 vhosty ext install mongodb --php 8.4              # installs it, restarts that FPM

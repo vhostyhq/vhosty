@@ -2,6 +2,8 @@
   <img src="https://github.com/vhostyhq/.profile/blob/main/profile/vhosty-wordmark.svg" alt="vhosty" width="320">
 </p>
 
+# vhosty cli
+
 **Herd for your tailnet.** Every folder becomes a private HTTPS site on your own
 domain, reachable from your phone, laptop, or any device on your
 [Tailscale](https://tailscale.com) network.

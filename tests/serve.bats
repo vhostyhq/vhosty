@@ -299,7 +299,8 @@ rebuild() {
   run rebuild linux
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_contains "$output" "Serve is not enabled on your tailnet"
-  assert_contains "$output" "The sites still work"
+  assert_contains "$output" "the sites still work"
+  refute_contains "$output" "error:"
   [ -f "$VHOSTY_DIR/serve-fallback" ]
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"

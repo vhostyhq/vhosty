@@ -626,18 +626,27 @@ caddy_can_bind() { # Caddy may listen below 1024 (setcap, from older vhosty)
 # Turns Serve on, after Caddy has moved behind it. If it can't, and Caddy can
 # still listen on 443 itself, Caddy goes back there so the sites stay up.
 serve_on_or_fallback() {
-  local rc
+  local rc errf l
+  make_tmp errf
   set +e
-  ( set -e; serve_on )
+  ( set -e; serve_on ) 2>"$errf"   # its questions go to the terminal, not here
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || return 0
-  is_linux && caddy_can_bind && [ -n "$(ts_ip)" ] || exit "$rc"
+  if [ "$rc" -eq 0 ] || ! { is_linux && caddy_can_bind && [ -n "$(ts_ip)" ]; }; then
+    cat "$errf" >&2
+    [ "$rc" -eq 0 ] || exit "$rc"
+    return 0
+  fi
   : >"$SERVE_FALLBACK"
   write_configs
   svc_apply >/dev/null
-  warn "Tailscale Serve isn't set up (see above), so Caddy is back on this machine's"
-  warn "Tailscale address, as before. The sites still work. Fix what's above, then run: vhosty rebuild"
+  # Not an error: the sites still work, so Serve's message is a warning here
+  while IFS= read -r l; do
+    case "$l" in *error:*) l="${l#*error:}"; l="${l#"$N"}"; l="${l# }" ;; esac
+    warn "$l"
+  done <"$errf"
+  warn "So Caddy is back on this machine's Tailscale address, as before: the sites still work."
+  warn "vhosty moves it behind Tailscale Serve on the next: vhosty rebuild"
 }
 
 serve_check() { # for doctor

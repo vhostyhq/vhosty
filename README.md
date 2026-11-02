@@ -148,7 +148,9 @@ and macOS:
 - The connection stays encrypted end to end with vhosty's certificate; Serve only
   forwards it, and port 80 only redirects to `https://`.
 - Serve tells Caddy which device is asking (a PROXY protocol header), so PHP sees
-  the device's tailnet address in `REMOTE_ADDR`, not 127.0.0.1.
+  the device's tailnet address in `REMOTE_ADDR`, not 127.0.0.1. Laravel needs no
+  `trustProxies` for that, or for https links: PHP-FPM gets both from Caddy
+  directly. (With [Herd](#with-laravel-herd-macos), or a dev server on a port, it does.)
 - Ports 80 and 443 on the machine itself stay free for nginx, Apache, Herd, Valet
   or anything else. (macOS wouldn't let Caddy have the tailnet's 443 anyway: it
   keeps ports below 1024 on one address for root.)
@@ -210,9 +212,11 @@ A site you add in Herd works right away; `vhosty sites` lists them.
 Herd keeps its ports 80 and 443; Caddy listens behind
 [Tailscale Serve](#tailscale-serve), as everywhere.
 
-Laravel builds links and redirects from the host it sees, which is `escrow.test`.
-For it to use the tailnet address instead, trust the proxy so it reads Caddy's
-`X-Forwarded-Host` and `X-Forwarded-Proto`. In `bootstrap/app.php`:
+Herd's nginx stands between Caddy and PHP, so out of the box Laravel sees
+`escrow.test` as the host (for links and redirects) and 127.0.0.1 as the client
+(`$request->ip()`). Trust the proxy, and it reads what Caddy sends instead:
+`X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` with the device's
+tailnet address. In `bootstrap/app.php`:
 
 ```php
 ->withMiddleware(function (Middleware $middleware) {

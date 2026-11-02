@@ -2376,7 +2376,7 @@ cmd_setup() {
 
   if herd_mode; then
     printf "\n%sDone.%s Herd's sites are live at https://<name>.%s (see: vhosty sites)\n" "$G" "$N" "$VHOSTY_DOMAIN"
-    printf "For links and redirects on that address, Laravel has to trust the proxy (see the README).\n"
+    printf "For links, redirects and the client address (\$request->ip()), Laravel has to trust the proxy (see the README).\n"
   else
     printf "\n%sDone.%s Folders in %s are live at https://<folder>.%s\n" "$G" "$N" "$park" "$VHOSTY_DOMAIN"
   fi

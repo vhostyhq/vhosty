@@ -1,13 +1,11 @@
 #!/usr/bin/env bats
-# vhosty's own mode on macOS: PHP from Homebrew, Caddy behind Tailscale Serve,
-# and log rotation from launchd. Runs anywhere: `mac` runs one of vhosty's
-# functions as if on macOS, with a fake Homebrew (shell scripts standing in for
-# its PHP binaries, and a brew that logs what it's asked).
+# vhosty's own mode on macOS: PHP from Homebrew, and log rotation from launchd
+# (Caddy is behind Tailscale Serve there as everywhere: serve.bats). Runs
+# anywhere: `mac` runs one of vhosty's functions as if on macOS, with a fake
+# Homebrew (shell scripts standing in for its PHP binaries, and a brew that
+# logs what it's asked).
 
 load helpers
-
-# Found before vhosty_setup points HOME at a scratch folder
-CADDY="${VHOSTY_TEST_CADDY:-$HOME/.vhosty/bin/caddy}"
 
 setup() {
   vhosty_setup
@@ -184,151 +182,6 @@ static_build() { # an old vhosty's static PHP-FPM in ~/.vhosty/bin
   run mac update_php 8.4
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_contains "$(cat "$HOME/brew.log")" "brew upgrade php@8.4 redis@8.4 igbinary@8.4"
-}
-
-# --- Caddy behind Tailscale Serve ----------------------------------------------
-
-@test "on macOS, Caddy listens on localhost's 48443 and 48080, and redirects http itself" {
-  mac write_configs
-  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
-  run grep -E '^\s*default_bind' "$VHOSTY_DIR/Caddyfile"
-  [ "$output" = "$(printf '\tdefault_bind 127.0.0.1')" ]
-  assert_contains "$caddyfile" "https_port 48443"
-  assert_contains "$caddyfile" "http_port 48080"
-  assert_contains "$caddyfile" "auto_https disable_redirects"
-  assert_contains "$caddyfile" "http://*.test.example {
-	redir https://{host}{uri} permanent
-}"
-  # the folder sites are vhosty's own, as on Linux
-  assert_contains "$caddyfile" "php_fastcgi"
-}
-
-@test "on macOS, the ports are settings" {
-  write_config 'VHOSTY_SERVE_PORT="49443"
-VHOSTY_SERVE_HTTP_PORT="49080"'
-  mac write_configs
-  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "https_port 49443"
-  [ "$(mac serve_pairs)" = "443:49443 80:49080" ]
-}
-
-@test "on macOS, the ports are saved with the config; on Linux they aren't" {
-  mac save_config
-  grep -q '^VHOSTY_SERVE_PORT=48443$' "$VHOSTY_DIR/config"
-  linux save_config
-  run grep -q SERVE "$VHOSTY_DIR/config"
-  [ "$status" -ne 0 ]
-}
-
-@test "on macOS, the Caddyfile doesn't depend on the Tailscale address" {
-  mac write_configs
-  before="$(cat "$VHOSTY_DIR/Caddyfile")"
-  stub tailscale 'exit 1'
-  mac write_configs
-  [ "$(cat "$VHOSTY_DIR/Caddyfile")" = "$before" ]
-  run mac drift_reason
-  [ "$output" = "settings changed since the last rebuild" ]
-}
-
-@test "on Linux, Caddy still listens on the Tailscale address and localhost" {
-  linux write_configs
-  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
-  assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"
-  refute_contains "$caddyfile" "https_port"
-  refute_contains "$caddyfile" "http://"
-}
-
-@test "the macOS Caddyfile is valid" {
-  [ -x "$CADDY" ] || skip "no Caddy with the Cloudflare plugin (set VHOSTY_TEST_CADDY)"
-  php_site app
-  mac write_configs
-  CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
-  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
-}
-
-# A fake tailscale whose Serve config is kept as "port target" lines, and
-# printed as JSON the way the real one prints it. serve_stub [JSON] starts
-# from that JSON instead (something else on Serve).
-serve_stub() {
-  : >"$HOME/serve.tcp"
-  if [ -n "${1:-}" ]; then printf '%s\n' "$1" >"$HOME/serve.json"; else echo '{}' >"$HOME/serve.json"; fi
-  stub tailscale '
-tcp="$HOME/serve.tcp"; st="$HOME/serve.json"
-echo "$*" >>"$HOME/tailscale.log"
-write() {
-  { printf "{\n  \"TCP\": {"; sep=""
-    while read -r p t; do printf "%s\n    \"%s\": {\n      \"TCPForward\": \"%s\"\n    }" "$sep" "$p" "$t"; sep=","; done <"$tcp"
-    printf "\n  }\n}\n"; } >"$st"
-}
-case "$*" in
-  ip*) echo 100.64.0.7 ;;
-  "serve status --json") cat "$st" ;;
-  "serve status") echo "(serve status)" ;;
-  "serve --bg --tcp="*) p="${3#--tcp=}"; grep -v "^$p " "$tcp" >"$tcp.new"; echo "$p ${4#tcp://}" >>"$tcp.new"; mv "$tcp.new" "$tcp"; write ;;
-  "serve --https="*" off"|"serve --http="*" off"|"serve --tcp="*" off")
-    p="${2#*=}"; grep -v "^$p " "$tcp" >"$tcp.new" || true; mv "$tcp.new" "$tcp"; write ;;
-  *) echo "unexpected: $*" >&2; exit 1 ;;
-esac'
-}
-
-@test "Tailscale Serve passes the tailnet's 443 and 80 to Caddy" {
-  serve_stub
-  mac serve_on
-  mac serve_ok
-  log="$(cat "$HOME/tailscale.log")"
-  assert_contains "$log" "serve --bg --tcp=443 tcp://127.0.0.1:48443"
-  assert_contains "$log" "serve --bg --tcp=80 tcp://127.0.0.1:48080"
-}
-
-@test "Tailscale Serve already passing both ports to Caddy is left alone" {
-  serve_stub '{"TCP":{"443":{"TCPForward":"127.0.0.1:48443"},"80":{"TCPForward":"127.0.0.1:48080"}}}'
-  mac serve_on
-  refute_contains "$(cat "$HOME/tailscale.log")" "--bg"
-}
-
-@test "an older setup with only 443 on Serve gets 80 added" {
-  serve_stub
-  printf '443 127.0.0.1:48443\n' >"$HOME/serve.tcp"
-  printf '{"TCP":{"443":{"TCPForward":"127.0.0.1:48443"}}}\n' >"$HOME/serve.json"
-  run mac serve_ok
-  [ "$status" -ne 0 ]
-  run mac serve_on
-  [ "$status" -eq 0 ]
-  refute_contains "$output" "already uses"
-  log="$(cat "$HOME/tailscale.log")"
-  refute_contains "$log" "--tcp=443 tcp://"
-  assert_contains "$log" "serve --bg --tcp=80 tcp://127.0.0.1:48080"
-  mac serve_ok
-}
-
-@test "something else on Tailscale Serve's 443 is replaced, once you say yes" {
-  serve_stub '{"TCP":{"443":{"HTTPS":true}},"Web":{"box.tail1.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8000"}}}}}'
-  run mac serve_on </dev/null   # no terminal: the default, yes
-  [ "$status" -eq 0 ]
-  assert_contains "$output" "already uses port 443"
-  assert_contains "$output" "Replacing it turns that off"
-  assert_contains "$output" "tailscale serve --bg --https=8443 http://127.0.0.1:8000"
-  assert_contains "$(cat "$HOME/tailscale.log")" "serve --https=443 off"
-  mac serve_ok
-}
-
-@test "Tailscale Serve refusing (Serve not enabled) stops with its message" {
-  stub tailscale 'case "$*" in ip*) echo 100.64.0.7 ;; "serve status --json") echo "{}" ;; *) echo "Serve is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/serve" >&2; exit 1 ;; esac'
-  run mac serve_on
-  [ "$status" -ne 0 ]
-  assert_contains "$output" "Serve is not enabled on your tailnet"
-}
-
-@test "uninstall's Serve cleanup only removes vhosty's forwards" {
-  serve_stub '{"TCP":{"443":{"HTTPS":true}}}'
-  mac serve_off
-  [ ! -f "$HOME/tailscale.log" ] || refute_contains "$(cat "$HOME/tailscale.log")" "off"
-  serve_stub
-  printf '443 127.0.0.1:48443\n80 127.0.0.1:48080\n' >"$HOME/serve.tcp"
-  printf '{"TCP":{"443":{"TCPForward":"127.0.0.1:48443"},"80":{"TCPForward":"127.0.0.1:48080"}}}\n' >"$HOME/serve.json"
-  mac serve_off
-  log="$(cat "$HOME/tailscale.log")"
-  assert_contains "$log" "serve --tcp=443 off"
-  assert_contains "$log" "serve --tcp=80 off"
 }
 
 # --- launchd --------------------------------------------------------------------

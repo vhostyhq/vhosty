@@ -5,11 +5,6 @@ load helpers
 
 caddyfile() { vh write_caddyfile && cat "$VHOSTY_DIR/Caddyfile"; }
 
-@test "on Linux, Caddy listens on the Tailscale address and localhost only" {
-  run linux eval 'write_caddyfile && cat "$CADDYFILE"'
-  assert_contains "$output" "default_bind 100.64.0.7 127.0.0.1 ::1"
-}
-
 @test "Caddy's admin API is on a socket in ~/.vhosty/run, not localhost:2019" {
   run caddyfile
   assert_contains "$output" "admin \"unix/$VHOSTY_DIR/run/caddy-admin.sock|0600\""
@@ -217,10 +212,6 @@ SITE_LINKED=yes"
   [ "$(linux drift_reason)" = "settings changed since the last rebuild" ]
   sed -i.bak 's/\$vhosty := "[^"]*"/$vhosty := "0.0.1"/' "$VHOSTY_DIR/error.html"
   [ "$(linux drift_reason)" = "vhosty was updated since the config was generated" ]
-  # On Linux, Caddy listens on the Tailscale address, so a new one needs a rebuild
-  linux write_configs
-  stub tailscale 'case "$1" in ip) echo 100.64.0.99 ;; esac'
-  [ "$(linux drift_reason)" = "this machine's Tailscale address changed (now 100.64.0.99)" ]
 }
 
 @test "config_in_sync notices when the php shim is out of date" {

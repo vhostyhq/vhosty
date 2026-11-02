@@ -98,8 +98,8 @@ sudo -n true 2>/dev/null || { info "asks for your password (sudo)"; sudo -v; }
 
 step "Packages"
 sudo apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq git libcap2-bin >/dev/null
-ok "curl, jq, git, setcap"
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq git >/dev/null
+ok "curl, jq, git"
 
 # Docker keeps images and volumes under /var/lib, which on cloud VMs is often
 # a small root disk. Move them to the big disk, leaving links behind.

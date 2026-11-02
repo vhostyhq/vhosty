@@ -90,7 +90,7 @@ VHOSTY_DNS="cloudflare"   # DNS provider: cloudflare digitalocean porkbun route5
 VHOSTY_DNS_PLUGIN=""      # custom: the Caddy plugin, e.g. github.com/caddy-dns/gandi
 VHOSTY_DNS_TLS=""         # custom: its Caddyfile line, e.g. dns gandi {env.GANDI_BEARER_TOKEN}
 VHOSTY_BACKEND="vhosty"   # vhosty: serve folders with vhosty's PHP-FPM; herd: forward to Laravel Herd (macOS)
-# macOS: Caddy's ports on localhost; Tailscale Serve passes the tailnet's 443 and 80 to them
+# Caddy's ports on localhost; Tailscale Serve passes the tailnet's 443 and 80 to them
 VHOSTY_SERVE_PORT="${VHOSTY_SERVE_PORT:-${VHOSTY_HERD_PORT:-48443}}"
 VHOSTY_SERVE_HTTP_PORT="${VHOSTY_SERVE_HTTP_PORT:-48080}"
 
@@ -194,12 +194,9 @@ save_config() {
     echo "# vhosty config. After editing, run: vhosty rebuild"
     for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
       VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_PORTS \
-      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_BACKEND; do
+      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_BACKEND VHOSTY_SERVE_PORT VHOSTY_SERVE_HTTP_PORT; do
       printf '%s=%q\n' "$k" "${!k}"
     done
-    if uses_serve; then
-      for k in VHOSTY_SERVE_PORT VHOSTY_SERVE_HTTP_PORT; do printf '%s=%q\n' "$k" "${!k}"; done
-    fi
   } >"$CONFIG_FILE"
 }
 
@@ -496,15 +493,18 @@ herd_checks() {
 }
 
 # ---------------------------------------------------------------------------
-# Tailscale Serve (macOS). Caddy can't listen on the Tailscale address's
-# port 443 there: macOS lets an ordinary user listen below 1024 only on every
-# address at once, and Caddy runs as you. So Caddy listens on localhost's
+# Tailscale Serve, on every machine. Caddy listens on localhost's
 # VHOSTY_SERVE_PORT (https) and VHOSTY_SERVE_HTTP_PORT (redirects to https),
 # and Tailscale Serve passes the tailnet's 443 and 80 to them as plain TCP:
 # still encrypted, with Caddy's certificate. Serve keeps this across restarts.
+# - macOS lets an ordinary user listen below 1024 only on every address at
+#   once, and Caddy runs as you, so it couldn't have the tailnet's 443 itself.
+# - With 443 and 80 vhosty's in Serve's config, other tools that publish
+#   through Serve find them taken (T3 Code's pairing stops and asks for
+#   another port), instead of taking them from Caddy without a word.
+# Serve adds a PROXY protocol header (v2) with the device's tailnet address,
+# and Caddy reads it, so PHP still sees who's asking, not 127.0.0.1.
 # ---------------------------------------------------------------------------
-uses_serve() { is_macos || herd_mode; }
-
 serve_json() { # Serve's config, on one line
   local t
   t="$(tailscale_bin)"
@@ -514,8 +514,20 @@ serve_json() { # Serve's config, on one line
 
 serve_pairs() { echo "443:$VHOSTY_SERVE_PORT 80:$VHOSTY_SERVE_HTTP_PORT"; }
 
+serve_port_entry() { # serve_port_entry 443 [JSON]: that port's object in Serve's TCP config
+  printf '%s' "${2:-$(serve_json)}" | grep -oE "\"$1\":\\{[^}]*\\}" | head -1 || true
+}
+
+# Serve forwards that port to Caddy (vhosty's, set up by any version)
+serve_port_ours() { # serve_port_ours 443 48443 [JSON]
+  serve_port_entry "$1" "${3:-}" | grep -qF "\"TCPForward\":\"127.0.0.1:$2\""
+}
+
+# ...and sends the PROXY header Caddy expects
 serve_port_ok() { # serve_port_ok 443 48443 [JSON]
-  printf '%s' "${3:-$(serve_json)}" | grep -qE "\"$1\":\\{[^}]*\"TCPForward\":\"127\\.0\\.0\\.1:$2\""
+  local e
+  e="$(serve_port_entry "$1" "${3:-}")"
+  printf '%s' "$e" | grep -qF "\"TCPForward\":\"127.0.0.1:$2\"" && printf '%s' "$e" | grep -qF '"ProxyProtocol":2'
 }
 
 serve_ok() {
@@ -532,7 +544,10 @@ serve_on() {
   for pair in $(serve_pairs); do
     p="${pair%%:*}"; to="${pair#*:}"
     serve_port_ok "$p" "$to" && continue
-    if serve_json | grep -q "\"$p\":"; then
+    if serve_port_ours "$p" "$to"; then
+      # vhosty's own forward from before the PROXY header: replaced quietly
+      "$t" serve --tcp="$p" off >/dev/null 2>&1 || true
+    elif serve_json | grep -q "\"$p\":"; then
       warn "Tailscale Serve already uses port $p on this machine:"
       "$t" serve status 2>/dev/null | sed 's/^/      /' || true
       # What it forwards to, so it can move to another port: "Proxy":"http://127.0.0.1:3773"
@@ -546,11 +561,27 @@ serve_on() {
       else "$t" serve --http="$p" off >/dev/null 2>&1 || true; fi
       "$t" serve --tcp="$p" off >/dev/null 2>&1 || true
     fi
-    out="$("$t" serve --bg --tcp="$p" "tcp://127.0.0.1:$to" 2>&1)" \
+    out="$("$t" serve --bg --tcp="$p" --proxy-protocol=2 "tcp://127.0.0.1:$to" 2>&1)" \
       || die "Tailscale Serve didn't take port $p: $out
-If Serve isn't enabled on your tailnet, the message above has the link to enable it. Then run: vhosty rebuild"
+If Serve isn't enabled on your tailnet, the message above has the link to enable it.$(is_linux && printf '\nIf it says access denied, let your account manage Tailscale: sudo tailscale set --operator=%s' "$VHOSTY_USER")
+Then run: vhosty rebuild"
   done
   serve_ok || die "Tailscale Serve didn't take ports 443 and 80 (tailscale serve status). Free them (tailscale serve reset), then run: vhosty rebuild"
+}
+
+# Linux: tailscaled lets only root and its operator change Serve's config.
+# Makes you the operator once, so vhosty (and you) can, without sudo.
+serve_allow_user() {
+  local t prefs
+  is_linux || return 0
+  [ "$(id -u)" != 0 ] || return 0
+  t="$(tailscale_bin)"
+  [ -n "$t" ] || return 0
+  # Unreadable prefs: leave it to serve_on, whose error says what to do
+  prefs="$("$t" debug prefs 2>/dev/null)" || return 0
+  if printf '%s' "$prefs" | grep -qE "\"OperatorUser\": *\"$VHOSTY_USER\""; then return 0; fi
+  info "letting $VHOSTY_USER manage Tailscale Serve without sudo (asks for your password)"
+  sudo "$t" set --operator="$VHOSTY_USER" || die "Couldn't make $VHOSTY_USER Tailscale's operator. Run: sudo tailscale set --operator=$VHOSTY_USER"
 }
 
 # Removes vhosty's forwards only
@@ -560,15 +591,36 @@ serve_off() {
   [ -n "$t" ] || return 0
   j="$(serve_json)" || return 0
   for pair in $(serve_pairs); do
-    if serve_port_ok "${pair%%:*}" "${pair#*:}" "$j" && "$t" serve --tcp="${pair%%:*}" off >/dev/null 2>&1; then
+    if serve_port_ours "${pair%%:*}" "${pair#*:}" "$j" && "$t" serve --tcp="${pair%%:*}" off >/dev/null 2>&1; then
       ok "removed Tailscale Serve's port ${pair%%:*}"
     fi
   done
 }
 
 serve_check() { # for doctor
-  if serve_ok; then ok "Tailscale Serve: the tailnet's 443 and 80 → Caddy (127.0.0.1:$VHOSTY_SERVE_PORT, :$VHOSTY_SERVE_HTTP_PORT)"
-  else bad "Tailscale Serve isn't passing ports 443 and 80 to Caddy (see: tailscale serve status). Run: vhosty rebuild"; fi
+  local j pair p to e target off
+  j="$(serve_json || true)"
+  if serve_ok; then ok "Tailscale Serve: the tailnet's 443 and 80 → Caddy (127.0.0.1:$VHOSTY_SERVE_PORT, :$VHOSTY_SERVE_HTTP_PORT)"; return 0; fi
+  for pair in $(serve_pairs); do
+    p="${pair%%:*}"; to="${pair#*:}"
+    serve_port_ours "$p" "$to" "$j" && continue
+    e="$(serve_port_entry "$p" "$j")"
+    [ -n "$e" ] || continue
+    # Something else published itself on vhosty's port (T3 Code's pairing, say)
+    if printf '%s' "$e" | grep -q '"TCPForward"'; then
+      target="$(printf '%s' "$e" | grep -oE '"TCPForward":"[^"]+"' | sed 's/^"TCPForward":"/tcp:\/\//; s/"$//')"
+      off="--tcp=$p"
+    else
+      target="$(printf '%s' "$j" | grep -oE "\"[^\"]+:$p\":\\{\"Handlers\":\\{[^}]*\"Proxy\":\"[^\"]+\"" | grep -oE '"Proxy":"[^"]+"' | head -1 | sed 's/^"Proxy":"//; s/"$//' || true)"
+      if [ "$p" = 443 ]; then off="--https=443"; else off="--http=$p"; fi
+    fi
+    bad "Tailscale Serve's port $p goes to ${target:-something else}, not vhosty's Caddy"
+    info "To keep it, move it to another port: tailscale serve $off off, then"
+    info "  tailscale serve --bg --https=8443 ${target:-<what it serves>}"
+    info "Then: vhosty rebuild. (vhosty doctor --fix replaces it too, after asking.)"
+    return 0
+  done
+  bad "Tailscale Serve isn't passing ports 443 and 80 to Caddy (see: tailscale serve status). Run: vhosty rebuild"
 }
 
 # ---------------------------------------------------------------------------
@@ -612,7 +664,7 @@ port_owner() {
       if (match($0, /users:\(\("[^"]+"/)) { s = substr($0, RSTART + 9, RLENGTH - 10); print s } else print "?"
     }' | sort -u | tr '\n' ' ' | sed 's/ $//' \
       | { IFS= read -r o || true
-          # Caddy's port capability hides its sockets from ss; "?" is ours if it's running
+          # Older vhosty's setcap'd Caddy hides its sockets from ss; "?" is ours if it's running
           if [ "$o" = "?" ] && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && svc_running caddy; then o="caddy"; fi
           printf '%s' "$o"; } || true
   fi
@@ -786,32 +838,6 @@ dns_sync() {
 # ---------------------------------------------------------------------------
 # Caddy
 # ---------------------------------------------------------------------------
-# A tool from /usr/sbin or /sbin, which aren't on a normal user's PATH on Debian
-sbin_cmd() {
-  local c
-  for c in "$(command -v "$1" 2>/dev/null || true)" "/usr/sbin/$1" "/sbin/$1"; do
-    if [ -n "$c" ] && [ -x "$c" ]; then echo "$c"; return 0; fi
-  done
-  return 1
-}
-
-caddy_can_bind() {
-  local g
-  g="$(sbin_cmd getcap)" || return 1
-  "$g" "$CADDY_BIN" 2>/dev/null | grep -q cap_net_bind_service
-}
-
-# Lets Caddy bind 80/443 as a normal user. Replacing the binary drops it, so
-# this runs again after every download.
-caddy_allow_ports() {
-  is_linux || return 0
-  if caddy_can_bind; then return 0; fi
-  local sc
-  sc="$(sbin_cmd setcap)" || die "vhosty needs setcap: sudo apt install libcap2-bin"
-  info "letting Caddy use ports 80 and 443 without root (asks for your password)"
-  sudo "$sc" cap_net_bind_service=+ep "$CADDY_BIN" || die "setcap failed"
-}
-
 # The IPv4 address a name resolves to: dig when it's installed, otherwise the
 # system resolver (minimal Debian has no dig)
 resolve_a() {
@@ -832,12 +858,11 @@ install_caddy() {
   make_tmp tmp
   info "downloading Caddy with the $DNS_NAME DNS plugin ($os/$arch)"
   download "$url" "$tmp" || die "Caddy download failed"
-  chmod 700 "$tmp"   # it may bind ports below 1024: yours to run, nobody else's
+  chmod 700 "$tmp"   # yours to run, nobody else's
   if is_macos; then xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true; fi
   "$tmp" list-modules 2>/dev/null | grep -qx "$DNS_MODULE" \
     || die "Downloaded Caddy is missing the $DNS_NAME plugin ($DNS_MODULE), or doesn't run on this system"
   mv "$tmp" "$CADDY_BIN"
-  caddy_allow_ports
   ok "Caddy $("$CADDY_BIN" version | awk '{print $1}')"
 }
 
@@ -1339,7 +1364,7 @@ check_ports() {
 }
 
 write_caddyfile() {
-  local depth dir v ip bind name sites="" cased=""
+  local depth dir v name sites="" cased=""
   check_ports
   dns_provider
   mkdir -p "$RUN_DIR"   # for the admin socket
@@ -1353,44 +1378,36 @@ write_caddyfile() {
       [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
     done
   fi
-  # Listen on the Tailscale address (and localhost) only, not the LAN.
-  # macOS: high ports on localhost, behind Tailscale Serve (serve_on)
-  if uses_serve; then
-    bind="127.0.0.1"
-  else
-    ip="$(ts_ip)"
-    bind="127.0.0.1 ::1"; [ -z "$ip" ] || bind="$ip $bind"
-  fi
   {
     cat <<EOF
 # Generated by vhosty. Don't edit: change ~/.vhosty/config, then run \`vhosty rebuild\`.
 {
-	default_bind $bind
-EOF
-    if uses_serve; then
-      cat <<EOF
-	# macOS keeps ports below 1024 on one address for root; Tailscale Serve
-	# passes the tailnet's 443 and 80 to these. Caddy's own redirects would
-	# point at :$VHOSTY_SERVE_PORT, so the http:// block below does them.
+	# Localhost only, not the LAN: Tailscale Serve passes the tailnet's 443 and
+	# 80 to these high ports (vhosty status shows it). Caddy's own redirects
+	# would point at :$VHOSTY_SERVE_PORT, so the http:// block below does them.
+	default_bind 127.0.0.1
 	http_port $VHOSTY_SERVE_HTTP_PORT
 	https_port $VHOSTY_SERVE_PORT
 	auto_https disable_redirects
-EOF
-    fi
-    cat <<EOF
+	# Serve says which device is asking in a PROXY header, sent from 127.0.0.1.
+	# Connections without one (curl on this machine) work as before.
+	servers {
+		listener_wrappers {
+			proxy_protocol {
+				allow 127.0.0.1/32
+			}
+			tls
+		}
+	}
 	# Caddy's admin API, which can load any config: on a socket only you can use,
 	# not localhost:2019, where every account on this machine could
 	admin "unix/$RUN_DIR/caddy-admin.sock|0600"
 }
-EOF
-    if uses_serve; then
-      cat <<EOF
 
 http://*.$VHOSTY_DOMAIN {
 	redir https://{host}{uri} permanent
 }
 EOF
-    fi
     cat <<EOF
 
 *.$VHOSTY_DOMAIN {
@@ -2023,7 +2040,7 @@ svc_remove() {
 svc_sync() {
   local s
   mkdir -p "$LOG_DIR" "$RUN_DIR"
-  # Caddy can bind ports below 1024 (setcap): only its owner may run it
+  # Only its owner may run Caddy (older vhosty let it bind 443 with setcap)
   [ ! -f "$CADDY_BIN" ] || chmod 700 "$CADDY_BIN"
   if is_linux; then
     write_units
@@ -2087,14 +2104,8 @@ config_in_sync() {
 
 # Why the generated files no longer match what vhosty would write now
 drift_reason() {
-  local ip
   if [ -f "$ERROR_PAGE" ] && ! grep -qF "\$vhosty := \"$VHOSTY_VERSION\"" "$ERROR_PAGE"; then
     echo "vhosty was updated since the config was generated"
-    return 0
-  fi
-  ip="$(ts_ip)"
-  if ! uses_serve && [ -n "$ip" ] && [ -f "$CADDYFILE" ] && ! grep -qE "default_bind ${ip//./\\.}( |\$)" "$CADDYFILE"; then
-    echo "this machine's Tailscale address changed (now $ip)"
     return 0
   fi
   echo "settings changed since the last rebuild"
@@ -2134,7 +2145,6 @@ cmd_setup() {
   ok "Tailscale IP: $ip"
   if is_linux; then
     command -v jq >/dev/null 2>&1 || die "vhosty needs jq: sudo apt install jq"
-    sbin_cmd setcap >/dev/null || die "vhosty needs setcap: sudo apt install libcap2-bin"
     command -v systemctl >/dev/null 2>&1 || die "vhosty on Linux needs systemd"
   fi
   if [ -n "$backend" ]; then
@@ -2150,15 +2160,13 @@ cmd_setup() {
     herd_installed || die "Herd isn't set up here ($(herd_valet)/config.json not found). Install Herd and open it once: https://herd.laravel.com"
     ok "Herd: sites are <name>.$(herd_tld) (Caddy forwards <name>.<domain> to them)"
   fi
-  # The ports Caddy needs: 443 (and 80) on Linux; on macOS, localhost's high
-  # ports behind Tailscale Serve, so Herd or Valet can keep 80 and 443
-  if uses_serve; then o="$VHOSTY_SERVE_PORT $VHOSTY_SERVE_HTTP_PORT"; else o="443"; fi
-  for p in $o; do
+  # The ports Caddy needs: localhost's high ports behind Tailscale Serve, so
+  # Herd, Valet, nginx or Apache can keep 80 and 443
+  for p in $VHOSTY_SERVE_PORT $VHOSTY_SERVE_HTTP_PORT; do
     v="$(port_owner "$p")"
     if [ -n "$v" ] && [ "$v" != "caddy" ]; then
       warn "port $p is in use by: $v"
-      if uses_serve; then warn "vhosty's Caddy needs it. Free it, or pick another: VHOSTY_SERVE_PORT / VHOSTY_SERVE_HTTP_PORT in ~/.vhosty/config."
-      else warn "Herd, Valet, nginx and Apache use 443. Stop them, or vhosty's Caddy can't start."; fi
+      warn "vhosty's Caddy needs it. Free it, or pick another: VHOSTY_SERVE_PORT / VHOSTY_SERVE_HTTP_PORT in ~/.vhosty/config."
       confirm "Continue anyway?" N || exit 1
     fi
   done
@@ -2247,7 +2255,6 @@ cmd_setup() {
 
   step "Caddy"
   if caddy_installed; then
-    caddy_allow_ports
     ok "Caddy already installed ($("$CADDY_BIN" version | awk '{print $1}'))"
   else
     install_caddy
@@ -2270,14 +2277,13 @@ cmd_setup() {
   svc_sync
   svc_apply
 
-  if uses_serve; then
-    step "Tailscale Serve"
-    info "macOS lets only root listen on port 443 of one address, so Tailscale Serve passes"
-    info "the tailnet's ports 443 and 80 to Caddy on 127.0.0.1:$VHOSTY_SERVE_PORT and :$VHOSTY_SERVE_HTTP_PORT"
-    info "(still encrypted, with vhosty's certificate)."
-    serve_on
-    ok "the tailnet's ports 443 and 80 → Caddy"
-  fi
+  step "Tailscale Serve"
+  info "Tailscale Serve passes the tailnet's ports 443 and 80 to Caddy on 127.0.0.1:$VHOSTY_SERVE_PORT"
+  info "and :$VHOSTY_SERVE_HTTP_PORT (still encrypted, with vhosty's certificate). Other tools that"
+  info "publish through Serve find 443 and 80 taken, so they can't take them from Caddy."
+  serve_allow_user
+  serve_on
+  ok "the tailnet's ports 443 and 80 → Caddy"
 
   step "Waiting for the certificate"
   local n=0
@@ -2500,9 +2506,11 @@ cmd_rebuild() {
   ok "regenerated config"
   if svc_installed; then
     cmd_validate >/dev/null || { cmd_validate || true; die "Not applying. Fix the errors above."; }
+    # Before Caddy moves: if Serve can't be set up, the sites stay as they were
+    serve_ok || serve_allow_user
     svc_sync
     svc_apply
-    ! uses_serve || serve_on
+    serve_on   # after Caddy has let go of 443, if an older vhosty had it
   fi
 }
 
@@ -2551,12 +2559,10 @@ cmd_status() {
     else bad "$s $st (run: vhosty start, or see: vhosty logs $s)"; fi
   done
   head_ "Listening"
-  p=443; ! uses_serve || p="$VHOSTY_SERVE_PORT"
+  p="$VHOSTY_SERVE_PORT"
   o="$(port_owner "$p")"; if [ -n "$o" ]; then ok "$p → $o"; else bad "nothing listening on $p"; fi
-  if uses_serve; then
-    if serve_ok; then ok "Tailscale Serve: 443 → $VHOSTY_SERVE_PORT, 80 → $VHOSTY_SERVE_HTTP_PORT"
-    else bad "Tailscale Serve isn't passing 443 and 80 to Caddy (run: vhosty rebuild)"; fi
-  fi
+  if serve_ok; then ok "Tailscale Serve: 443 → $VHOSTY_SERVE_PORT, 80 → $VHOSTY_SERVE_HTTP_PORT"
+  else bad "Tailscale Serve isn't passing 443 and 80 to Caddy (run: vhosty rebuild)"; fi
   for v in $(php_versions_in_use); do
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v → $(fpm_sock "$v")"; else bad "no socket for PHP $v"; fi
   done
@@ -3992,8 +3998,6 @@ cmd_dns() {
   case "${1:-sync}" in
     sync)
       dns_point
-      # Caddy listens on the Tailscale IP, so a new IP needs a new Caddyfile
-      if svc_installed && ! uses_serve && ! grep -q "default_bind $(ts_ip) " "$CADDYFILE" 2>/dev/null; then cmd_rebuild; fi
       ;;
     *) die "Usage: vhosty dns sync" ;;
   esac
@@ -4293,7 +4297,7 @@ doctor_fix() {
     if [ "$DNS_MANAGED" != "yes" ]; then
       dns_point   # can't change it ourselves: says which record to make
     elif fix_ok "point *.$VHOSTY_DOMAIN at $ip (vhosty dns sync)"; then
-      dns_sync; need_rebuild=1; fixed=1
+      dns_sync; fixed=1
     fi
   fi
 
@@ -4314,7 +4318,7 @@ doctor_fix() {
   if ! config_in_sync || ! config_applied; then need_rebuild=1; fi
   for s in $(svc_all); do svc_running "$s" || need_rebuild=1; done
   if svc_installed && ! logs_scheduled; then need_rebuild=1; fi
-  if svc_installed && uses_serve && ! serve_ok; then need_rebuild=1; fi
+  if svc_installed && ! serve_ok; then need_rebuild=1; fi
   if [ "$need_rebuild" = "1" ] && svc_installed && fix_ok "regenerate config and start or reload services (vhosty rebuild)"; then
     cmd_rebuild; fixed=1
   fi
@@ -4382,11 +4386,6 @@ doctor_checks() {
   if [ -x "$CADDY_BIN" ]; then ok "binary: $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}')"; else bad "Caddy missing. Run: vhosty update caddy"; fi
   dns_provider
   if "$CADDY_BIN" list-modules 2>/dev/null | grep -qx "$DNS_MODULE"; then ok "$DNS_NAME DNS plugin"; else bad "Caddy is missing the $DNS_NAME plugin. Run: vhosty update caddy"; fi
-  if is_linux; then
-    if ! sbin_cmd getcap >/dev/null; then warn "can't check that Caddy may use ports 80 and 443: sudo apt install libcap2-bin"
-    elif caddy_can_bind; then ok "allowed to use ports 80 and 443"
-    else bad "Caddy can't bind 80/443. Run: vhosty setup"; fi
-  fi
   missing=""
   for v in $DNS_VARS; do load_secret "$v"; [ -n "${!v}" ] || missing="$missing $v"; done
   if [ -n "$missing" ]; then bad "missing $DNS_NAME credentials in $SECRETS_FILE:$missing. Run: vhosty setup, or: vhosty edit env"
@@ -4449,9 +4448,9 @@ doctor_checks() {
     elif svc_installed; then bad "$s $st. Run: vhosty start (logs: vhosty logs $s)"
     else bad "$s not installed. Run: vhosty setup"; fi
   done
-  p=443; ! uses_serve || p="$VHOSTY_SERVE_PORT"
+  p="$VHOSTY_SERVE_PORT"
   o="$(port_owner "$p")"; if [ -n "$o" ]; then ok "$p → $o"; else bad "nothing listening on $p"; fi
-  ! uses_serve || serve_check
+  serve_check
   for v in $(php_versions_in_use); do
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v socket"; else bad "no socket for PHP $v"; fi
   done
@@ -4512,8 +4511,8 @@ cmd_uninstall() {
     for s in $(svc_all) logs $(launchd_stale); do
       if [ -f "$(plist_for "$s")" ]; then svc_remove "$s"; ok "removed $(label_of "$s")"; fi
     done
-    serve_off
   fi
+  serve_off
   dns_provider
   info "To remove everything: rm -rf $VHOSTY_DIR, and delete the *.$VHOSTY_DOMAIN record at $DNS_NAME."
 }

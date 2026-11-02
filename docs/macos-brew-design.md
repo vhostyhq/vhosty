@@ -116,7 +116,8 @@ live there). They keep working until moved, so `vhosty update self` (which runs
 
 `uses_serve` = macOS (either backend). The Herd code's `herd_serve_*` become
 `serve_*`, used by both backends; Linux is unchanged (Caddy binds the Tailscale
-IP and localhost on 80/443, with `setcap`).
+IP and localhost on 80/443, with `setcap`). *Later: Linux moved behind Serve too,
+with the PROXY header below, so every platform listens the same way.*
 
 On macOS Caddy listens on localhost only, on high ports, and Serve forwards the
 tailnet's ports to it as plain TCP. TLS still ends at Caddy, with the wildcard
@@ -188,3 +189,5 @@ The tests run on Linux and macOS CI, so the macOS paths are tested by setting
   Caddy can read it (`listener_wrappers { proxy_protocol … }`). Tailscale's docs
   only show it with `--tls-terminated-tcp`, so try it on the Mac first. If it
   works with `--tcp`, PHP would see the real tailnet address again, as on Linux.
+  *Done: it works with `--tcp` (checked on Linux, Tailscale 1.104), and vhosty
+  now uses it on every platform.*

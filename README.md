@@ -22,7 +22,7 @@ Runs on **Linux** (systemd) and **macOS** (launchd).
 
 ```
 your phone ──tailnet──▶ dev box (100.x.y.z)
-                         └─ Caddy :443   *.yourdomain.dev, wildcard cert
+                         └─ Tailscale Serve :443 ─▶ Caddy 127.0.0.1:48443   *.yourdomain.dev, wildcard cert
                               ├─ <port>.yourdomain.dev  → localhost:<port>
                               ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
                               └─ <site>.yourdomain.dev  → static (site/index.html)
@@ -30,7 +30,7 @@ your phone ──tailnet──▶ dev box (100.x.y.z)
 
 1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the machine's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
 2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through your DNS provider's API, so Let's Encrypt never needs to reach the machine.
-3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on the Tailscale IP and localhost only, not your LAN. (On macOS, which keeps ports 80 and 443 of one address for root, Caddy listens on localhost and [Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's 443 and 80 to it: see [macOS](#macos).)
+3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on localhost only, and [Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports 443 and 80 to it, so nothing is open to your LAN. See [Tailscale Serve](#tailscale-serve).
 4. **Services:** Caddy and one PHP-FPM per PHP version in use. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
 
 ## Requirements
@@ -38,18 +38,17 @@ your phone ──tailnet──▶ dev box (100.x.y.z)
 - **[Tailscale](https://tailscale.com/download)** on this machine and on every device you'll browse from.
 - **A domain whose DNS is on [Cloudflare](https://cloudflare.com)**, or on another provider vhosty supports (see [DNS providers](#dns-providers)). It can be one you own or a new one, and it doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
 - **An API token for it.** For Cloudflare: *Zone → Read* and *DNS → Edit* for that domain, created at dash.cloudflare.com → My Profile → API Tokens with the "Edit zone DNS" template.
-- **Linux: ports 80 and 443 free.** nginx and Apache use them, so stop those first. On macOS they can stay in use: vhosty listens elsewhere (see [macOS](#macos)), and can also put Laravel Herd's sites on your tailnet instead (see [With Laravel Herd](#with-laravel-herd-macos)).
+- **[Tailscale Serve](https://tailscale.com/kb/1312/serve) enabled on your tailnet.** Setup prints Tailscale's link to enable it if it isn't. Ports 80 and 443 on the machine itself can stay in use (nginx, Apache, Herd, Valet): vhosty doesn't need them. On macOS it can also put Laravel Herd's sites on your tailnet instead (see [With Laravel Herd](#with-laravel-herd-macos)).
 
 **Linux** (tested on Ubuntu 26.04): systemd, `curl`, `jq`, and PHP from apt. Ubuntu
 ships one PHP version; for several side by side, add Ondřej Surý's repo
 ([packages.sury.org/php](https://packages.sury.org/php/README.txt)), then
 `vhosty php install 8.4`. Setup asks for your password twice, once each to let
-your services run at boot (`loginctl enable-linger`) and to let Caddy use ports
-80 and 443 (`setcap`). Nothing else needs root.
+your services run at boot (`loginctl enable-linger`) and to let your account
+manage Tailscale Serve (`tailscale set --operator`). Nothing else needs root.
 
 **macOS** 13 (Ventura) or newer, Intel or Apple Silicon, with
-[Homebrew](https://brew.sh) for PHP (not needed with `--no-php` or `--herd`), and
-[Tailscale Serve](https://tailscale.com/kb/1312/serve) enabled on your tailnet.
+[Homebrew](https://brew.sh) for PHP (not needed with `--no-php` or `--herd`).
 Starting and stopping services asks for your password (launchd daemons).
 
 vhosty downloads its own Caddy, with your DNS provider's plugin built in.
@@ -135,6 +134,35 @@ export PATH="$HOME/.vhosty/bin:$PATH"
 fpath=(~/.vhosty/completions $fpath)   # before compinit
 ```
 
+## Tailscale Serve
+
+Caddy listens on `127.0.0.1:48443` and `:48080` only, and
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports
+443 and 80 to them (`tailscale serve status` shows it). It works the same on Linux
+and macOS:
+
+- The connection stays encrypted end to end with vhosty's certificate; Serve only
+  forwards it, and port 80 only redirects to `https://`.
+- Serve tells Caddy which device is asking (a PROXY protocol header), so PHP sees
+  the device's tailnet address in `REMOTE_ADDR`, not 127.0.0.1.
+- Ports 80 and 443 on the machine itself stay free for nginx, Apache, Herd, Valet
+  or anything else. (macOS wouldn't let Caddy have the tailnet's 443 anyway: it
+  keeps ports below 1024 on one address for root.)
+- With 443 and 80 vhosty's in Serve's config, other tools that publish through
+  Serve find them taken instead of quietly taking them over. T3 Code's pairing,
+  for one, uses 443 by default; with vhosty there, it stops and asks for another
+  port (`--tailscale-serve-port 8443`).
+
+Setup turns this on, so Serve has to be enabled on your tailnet: if it isn't,
+setup prints Tailscale's link to enable it. Anything you had on Serve's ports 443
+or 80 is replaced, after asking. If something takes them later, `vhosty doctor`
+says what and how to move it, and `vhosty rebuild` takes them back. To move
+Caddy's own ports, set `VHOSTY_SERVE_PORT` and `VHOSTY_SERVE_HTTP_PORT` in
+`~/.vhosty/config`, then run `vhosty rebuild`.
+
+Older vhosty on Linux had Caddy listen on the Tailscale address's 443 itself.
+`vhosty rebuild` (which `vhosty update self` runs) moves it behind Serve.
+
 ## macOS
 
 PHP comes from Homebrew, through [shivammathur/php](https://github.com/shivammathur/homebrew-php),
@@ -153,20 +181,9 @@ keep working until moved: `vhosty setup`, or `vhosty php install <version>` per
 version, installs it from Homebrew and removes the old build. `vhosty doctor`
 lists any that are left.
 
-macOS lets only root listen on port 443 (or 80) of one particular address, and
-Caddy runs as you. So Caddy listens on `127.0.0.1:48443` and `:48080`, and
-[Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports
-443 and 80 to them (`tailscale serve status` shows it). The connection stays
-encrypted end to end with vhosty's certificate; Serve only forwards it, and port
-80 only redirects to `https://`. Setup sets this up, so Serve has to be enabled
-on your tailnet: if it isn't, setup prints Tailscale's link to enable it.
-Anything you had on Serve's ports 443 or 80 is replaced, after asking. Ports 80
-and 443 on the Mac itself stay free for Herd, Valet or anything else. To move
-Caddy's ports, set `VHOSTY_SERVE_PORT` and `VHOSTY_SERVE_HTTP_PORT` in
-`~/.vhosty/config`, then run `vhosty rebuild`.
-
-One difference from Linux: PHP sees every request as coming from 127.0.0.1, the
-address Serve forwards from, not the device's tailnet address.
+Caddy listens behind Tailscale Serve, as on Linux (see
+[Tailscale Serve](#tailscale-serve)), so ports 80 and 443 on the Mac itself stay
+free for Herd, Valet or anything else.
 
 ## With Laravel Herd (macOS)
 
@@ -186,8 +203,8 @@ Setup offers this on its own when it finds Herd. Caddy forwards
 `<name>.yourdomain.dev` to Herd as `<name>.test` (Herd's TLD, read from its config).
 A site you add in Herd works right away; `vhosty sites` lists them.
 
-Herd keeps its ports 80 and 443; Caddy listens behind Tailscale Serve, as
-described under [macOS](#macos).
+Herd keeps its ports 80 and 443; Caddy listens behind
+[Tailscale Serve](#tailscale-serve), as everywhere.
 
 Laravel builds links and redirects from the host it sees, which is `escrow.test`.
 For it to use the tailnet address instead, trust the proxy so it reads Caddy's
@@ -461,8 +478,8 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 | 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
 | 502 on a port site | Nothing is listening on that port, or it only listens on another interface. |
 | A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |
-| Port 443 in use (Linux) | nginx or Apache is running. Stop it. |
-| Site can't be reached from other devices (macOS) | Tailscale Serve isn't forwarding to Caddy. `vhosty doctor` checks it; `vhosty rebuild` sets it up again. |
+| Sites stopped working after pairing an app over Tailscale (T3 Code, say) | It published itself on Tailscale Serve's port 443, vhosty's. `vhosty doctor` says what it is and how to move it to another port (`tailscale serve --bg --https=8443 …`); then `vhosty rebuild`. |
+| Site can't be reached from other devices | Tailscale Serve isn't forwarding to Caddy. `vhosty doctor` checks it; `vhosty rebuild` sets it up again. |
 
 ## Security
 

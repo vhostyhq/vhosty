@@ -135,12 +135,12 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$output" "Herd's PHP settings"
 }
 
-@test "without VHOSTY_BACKEND, nothing changes (on Linux)" {
+@test "without VHOSTY_BACKEND, vhosty serves the folders itself" {
   write_config
   linux write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   refute_contains "$caddyfile" "Herd"
-  assert_contains "$caddyfile" "default_bind 100.64.0.7 127.0.0.1 ::1"
+  assert_contains "$caddyfile" "php_fastcgi"
 }
 
 @test "with Herd, the drift check doesn't look for the Tailscale address" {

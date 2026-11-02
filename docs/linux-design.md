@@ -131,8 +131,9 @@ requests running.
 ## Services (systemd user units)
 
 - `setup` runs `loginctl enable-linger $USER` once, so the units start at boot without a login.
-- Caddy binds 80/443 without root via `setcap cap_net_bind_service=+ep ~/.vhosty/bin/caddy`
-  (repeated after `vhosty update caddy`, since replacing the binary drops the capability).
+- ~~Caddy binds 80/443 without root via `setcap cap_net_bind_service=+ep ~/.vhosty/bin/caddy`~~
+  Superseded: Caddy now listens on localhost's high ports behind Tailscale Serve, as on macOS
+  (README, "Tailscale Serve"), so it needs no capability.
 - `Restart=on-failure` and logs in `~/.vhosty/logs`, readable with `vhosty logs` as today
   (`journalctl --user -u vhosty-*` works too).
 - macOS keeps launchd.

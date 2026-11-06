@@ -301,6 +301,7 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty link [dir] [--name N]` / `unlink [name]` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
 | `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
 | `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
+| `vhosty worktree [add\|link\|remove\|list]` | A git worktree as a site of its own, with its own URL, `.env` and database. See [Git worktrees](#git-worktrees) |
 | `vhosty open [site\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
 | `vhosty php [list\|install\|default\|which]` | PHP versions |
 | `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
@@ -349,6 +350,85 @@ reloads every 2 seconds until it comes up. Errors from your app itself (Laravel'
 (`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
 with no config. Laravel setup and mixed-content fixes are in
 [docs/laravel-vite.md](docs/laravel-vite.md).
+
+### Git worktrees
+
+When coding agents work on branches side by side, each branch can have its own
+site: its own URL, `.env` and database, so it can migrate without touching the
+parent's data. Nothing happens by itself: a worktree is a site once you say so.
+
+```bash
+cd ~/Sites/ledger
+vhosty worktree add feature/x          # https://feature-x--ledger.yourdomain.dev
+vhosty worktree add feature/x --copy-db   # the same, with a clone of ledger's data
+vhosty worktree link ~/.t3/worktrees/ledger/t3-1234   # a worktree something else made
+vhosty worktree                        # list them
+vhosty worktree remove feature-x--ledger
+```
+
+`add` takes an existing local or remote branch, or makes a new one from the HEAD
+you're on. Git refuses a branch that's checked out elsewhere, and vhosty says so.
+The folder goes in `~/.vhosty/worktrees/<site>/<branch>`, not a parked folder, where
+it would also be served by its folder name; `--path` picks another. `link` is for
+worktrees that already exist, such as those from T3 Code: run it inside one, or
+point it at one, and it finds the parent through git. The parent has to be a site.
+
+**The name** is `<branch>--<site>`, one DNS label, as the wildcard certificate covers
+only one level. It's lowercase letters, numbers and dashes, at most 63 characters; a
+longer one is cut, with a short hash of the original. A detached worktree uses its
+folder's name. A name that's taken is refused, so `feature/x` and `feature-x` can't
+both have a site. The name stays if the worktree changes branch later.
+
+**`.env`** is a copy of the parent's, with the same file permissions, or
+`.env.example` if the parent has none. `APP_URL` and `DB_DATABASE` are set in the
+copy; the parent's `.env` is only ever read. vhosty warns about settings that still
+name the parent's address, and about Redis, whose keys are shared unless you set
+`REDIS_PREFIX`. With `link`, a `.env` already in the worktree is kept and edited, but
+a symlink there is replaced, never written through.
+
+**The database** is new and empty, so vhosty prints `php artisan migrate --seed`.
+`--copy-db` clones the parent's without holding it up, in a single-transaction dump
+that only reads it.
+
+| The parent's `.env` says | What the worktree gets |
+|---|---|
+| `mysql`, `mariadb` or `pgsql`, on a port of a [Docker service](#docker-services) | A new database, `wt_feature_x__ledger`. A database user other than root gets access to it |
+| `sqlite` | Its own file, `database/database.sqlite` in the worktree |
+| Anything else: another host, a socket, `DB_URL`, no `DB_CONNECTION` | **It shares the parent's database**, and vhosty warns you plainly. It's left alone |
+
+If the service is down, or the database name is taken, `add` stops before changing
+anything rather than guess. With `link`, a `.env` that already names a different
+database from the parent's keeps it.
+
+**PHP:** a worktree site gets the parent's PHP pin, settings and extensions, copied
+when it's made. It runs on PHP-FPM, even if the parent is on Octane, until
+`vhosty octane on <name>`. `composer install` runs through the `php` shim, so with the
+site's version; if it fails the site stays and vhosty says so. `--no-install` skips
+it. npm is never run; it's printed as a next step if there's a lockfile.
+
+**`remove`** does only what vhosty set up, and the site's config records what that is:
+
+- A worktree from `add` is removed with `git worktree remove`, never `--force`, so
+  uncommitted or untracked files stop it, with nothing removed. The branch always stays.
+- A worktree from `link` isn't vhosty's: the folder stays, and only the site and
+  vhosty's database go.
+- The database vhosty created is dropped after a confirmation that names it. `--yes`
+  skips that, for scripts; without a terminal, it's required. `--keep-db` keeps the
+  database and prints how to drop it. A database vhosty didn't create is never dropped,
+  and one that fails to drop is reported, with the site kept so you can run it again.
+
+If the folder is deleted some other way (`git worktree remove` by hand, or by T3),
+`vhosty doctor` says so and `vhosty worktree remove` still works. `vhosty prune` leaves
+that site's config alone while it records a database, and says how to drop it: the
+record is what lets vhosty drop it safely.
+
+Unlinking or unparking the parent leaves its worktree sites working, as they have
+their own folder, URL, `.env` and database; vhosty says which ones. `vhosty unlink`
+refuses a worktree site: use `vhosty worktree remove`.
+
+Worktree databases are in `vhosty services backup` like any other, including copies
+of the parent's. With [Herd](#with-laravel-herd-macos) serving the sites, these
+commands are off.
 
 ### PHP versions
 
@@ -479,6 +559,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── config                 domain, parked folders, default PHP, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
+├── worktrees/<site>/      git worktrees from `vhosty worktree add`
 ├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
 ├── error.html             generated: the page for "no site", and PHP or a dev server down

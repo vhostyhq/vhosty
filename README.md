@@ -29,13 +29,14 @@ your phone ──tailnet──▶ dev box (100.x.y.z)
                          └─ Tailscale Serve :443 ─▶ Caddy 127.0.0.1:48443   *.yourdomain.dev, wildcard cert
                               ├─ <port>.yourdomain.dev  → localhost:<port>
                               ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
+                              ├─ <site>.yourdomain.dev  → Laravel Octane on a local port (vhosty octane on)
                               └─ <site>.yourdomain.dev  → static (site/index.html)
 ```
 
 1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the machine's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
 2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through your DNS provider's API, so Let's Encrypt never needs to reach the machine.
 3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on localhost only, and [Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports 443 and 80 to it, so nothing is open to your LAN. See [Tailscale Serve](#tailscale-serve).
-4. **Services:** Caddy and one PHP-FPM per PHP version in use. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
+4. **Services:** Caddy, one PHP-FPM per PHP version in use, and one service for each [Octane](#laravel-octane) site. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
 
 ## Requirements
 
@@ -190,6 +191,52 @@ lists any that are left.
 Caddy listens behind Tailscale Serve, as on Linux (see
 [Tailscale Serve](#tailscale-serve)), so ports 80 and 443 on the Mac itself stay
 free for Herd, Valet or anything else.
+
+## Laravel Octane
+
+A site can run on [Laravel Octane](https://laravel.com/docs/octane) instead of
+PHP-FPM, at the same address:
+
+```bash
+cd ~/Sites/myapp
+composer require laravel/octane
+php artisan octane:install      # picks the server: FrankenPHP, RoadRunner or Swoole
+vhosty octane on
+```
+
+vhosty runs `artisan octane:start` as a service, `octane-myapp`, that starts at
+boot and restarts if it crashes, and Caddy passes `myapp.yourdomain.dev` to its
+port on localhost. If the server isn't downloaded yet, `octane on` does that first.
+
+```bash
+vhosty octane                   # sites on Octane
+vhosty octane on --workers 4    # 2 workers by default, for each site
+vhosty octane reload            # reload the workers by hand
+vhosty octane off               # back to PHP-FPM
+vhosty restart octane-myapp
+vhosty logs octane-myapp
+```
+
+- **Code changes reload by themselves** (`--watch`). FrankenPHP watches files on its
+  own; RoadRunner and Swoole need Node and `npm i -D chokidar` (run `vhosty rebuild`
+  after adding it). Without them, `doctor` says so, and `vhosty octane reload` does it.
+- **The app sees its real host and https links** with no changes: Caddy keeps the
+  `Host` header, and the service sets `OCTANE_HTTPS=true` (unless the app's `.env`
+  says `OCTANE_HTTPS=false`, or its config is cached). For `$request->ip()` to be
+  the device and not 127.0.0.1, trust the proxy, as for `artisan serve`:
+  `$middleware->trustProxies(at: ['127.0.0.1', '::1']);` in `bootstrap/app.php`.
+- **`vhosty ini` applies to the workers** on every server, global and per site.
+- **FrankenPHP has its own PHP inside.** `vhosty isolate` and `ext` set what the CLI
+  uses, not what serves its requests. RoadRunner and Swoole run on the site's PHP
+  version. For Swoole: `vhosty ext install swoole`, which loads it into that PHP
+  version's PHP-FPM too (it does nothing there).
+- **RoadRunner is told not to serve `.php` files as static files,** which would
+  send their source code. If the project has its own `.rr.yaml`, that one's used
+  instead: add `http.static.forbid: [".php"]` to it (`doctor` warns if it's missing).
+- **Only localhost can reach the port.** For FrankenPHP that takes a copy of Octane's
+  Caddyfile in `~/.vhosty/octane/<site>`, written on `rebuild`, so run `vhosty rebuild`
+  after updating Octane. `doctor` checks the port isn't open on the tailnet address.
+- A `vhosty rebuild` restarts the Octane services, so a new pin or setting applies.
 
 ## With Laravel Herd (macOS)
 

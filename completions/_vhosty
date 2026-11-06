@@ -48,8 +48,11 @@ _vhosty_php_versions() {
 
 _vhosty_services() {
   local -a svcs
-  svcs=( caddy php ${${(f)"$(_vhosty_php_versions_raw)"}/#/php-} )
+  svcs=( caddy php ${${(f)"$(_vhosty_php_versions_raw)"}/#/php-} octane ${${(f)"$(_vhosty_octane_sites)"}/#/octane-} )
   _values 'service' $svcs
+}
+_vhosty_octane_sites() {
+  grep -lE '^SITE_OCTANE=[0-9]' "$(_vhosty_dir)"/sites/*.conf(N) 2>/dev/null | sed 's#.*/##; s/\.conf$//'
 }
 _vhosty_php_versions_raw() {
   print -l /usr/sbin/php-fpm[0-9]*(N:t) "$(_vhosty_dir)"/bin/php-fpm-*(N:t) "$(_vhosty_dir)"/bin/php-[0-9]*(N:t) \
@@ -82,6 +85,7 @@ _vhosty() {
     'isolate:Pin a site to a PHP version'
     'unisolate:Back to the default PHP version'
     'isolated:List pinned sites'
+    'octane:Laravel Octane (list, on, off, reload)'
     'ini:PHP settings, global or per site'
     'ext:PHP extensions a site needs'
     'services:Docker services (databases, caches, search, S3)'
@@ -135,6 +139,16 @@ _vhosty() {
           default) _vhosty_php_versions ;;
           which)   _vhosty_sites ;;
         esac
+      fi ;;
+    octane)
+      if (( CURRENT == 3 )); then
+        _values 'action' list on off reload
+      elif [ "${words[CURRENT-1]}" = "--workers" ]; then
+        _message 'number of workers'
+      elif [ "${words[3]}" = "on" ] && [[ "${words[CURRENT]}" == -* ]]; then
+        _values 'option' --workers
+      elif (( CURRENT == 4 )); then
+        _vhosty_sites
       fi ;;
     ext|exts)
       if (( CURRENT == 3 )); then

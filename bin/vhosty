@@ -40,6 +40,7 @@ CADDY_BIN="$BIN_DIR/caddy"
 CADDYFILE="$VHOSTY_DIR/Caddyfile"
 ERROR_PAGE="$VHOSTY_DIR/error.html"   # Caddy template for vhosty's own error pages
 PHP_CONF_DIR="$VHOSTY_DIR/php"
+OCTANE_CONF_DIR="$VHOSTY_DIR/octane"   # each Octane site's PHP settings
 LOG_DIR="$VHOSTY_DIR/logs"
 RUN_DIR="$VHOSTY_DIR/run"
 CADDY_LOG="$LOG_DIR/caddy.log"
@@ -413,6 +414,7 @@ herd_refuse() {
     isolated) alt="herd isolated" ;;
     php) alt="herd use, or Herd's PHP settings" ;;
     ini|ext|exts|extension|extensions) alt="Herd's PHP settings" ;;
+    octane) alt="php artisan octane:start, reached at https://<port>.<domain>" ;;
     *) return 0 ;;
   esac
   die "Herd serves the sites on this machine (VHOSTY_BACKEND=herd), so this is Herd's job. Use: $alt"
@@ -1181,8 +1183,8 @@ site_names() {
   done
 }
 
-site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT
-  SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""; SITE_EXT=""
+site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT SITE_OCTANE SITE_OCTANE_WORKERS
+  SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""; SITE_EXT=""; SITE_OCTANE=""; SITE_OCTANE_WORKERS=""
   # shellcheck disable=SC1090
   if [ -f "$(site_file "$1")" ]; then . "$(site_file "$1")"; fi
 }
@@ -1192,7 +1194,7 @@ site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT
 site_save() {
   local f
   f="$(site_file "$1")"
-  if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ] && [ -z "$SITE_EXT" ]; then
+  if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ] && [ -z "$SITE_EXT" ] && [ -z "$SITE_OCTANE" ]; then
     rm -f "$f"
     return 0
   fi
@@ -1204,6 +1206,8 @@ site_save() {
     printf 'SITE_PHP=%q\n' "$SITE_PHP"
     printf 'SITE_INI=%q\n' "$SITE_INI"
     printf 'SITE_EXT=%q\n' "$SITE_EXT"
+    printf 'SITE_OCTANE=%q\n' "$SITE_OCTANE"
+    printf 'SITE_OCTANE_WORKERS=%q\n' "$SITE_OCTANE_WORKERS"
   } >"$f"
 }
 
@@ -1289,6 +1293,193 @@ resolve_site() {
 }
 
 # ---------------------------------------------------------------------------
+# Laravel Octane (vhosty octane on): the site's app runs in a server of its own,
+# as a service named octane-<site>, on a port on localhost. Caddy passes the
+# site's name to that port. Which server (FrankenPHP, RoadRunner, Swoole) is the
+# app's choice: OCTANE_SERVER in its .env.
+# ---------------------------------------------------------------------------
+OCTANE_FIRST_PORT=21000   # above VHOSTY_PORTS' defaults: not reachable as <port>.domain too
+OCTANE_WORKERS=2          # Octane's default is one per CPU core, for every site
+
+# Sites on Octane whose folder is there
+octane_sites() {
+  local name
+  php_enabled || return 0
+  for name in $(site_names); do
+    site_folder "$name" >/dev/null || continue
+    [ -z "$SITE_OCTANE" ] || echo "$name"
+  done
+}
+
+# What the app's .env names, or nothing
+octane_env_server() {
+  [ -f "$1/.env" ] || return 0
+  sed -n 's/^OCTANE_SERVER=[[:space:]]*["'"'"']\{0,1\}\([a-z]*\).*/\1/p' "$1/.env" | tail -1
+}
+
+# The server Octane starts: roadrunner is the default in its config/octane.php
+octane_server() {
+  local s
+  s="$(octane_env_server "$1")"
+  printf '%s' "${s:-roadrunner}"
+}
+
+# FrankenPHP watches files itself; the others run Octane's watcher, on Node and chokidar
+octane_watches() {
+  [ "$(octane_server "$1")" = "frankenphp" ] && return 0
+  command -v node >/dev/null 2>&1 && [ -d "$1/node_modules/chokidar" ]
+}
+
+# A port no site has and nothing listens on
+octane_free_port() {
+  local p="$OCTANE_FIRST_PORT" used
+  # With the settings `vhosty link` set aside: unlink brings their port back
+  used=" $(cat "$SITES_DIR"/*.conf "$SITES_DIR"/*.conf.parked 2>/dev/null | sed -n 's/^SITE_OCTANE=//p' | tr '\n' ' ' || true) "
+  while :; do
+    case "$used" in
+      *" $p "*) ;;
+      *) [ -n "$(port_owner "$p")" ] || { echo "$p"; return 0; } ;;
+    esac
+    p=$((p + 1))
+  done
+}
+
+# Services start without your shell's PATH, where a version manager's Node would
+# be, or a server you installed yourself
+octane_path() {
+  local p="$BIN_DIR" t f
+  for t in node frankenphp rr; do
+    f="$(command -v "$t" 2>/dev/null || true)"
+    case "$f" in /*) case ":$p:" in *":${f%/*}:"*) ;; *) p="$p:${f%/*}" ;; esac ;; esac
+  done
+  if is_macos; then p="$p:$(brew_prefix)/bin"; fi
+  printf '%s:/usr/local/bin:/usr/bin:/bin' "$p"
+}
+
+# octane_cmd NAME: the command line, one argument per line. Through the shim, so
+# it gets the site's PHP version and settings, found from the service's folder.
+octane_cmd() {
+  local workers dir conf
+  site_load "$1"
+  dir="$(site_dir "$1")" || return 1
+  conf="$(octane_ini_dir "$1")"
+  workers="${SITE_OCTANE_WORKERS:-$OCTANE_WORKERS}"
+  printf '%s\n' "$PHP_SHIM" artisan octane:start --host=127.0.0.1 "--port=$SITE_OCTANE" "--workers=$workers" "--task-workers=$workers"
+  # Each server only reads its own, so changing OCTANE_SERVER keeps them in force
+  if [ -f "$conf/Caddyfile" ]; then echo "--caddyfile=$conf/Caddyfile"; fi
+  if [ -f "$conf/rr.yaml" ]; then echo "--rr-config=$conf/rr.yaml"; fi
+  if octane_watches "$dir"; then echo --watch; fi
+}
+
+# Files for each Octane site, in ~/.vhosty/octane/<site>:
+# - vhosty.ini, its PHP settings. The shim's -d arguments only reach the artisan
+#   process: the workers are processes of their own, and FrankenPHP's aren't even
+#   this PHP. All of them read PHP_INI_SCAN_DIR, which the service sets.
+# - Caddyfile, for FrankenPHP: Octane's own, listening on localhost only. Octane
+#   ignores --host without --https, so its own listens on every address, plain
+#   http, past Caddy and its certificate. It has no setting for this.
+# - rr.yaml, for RoadRunner, whose static files include any .php in public/ as
+#   source code. Not when the project has its own .rr.yaml: that one's kept.
+octane_ini_dir() { echo "$OCTANE_CONF_DIR/$1"; }
+
+write_octane_confs() {
+  local name d kv keep dir conf stub
+  keep=" $(octane_sites | tr '\n' ' ') "
+  for d in "$OCTANE_CONF_DIR"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    case "$keep" in *" ${d##*/} "*) ;; *) rm -rf "$d" ;; esac
+  done
+  for name in $keep; do
+    site_load "$name"
+    dir="$(site_dir "$name")"
+    conf="$(octane_ini_dir "$name")"
+    mkdir -p "$conf"
+    {
+      echo "; Generated by vhosty. Change it with: vhosty ini"
+      { ini_pairs "$PHP_INI"; printf '%s\n' "$SITE_INI"; } | ini_merge | while IFS= read -r kv; do
+        [ -z "$kv" ] || printf '%s = %s\n' "${kv%%=*}" "${kv#*=}"
+      done
+    } >"$conf/vhosty.ini"
+    rm -f "$conf/Caddyfile" "$conf/rr.yaml"
+    stub="$dir/vendor/laravel/octane/src/Commands/stubs/Caddyfile"
+    if [ -f "$stub" ]; then
+      awk 'NR == 1 && /^\{[[:space:]]*$/ { print; print "\tdefault_bind 127.0.0.1"; next } { print }' "$stub" >"$conf/Caddyfile"
+    fi
+    if [ ! -s "$dir/.rr.yaml" ]; then
+      printf 'version: "3"\nhttp:\n  static:\n    forbid: [".php"]\n' >"$conf/rr.yaml"
+    fi
+  done
+}
+
+# After `vhosty ext install`: workers on that PHP version have to start again
+octane_restart_php() { # octane_restart_php 8.5
+  local name
+  for name in $(octane_sites); do
+    site_load "$name"
+    [ "$(site_php)" = "$1" ] || continue
+    if svc_running "octane-$name"; then svc_restart "octane-$name"; ok "restarted octane-$name"; fi
+  done
+}
+
+# The first run downloads the server, so that's done here, where you can see it,
+# rather than inside a service
+octane_prepare() { # octane_prepare NAME DIR
+  local name="$1" dir="$2" server v
+  server="$(octane_server "$dir")"
+  case "$server" in
+    frankenphp)
+      if [ -x "$dir/frankenphp" ] || command -v frankenphp >/dev/null 2>&1; then return 0; fi ;;
+    roadrunner)
+      if [ -x "$dir/rr" ]; then return 0; fi ;;
+    swoole)
+      v="$(site_load "$name"; site_php)"
+      ext_loaded "$v" swoole && return 0
+      ext_loaded "$v" openswoole && return 0
+      die "Octane is set to Swoole, but PHP $v doesn't have it. Run: vhosty ext install swoole --php $v" ;;
+    *) die "Octane doesn't know the server '$server' (OCTANE_SERVER in $dir/.env)" ;;
+  esac
+  [ -n "$(octane_env_server "$dir")" ] || die "$name hasn't picked an Octane server. In its folder, run: php artisan octane:install"
+  info "getting $server for $name (php artisan octane:install)"
+  ( cd "$dir" && "$PHP_SHIM" artisan octane:install --server="$server" --no-interaction ) || die "octane:install failed. See above, or run it in $dir yourself"
+}
+
+octane_checks() {
+  local name dir code ip v
+  ip="$(ts_ip)"
+  for name in $(octane_sites); do
+    site_load "$name"
+    dir="$(site_dir "$name")"
+    if [ ! -f "$dir/vendor/laravel/octane/composer.json" ]; then
+      bad "$name: laravel/octane isn't installed in $dir. Run composer install there, or: vhosty octane off $name"
+    fi
+    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 "http://127.0.0.1:$SITE_OCTANE/" 2>/dev/null || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then ok "$name answers on port $SITE_OCTANE ($(octane_server "$dir"))"
+    else bad "$name isn't answering on port $SITE_OCTANE. See: vhosty logs octane-$name"; fi
+    if [ -n "$ip" ]; then
+      code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 --max-time 5 "http://$ip:$SITE_OCTANE/" 2>/dev/null || true)"
+      if [ -n "$code" ] && [ "$code" != "000" ]; then
+        bad "$name answers on $ip:$SITE_OCTANE, not just localhost: plain http, past Caddy. Run: vhosty rebuild"
+      fi
+    fi
+    case "$(octane_server "$dir")" in
+      swoole)
+        v="$(site_php)"
+        if ! ext_loaded "$v" swoole && ! ext_loaded "$v" openswoole; then
+          bad "$name is on Swoole, but PHP $v doesn't have it. Run: vhosty ext install swoole --php $v"
+        fi ;;
+      roadrunner)
+        if [ -s "$dir/.rr.yaml" ] && ! grep -q 'forbid' "$dir/.rr.yaml"; then
+          warn "$name: RoadRunner serves PHP files in public/ as source code. Add to its .rr.yaml: http.static.forbid: [\".php\"]"
+        fi ;;
+    esac
+    if ! octane_watches "$dir"; then
+      warn "$name: code changes need vhosty octane reload $name. To reload by itself, it needs Node and chokidar: npm i -D chokidar, then vhosty rebuild"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Generated config
 # ---------------------------------------------------------------------------
 # Rules for configured sites, and parked folders with capitals in their name.
@@ -1310,7 +1501,17 @@ caddy_sites() { # caddy_sites "CASE_SITES"
       printf '\n\t# Site: %s (skipped: its folder is gone, or no longer parked)\n' "$name"
       continue
     fi
-    if php_enabled && { [ -f "$dir/public/index.php" ] || [ ! -f "$dir/index.html" ]; }; then
+    if php_enabled && [ -n "$SITE_OCTANE" ]; then
+      cat <<EOF
+
+	# Site: $name → $dir (Laravel Octane, on port $SITE_OCTANE)
+	@site_$name host $name.$VHOSTY_DOMAIN
+	handle @site_$name {
+		vars vhosty_kind octane
+		reverse_proxy 127.0.0.1:$SITE_OCTANE
+	}
+EOF
+    elif php_enabled && { [ -f "$dir/public/index.php" ] || [ ! -f "$dir/index.html" ]; }; then
       v="$(site_php)"
       sock="$(fpm_sock "$v")"
       [ -z "$SITE_INI" ] || sock="$(site_sock "$name")"
@@ -1715,6 +1916,12 @@ summary { cursor: pointer; }
 <p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to Herd on this machine, as <code>{{html $label}}.{{html (placeholder "http.vars.vhosty_herd_tld")}}</code>, but Herd's web server didn't answer.</p>
 <p>Open Herd, or restart it:</p>
 <pre>herd restart</pre>
+{{- else if and (eq $kind "octane") (ne $status "504")}}
+<h1>Octane isn't answering</h1>
+<p class="muted">Caddy couldn't reach Laravel Octane for <strong>{{html .Host}}</strong>. It may still be starting.</p>
+<pre>vhosty status
+vhosty restart octane-{{html $label}}
+vhosty logs octane-{{html $label}}</pre>
 {{- else if and (eq $kind "php") (ne $status "504")}}
 <h1>PHP {{html $php}} isn't answering</h1>
 <p class="muted">Caddy couldn't reach PHP-FPM for <strong>{{html .Host}}</strong>.</p>
@@ -1833,18 +2040,20 @@ write_configs() {
   write_caddyfile
   write_error_page
   for v in $(php_versions_in_use); do write_fpm_conf "$v"; done
+  write_octane_confs
   if php_enabled; then write_shim; else rm -f "$PHP_SHIM"; fi
 }
 
 # ---------------------------------------------------------------------------
 # Services
-#   Names: caddy, php-8.5, php-8.4, ...
-#   Linux: systemd user units (vhosty-caddy, vhosty-php@8.5), no sudo needed
-#   macOS: launchd daemons (link.vhosty.caddy, link.vhosty.php-8.5)
+#   Names: caddy, php-8.5, php-8.4, ..., octane-<site>
+#   Linux: systemd user units (vhosty-caddy, vhosty-php@8.5, vhosty-octane-<site>), no sudo needed
+#   macOS: launchd daemons (link.vhosty.caddy, link.vhosty.php-8.5, link.vhosty.octane-<site>)
 # ---------------------------------------------------------------------------
 svc_all() { # PHP first, so Caddy starts with its upstreams ready
-  local v
+  local v s
   for v in $(php_versions_in_use); do printf 'php-%s\n' "$v"; done
+  for s in $(octane_sites); do printf 'octane-%s\n' "$s"; done
   echo caddy
 }
 
@@ -1861,24 +2070,73 @@ svc_resolve() {
       v="${a#php}"; v="${v#[-@]}"
       php_is_installed "$v" || die "PHP $v isn't installed"
       echo "php-$v" ;;
-    *) die "Unknown service '$a' (use caddy, php, php-8.x, or all)" ;;
+    octane)
+      [ -n "$(octane_sites)" ] || die "No site runs on Octane. Turn it on with: vhosty octane on [site]"
+      for v in $(octane_sites); do echo "octane-$v"; done ;;
+    octane-*)
+      case " $(octane_sites | tr '\n' ' ') " in
+        *" ${a#octane-} "*) echo "$a" ;;
+        *) die "'${a#octane-}' doesn't run on Octane. Turn it on with: vhosty octane on ${a#octane-}" ;;
+      esac ;;
+    *) die "Unknown service '$a' (use caddy, php, php-8.x, octane, octane-<site>, or all)" ;;
   esac
 }
 
-svc_log() { case "$1" in caddy) echo "$CADDY_LOG" ;; php-*) fpm_log "${1#php-}" ;; esac; }
+svc_log() { case "$1" in caddy) echo "$CADDY_LOG" ;; php-*) fpm_log "${1#php-}" ;; octane-*) echo "$LOG_DIR/$1.log" ;; esac; }
 
 svc_cmd() { # the command line that runs a service
   case "$1" in
     caddy) printf '%s\n' "$CADDY_BIN" run --config "$CADDYFILE" --adapter caddyfile --envfile "$SECRETS_FILE" ;;
     php-*) printf '%s\n' "$(fpm_bin "${1#php-}")" --nodaemonize --fpm-config "$(fpm_conf "${1#php-}")" ;;
+    octane-*) octane_cmd "${1#octane-}" ;;
   esac
 }
 
 # --- Linux: systemd user units ---------------------------------------------
 sd() { systemctl --user "$@"; }
-unit_of() { case "$1" in caddy) echo vhosty-caddy.service ;; php-*) echo "vhosty-php@${1#php-}.service" ;; esac; }
+unit_of() { case "$1" in caddy) echo vhosty-caddy.service ;; php-*) echo "vhosty-php@${1#php-}.service" ;; octane-*) echo "vhosty-$1.service" ;; esac; }
+
+# One unit per site, not a template: each has its own folder and command line.
+# With no ExecReload, a reload restarts it, so a rebuild picks up a new PHP pin.
+write_octane_unit() { # write_octane_unit NAME
+  local name="$1" dir
+  dir="$(site_dir "$name")"
+  cat >"$UNIT_DIR/vhosty-octane-$name.service" <<EOF
+# Generated by vhosty
+[Unit]
+Description=vhosty: Laravel Octane for $name.$VHOSTY_DOMAIN
+
+[Service]
+WorkingDirectory=${dir//\%/%%}
+Environment=OCTANE_HTTPS=true
+Environment="PATH=$(octane_path)"
+Environment="PHP_INI_SCAN_DIR=:$(octane_ini_dir "$name")"
+Environment="PWD=${dir//\%/%%}"
+ExecStart=$(octane_cmd "$name" | tr '\n' ' ' | sed 's/ $//')
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+StandardOutput=append:$LOG_DIR/octane-$name.log
+StandardError=append:$LOG_DIR/octane-$name.log
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+# Units for sites that no longer run on Octane: their names
+sd_stale_octane() {
+  local f s keep
+  keep=" $(octane_sites | tr '\n' ' ') "
+  for f in "$UNIT_DIR"/vhosty-octane-*.service; do
+    [ -f "$f" ] || continue
+    s="${f##*/vhosty-octane-}"; s="${s%.service}"
+    case "$keep" in *" $s "*) ;; *) echo "$s" ;; esac
+  done
+}
 
 write_units() {
+  local name
   mkdir -p "$UNIT_DIR" "$LOG_DIR" "$RUN_DIR"
   cat >"$UNIT_DIR/vhosty-caddy.service" <<EOF
 # Generated by vhosty
@@ -1937,6 +2195,7 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+  for name in $(octane_sites); do write_octane_unit "$name"; done
   sd daemon-reload
 }
 
@@ -1970,8 +2229,15 @@ launchd_field() {
     | awk -F'= ' -v key="$2" '$0 ~ "^\t" key " = " {print $2; exit}' || true
 }
 
+xml_escape() { sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
 write_plist() { # write_plist NAME
-  local name="$1" args="" a dest
+  local name="$1" args="" a dest workdir="$VHOSTY_DIR" env=""
+  case "$name" in
+    octane-*)
+      workdir="$(site_dir "${name#octane-}" | xml_escape)"
+      env="<key>OCTANE_HTTPS</key><string>true</string><key>PATH</key><string>$(octane_path | xml_escape)</string><key>PHP_INI_SCAN_DIR</key><string>:$(octane_ini_dir "${name#octane-}" | xml_escape)</string><key>PWD</key><string>$workdir</string>" ;;
+  esac
   while IFS= read -r a; do
     args="$args    <string>$a</string>
 "
@@ -1986,12 +2252,12 @@ EOF
 <dict>
   <key>Label</key><string>$(label_of "$name")</string>
   <key>UserName</key><string>$VHOSTY_USER</string>
-  <key>WorkingDirectory</key><string>$VHOSTY_DIR</string>
+  <key>WorkingDirectory</key><string>$workdir</string>
   <key>ProgramArguments</key>
   <array>
 $args  </array>
   <key>EnvironmentVariables</key>
-  <dict><key>HOME</key><string>$VHOSTY_HOME_DIR</string></dict>
+  <dict><key>HOME</key><string>$VHOSTY_HOME_DIR</string>$env</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$(svc_log "$name")</string>
@@ -2122,6 +2388,12 @@ svc_sync() {
     write_units
     sd enable --now --quiet vhosty-logs.timer
     for s in $(sd_stale_php | sort -u); do svc_remove "$s"; ok "stopped $s (no longer used)"; done
+    for s in $(sd_stale_octane); do
+      svc_remove "vhosty-octane-$s.service"
+      rm -f "$UNIT_DIR/vhosty-octane-$s.service"
+      sd daemon-reload
+      ok "stopped octane-$s (no longer used)"
+    done
   else
     sudo -v
     for s in $(launchd_stale); do svc_remove "$s"; ok "removed $(label_of "$s") (no longer used)"; done
@@ -2157,7 +2429,8 @@ hash_stdin() {
 generated_hash() {
   local v
   { cat "$CADDYFILE" 2>/dev/null || true
-    for v in $(php_versions_in_use); do cat "$(fpm_conf "$v")" 2>/dev/null || true; done; } | hash_stdin
+    for v in $(php_versions_in_use); do cat "$(fpm_conf "$v")" 2>/dev/null || true; done
+    for v in $(octane_sites); do cat "$(octane_ini_dir "$v")"/* 2>/dev/null || true; done; } | hash_stdin
 }
 
 mark_applied() { mkdir -p "$RUN_DIR"; generated_hash >"$APPLIED_STAMP"; }
@@ -2165,15 +2438,27 @@ mark_applied() { mkdir -p "$RUN_DIR"; generated_hash >"$APPLIED_STAMP"; }
 # True when the generated files match what the config would generate now
 config_in_sync() {
   local tmp rc=0 v
+  local real_octane="$OCTANE_CONF_DIR"
   make_tmp tmp -d
   # The shim has its own path written in, so only its output moves
-  ( CADDYFILE="$tmp/Caddyfile"; PHP_CONF_DIR="$tmp/php"; SHIM_OUT="$tmp/php-shim"
+  ( CADDYFILE="$tmp/Caddyfile"; PHP_CONF_DIR="$tmp/php"; SHIM_OUT="$tmp/php-shim"; OCTANE_CONF_DIR="$tmp/octane"
     write_error_page() { error_page_html >"$tmp/error.html"; }
     write_configs ) >/dev/null 2>&1 || rc=1
   cmp -s "$tmp/Caddyfile" "$CADDYFILE" || rc=1
   cmp -s "$tmp/error.html" "$ERROR_PAGE" || rc=1
   if php_enabled; then cmp -s "$tmp/php-shim" "$PHP_SHIM" || rc=1; fi
   for v in $(php_versions_in_use); do cmp -s "$tmp/php/$v/php-fpm.conf" "$(fpm_conf "$v")" || rc=1; done
+  mkdir -p "$tmp/octane"
+  if [ -d "$real_octane" ]; then diff -r "$tmp/octane" "$real_octane" >/dev/null 2>&1 || rc=1
+  elif [ -n "$(ls -A "$tmp/octane")" ]; then rc=1; fi
+  # The units hold what was true at the rebuild: where Node is, whether to watch
+  if is_linux && svc_installed; then
+    mkdir -p "$tmp/units"
+    for v in $(octane_sites); do
+      ( UNIT_DIR="$tmp/units"; write_octane_unit "$v" ) >/dev/null 2>&1 || rc=1
+      cmp -s "$tmp/units/vhosty-octane-$v.service" "$UNIT_DIR/vhosty-octane-$v.service" || rc=1
+    done
+  fi
   rm -rf "$tmp"
   return $rc
 }
@@ -2524,7 +2809,7 @@ cmd_unlink() {
     SITE_LINKED="no"
     site_save "$name"
   else
-    [ -z "$SITE_PHP$SITE_INI" ] || info "its PHP pin and settings are removed too"
+    [ -z "$SITE_PHP$SITE_INI$SITE_OCTANE" ] || info "its PHP pin, settings and Octane service are removed too"
     rm -f "$(site_file "$name")"
   fi
   ok "unlinked $name"
@@ -2555,6 +2840,7 @@ cmd_site() {
   [ -n "$dir" ] || die "No site '$name'. Run: vhosty sites"
   if [ "$SITE_LINKED" = "yes" ]; then source="linked"; else source="parked in ${dir%/*}"; fi
   if [ ! -d "$dir" ]; then kind="${R}folder missing${N}"
+  elif php_enabled && [ -n "$SITE_OCTANE" ]; then kind="Laravel Octane"
   elif php_enabled && [ -f "$dir/public/index.php" ]; then kind="PHP (public/index.php)"
   elif [ -f "$dir/index.html" ]; then kind="static (index.html)"
   else kind="${Y}nothing to serve yet${N} (no public/index.php or index.html)"; fi
@@ -2568,7 +2854,16 @@ cmd_site() {
   printf "%s%s%s  https://%s.%s\n" "$B" "$name" "$N" "$name" "$VHOSTY_DOMAIN"
   printf "  %-10s %s\n" "Folder" "$dir" "Source" "$source" "Serves" "$kind"
   if php_enabled; then
-    printf "  %-10s %s\n" "PHP" "$v" "Settings" "$settings" "FPM" "$sock"
+    printf "  %-10s %s\n" "PHP" "$v" "Settings" "$settings"
+    if [ -n "$SITE_OCTANE" ]; then
+      if is_macos; then sudo -v; fi
+      printf "  %-10s %s\n" "Octane" "$(octane_server "$dir"), port $SITE_OCTANE, ${SITE_OCTANE_WORKERS:-$OCTANE_WORKERS} workers, $(svc_state "octane-$name")"
+      if [ "$(octane_server "$dir")" = "frankenphp" ]; then
+        printf "  %-10s %s\n" "" "FrankenPHP has its own PHP: the version and extensions above are for the CLI only; the settings apply"
+      fi
+    else
+      printf "  %-10s %s\n" "FPM" "$sock"
+    fi
     if [ -n "$SITE_INI" ]; then
       printf '%s\n' "$SITE_INI" | while IFS= read -r kv; do printf "  %-10s %s = %s\n" "" "${kv%%=*}" "${kv#*=}"; done
     fi
@@ -2651,7 +2946,106 @@ cmd_status() {
   for v in $(php_versions_in_use); do
     if [ -S "$(fpm_sock "$v")" ]; then ok "PHP $v → $(fpm_sock "$v")"; else bad "no socket for PHP $v"; fi
   done
+  for s in $(octane_sites); do
+    site_load "$s"
+    if [ -n "$(port_owner "$SITE_OCTANE")" ]; then ok "Octane $s → 127.0.0.1:$SITE_OCTANE"
+    else bad "nothing listening on $SITE_OCTANE for $s (see: vhosty logs octane-$s)"; fi
+  done
   echo
+}
+
+# ---------------------------------------------------------------------------
+# Commands: Laravel Octane
+# ---------------------------------------------------------------------------
+cmd_octane() {
+  local sub="${1:-list}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    list|ls)     cmd_octane_list ;;
+    on|enable)   cmd_octane_on "$@" ;;
+    off|disable) cmd_octane_off "${1:-}" ;;
+    reload)      cmd_octane_reload "${1:-}" ;;
+    *) die "Usage: vhosty octane [list | on [site] [--workers N] | off [site] | reload [site]]" ;;
+  esac
+}
+
+cmd_octane_list() {
+  need_config
+  is_macos && sudo -v
+  local name dir any=0
+  for name in $(octane_sites); do
+    any=1
+    site_load "$name"
+    dir="$(site_dir "$name")"
+    printf "  https://%s.%s  %s(%s, port %s, %s workers, %s)%s\n" "$name" "$VHOSTY_DOMAIN" "$D" \
+      "$(octane_server "$dir")" "$SITE_OCTANE" "${SITE_OCTANE_WORKERS:-$OCTANE_WORKERS}" "$(svc_state "octane-$name")" "$N"
+  done
+  [ "$any" = "1" ] || info "No site runs on Octane. Turn it on with: vhosty octane on [site]"
+}
+
+cmd_octane_on() {
+  need_config
+  php_enabled || die "PHP is turned off in ~/.vhosty/config"
+  local arg="" workers="" name dir port code i
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workers) [ -n "${2:-}" ] || die "--workers needs a number"; workers="$2"; shift 2 ;;
+      -*) die "Unknown option '$1'. Usage: vhosty octane on [site] [--workers N]" ;;
+      *) [ -z "$arg" ] || die "Usage: vhosty octane on [site] [--workers N]"; arg="$1"; shift ;;
+    esac
+  done
+  case "$workers" in
+    *[!0-9]*|0*) die "--workers needs a number, 1 or more" ;;
+  esac
+  name="$(resolve_site "$arg")"
+  dir="$(site_dir "$name")" || die "No folder for '$name' in your parked folders. Run: vhosty sites"
+  [ -d "$dir" ] || die "No folder for '$name' in your parked folders. Run: vhosty sites"
+  [ -f "$dir/vendor/laravel/octane/composer.json" ] || die "$name doesn't have Laravel Octane. In its folder, run: composer require laravel/octane && php artisan octane:install"
+  octane_prepare "$name" "$dir"
+  site_load "$name"
+  port="${SITE_OCTANE:-$(octane_free_port)}"
+  SITE_PATH="$dir"
+  SITE_OCTANE="$port"
+  [ -z "$workers" ] || SITE_OCTANE_WORKERS="$workers"
+  site_save "$name"
+  ok "$name now runs on Octane ($(octane_server "$dir"), port $port)"
+  cmd_rebuild
+  svc_installed || return 0
+  i=0
+  while [ "$i" -lt 30 ]; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 5 "http://127.0.0.1:$port/" 2>/dev/null || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then break; fi
+    code=""; i=$((i + 1)); sleep 1
+  done
+  if [ -n "$code" ]; then ok "https://$name.$VHOSTY_DOMAIN is up"
+  else warn "Octane isn't answering yet. See: vhosty logs octane-$name"; fi
+  if ! grep -q trustProxies "$dir/bootstrap/app.php" 2>/dev/null; then
+    info "Links are https already. For \$request->ip() to be the device and not 127.0.0.1, trust the proxy:"
+    info "\$middleware->trustProxies(at: ['127.0.0.1', '::1']); in bootstrap/app.php"
+  fi
+}
+
+cmd_octane_off() {
+  need_config
+  local name
+  name="$(resolve_site "${1:-}")"
+  site_load "$name"
+  [ -n "$SITE_OCTANE" ] || die "$name doesn't run on Octane. See: vhosty octane"
+  SITE_OCTANE=""
+  SITE_OCTANE_WORKERS=""
+  site_save "$name"
+  ok "$name is back on PHP-FPM"
+  cmd_rebuild
+}
+
+cmd_octane_reload() {
+  need_config
+  local name dir
+  name="$(resolve_site "${1:-}")"
+  site_load "$name"
+  [ -n "$SITE_OCTANE" ] || die "$name doesn't run on Octane. Turn it on with: vhosty octane on $name"
+  dir="$(site_dir "$name")" || die "No folder for '$name'. Run: vhosty sites"
+  ( cd "$dir" && "$PHP_SHIM" artisan octane:reload ) || die "octane:reload failed. Is it running? See: vhosty status"
 }
 
 # ---------------------------------------------------------------------------
@@ -2886,6 +3280,7 @@ install_exts() { # install_exts VERSION ext...
     if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded"; fi
   done
   if svc_running "php-$v"; then svc_restart "php-$v"; ok "restarted php-$v"; fi
+  octane_restart_php "$v"
 }
 
 # macOS: shivammathur/extensions' <ext>@X.Y when there is one (it writes
@@ -2919,6 +3314,7 @@ install_exts_brew() { # install_exts_brew VERSION ext...
     if ext_loaded "$v" "$e"; then ok "PHP $v: $e"; else bad "PHP $v: $e installed but not loaded (see: $(brew_prefix)/etc/php/$v/conf.d)"; fi
   done
   if svc_running "php-$v"; then svc_restart "php-$v"; ok "restarted php-$v"; fi
+  octane_restart_php "$v"
 }
 
 cmd_ext() {
@@ -3961,7 +4357,7 @@ cmd_sites() {
         info "$name (a number: https://$lname.$VHOSTY_DOMAIN is the port route, not this folder)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
         site_load "$lname"
-        printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")" "$note" "$N"
+        printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")$([ -n "$SITE_OCTANE" ] && echo ", Octane")" "$note" "$N"
       elif [ -f "$p/index.html" ]; then
         printf "  https://%s.%s  %s(static%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$note" "$N"
       else
@@ -4256,6 +4652,7 @@ EOF
   if is_linux; then
     printf "  Services      %s/vhosty-caddy.service\n" "$UNIT_DIR"
     printf "                %s/vhosty-php@.service\n" "$UNIT_DIR"
+    if [ -n "$(octane_sites)" ]; then printf "                %s/vhosty-octane-<site>.service\n" "$UNIT_DIR"; fi
     printf "                %s/vhosty-logs.timer (log rotation)\n" "$UNIT_DIR"
   else
     printf "  Services      %s\n" "$(plist_for caddy)"
@@ -4311,6 +4708,7 @@ describe_site() { # one line about a site config: what would be lost
   [ -z "$SITE_PHP" ] || what="${what:+$what, }PHP $SITE_PHP"
   [ -z "$SITE_INI" ] || what="${what:+$what, }settings ($(printf '%s\n' "$SITE_INI" | cut -d= -f1 | tr '\n' ' ' | sed 's/ $//'))"
   [ -z "$SITE_EXT" ] || what="${what:+$what, }extensions ($SITE_EXT)"
+  [ -z "$SITE_OCTANE" ] || what="${what:+$what, }Octane"
   printf '%s  %s(%s; was %s)%s' "$1" "$D" "${what:-no settings}" "${SITE_PATH:-?}" "$N"
 }
 
@@ -4514,6 +4912,11 @@ doctor_checks() {
     cmd_ext_check
   fi
 
+  if [ -n "$(octane_sites)" ]; then
+    head_ "Octane"
+    octane_checks
+  fi
+
   head_ "Services"
   if is_linux; then
     if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
@@ -4588,7 +4991,7 @@ cmd_uninstall() {
     for s in $(sd list-unit-files 'vhosty-*' --plain --no-legend 2>/dev/null | awk '{print $1}'; sd list-units 'vhosty-php@*' --all --plain --no-legend 2>/dev/null | awk '{print $1}'); do
       svc_remove "$s"
     done
-    rm -f "$UNIT_DIR/vhosty-caddy.service" "$UNIT_DIR/vhosty-php@.service" "$UNIT_DIR/vhosty-logs.service" "$UNIT_DIR/vhosty-logs.timer"
+    rm -f "$UNIT_DIR/vhosty-caddy.service" "$UNIT_DIR/vhosty-php@.service" "$UNIT_DIR/vhosty-logs.service" "$UNIT_DIR/vhosty-logs.timer" "$UNIT_DIR"/vhosty-octane-*.service
     sd daemon-reload
     ok "removed the systemd user services"
     info "Linger stays on (other user services may need it). To turn it off: sudo loginctl disable-linger $VHOSTY_USER"
@@ -4645,6 +5048,13 @@ ${B}PHP${N}
   vhosty ext check                   Check every site against its PHP version
   ${D}php, php artisan and composer use the site's version inside its folder.${N}
 
+${B}Laravel Octane${N}
+  vhosty octane [list]               Sites running on Octane
+  vhosty octane on [site] [--workers N]  Run the site on Octane, as a service (default: 2 workers)
+  vhosty octane off [site]           Back to PHP-FPM
+  vhosty octane reload [site]        Reload its workers (code changes reload by themselves)
+  ${D}Its service is octane-<site>: vhosty restart octane-<site>, vhosty logs octane-<site>${N}
+
 ${B}PHP settings${N} ${D}(default scope: the current folder's site, else global)${N}
   vhosty ini [--global|--site N]     Show settings
   vhosty ini set <key> <value> [..]  Set one, e.g. vhosty ini set memory_limit 2G
@@ -4666,9 +5076,9 @@ ${B}Docker services${N} ${D}(docker compose in VHOSTY_SERVICES_DIR)${N}
                                      Put a backup back: config, volumes, then databases
 
 ${B}Caddy and PHP-FPM${N}
-  vhosty start   [caddy|php|php-8.x] Start services (default: all)
-  vhosty stop    [caddy|php|php-8.x] Stop services
-  vhosty restart [caddy|php|php-8.x] Validate config, then restart
+  vhosty start   [caddy|php|php-8.x|octane-<site>] Start services (default: all)
+  vhosty stop    [caddy|php|php-8.x|octane-<site>] Stop services
+  vhosty restart [caddy|php|php-8.x|octane-<site>] Validate config, then restart
   vhosty status                      Service state, PIDs, and sockets
   vhosty logs [service] [N]          Show the last N log lines (default 100)
   vhosty logs rotate [--force]       Rotate logs over VHOSTY_LOG_MAX_MB (runs daily on its own)
@@ -4710,6 +5120,7 @@ main() {
     isolate)            cmd_isolate "${1:-}" "${2:-}" ;;
     unisolate)          cmd_unisolate "${1:-}" ;;
     isolated)           cmd_isolated ;;
+    octane)             cmd_octane "$@" ;;
     ini)                cmd_ini "$@" ;;
     ext|exts|extension|extensions) cmd_ext "$@" ;;
     services|svc|db)    cmd_services "$@" ;;

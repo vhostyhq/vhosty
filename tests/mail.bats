@@ -472,8 +472,13 @@ refused() {
   printf 'services:\n  web:\n    image: nginx:1\n' >"$SVC/compose.yaml"
   # A PATH without docker
   mkdir -p "$HOME/nodocker"
-  for c in bash sed awk grep tr cut head tail uname id cat cp mkdir mktemp dirname basename date rm sort ss lsof; do
-    if command -v "$c" >/dev/null; then ln -s "$(command -v "$c")" "$HOME/nodocker/$c"; fi
+  # Everything else, as the rebuild that makes the proxy needs plenty
+  IFS=: read -ra dirs <<<"$PATH"
+  for d in "${dirs[@]}"; do
+    for f in "$d"/*; do
+      c="${f##*/}"
+      if [ "$c" != docker ] && [ -x "$f" ] && [ ! -e "$HOME/nodocker/$c" ]; then ln -s "$f" "$HOME/nodocker/$c"; fi
+    done
   done
   run env PATH="$HOME/nodocker" bash -c "source '$ROOT/bin/vhosty'; trap cleanup_tmp EXIT; load_config; cmd_mail add"
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
@@ -756,3 +761,134 @@ exit 0'
   [ "$(vh service_kind docker.io/axllent/mailpit)" = mail ]
   [ "$(vh service_kind someone/mailpit-exporter:1)" = volume ]
 }
+
+# ---------------------------------------------------------------- mail.<domain>
+
+mail_config() { # mail_config [SMTP] [WEB]: the file exists, and compose reports Mailpit
+  mkdir -p "$SVC"
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
+  echo "VHOSTY_SERVICES_DIR=\"$SVC\"" >>"$VHOSTY_DIR/config"
+  echo '{"services":{"mailpit":{"image":"axllent/mailpit:v1.33","ports":[{"target":1025,"published":"'"${1:-1025}"'"},{"target":8025,"published":"'"${2:-8025}"'"}]}}}' >"$HOME/config.json"
+}
+
+@test "mail add gives the page mail.<domain>, and vhosty mail prints it" {
+  mail_config
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "https://mail.test.example → localhost:8025"
+  assert_contains "$output" "Caught mail: https://mail.test.example"
+  [ "$(sed -n 's/^PROXY_PORT=//p' "$VHOSTY_DIR/proxies/mail.conf")" = 8025 ]
+  grep -q "reverse_proxy localhost:8025" "$VHOSTY_DIR/Caddyfile"
+  run linux main mail
+  assert_contains "$output" "Caught mail: https://mail.test.example"
+  refute_contains "$output" "https://8025"
+}
+
+@test "mail add a second time leaves the proxy be, quietly" {
+  mail_config
+  linux main mail add >/dev/null 2>&1
+  before="$(cat "$VHOSTY_DIR/proxies/mail.conf")"
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "left it alone"
+  refute_contains "$output" "tailnet can"
+  [ "$(cat "$VHOSTY_DIR/proxies/mail.conf")" = "$before" ]
+}
+
+@test "mail add uses the port Mailpit really publishes" {
+  mail_config 1125 18025
+  sed -i.bak 's/^VHOSTY_DOMAIN=.*/&\nVHOSTY_PORTS="3000-5999 18025"/' "$VHOSTY_DIR/config"
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(sed -n 's/^PROXY_PORT=//p' "$VHOSTY_DIR/proxies/mail.conf")" = 18025 ]
+}
+
+@test "a Mailpit publishing no web page gets no proxy" {
+  mail_config
+  echo '{"services":{"mailpit":{"image":"axllent/mailpit:v1.33","ports":[{"target":1025,"published":"1025"}]}}}' >"$HOME/config.json"
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+  assert_contains "$output" "doesn't publish its web page"
+}
+
+@test "a parked folder called mail stays, with a warning, even if it isn't a site" {
+  mail_config
+  mkdir -p "$PARKED/mail"
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "$PARKED/mail already exists"
+  assert_contains "$output" "https://8025.test.example"
+  assert_contains "$output" "Caught mail: https://8025.test.example"
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+  [ -d "$PARKED/mail" ]
+}
+
+@test "a folder called Mail counts, as hostnames ignore case" {
+  mail_config
+  mkdir -p "$PARKED/Mail"
+  run linux main mail add
+  assert_contains "$output" "$PARKED/Mail already exists"
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+}
+
+@test "a linked site called mail stays, with a warning" {
+  mail_config
+  mkdir -p "$HOME/app/public"
+  echo '<?php' >"$HOME/app/public/index.php"
+  run linux main link "$HOME/app" --name mail
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "already a site called mail"
+  assert_contains "$output" "Caught mail: https://8025.test.example"
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+}
+
+@test "someone's proxy called mail, on another port, stays" {
+  mail_config
+  run linux main proxy mail 3000
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "goes to port 3000"
+  assert_contains "$output" "Caught mail: https://8025.test.example"
+  [ "$(sed -n 's/^PROXY_PORT=//p' "$VHOSTY_DIR/proxies/mail.conf")" = 3000 ]
+}
+
+@test "removing the proxy puts vhosty mail back on the port's URL" {
+  mail_config
+  linux main mail add >/dev/null 2>&1
+  run linux main unproxy mail
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux main mail
+  assert_contains "$output" "Caught mail: https://8025.test.example"
+}
+
+@test "mail add doesn't open a page VHOSTY_PORTS closed" {
+  mail_config
+  echo 'VHOSTY_PORTS="3000-5999"' >>"$VHOSTY_DIR/config"
+  run linux main mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+  assert_contains "$output" "VHOSTY_PORTS leaves out 8025"
+}
+
+@test "services init with Mailpit gives it the address too, and without it doesn't" {
+  run linux main services init "$SVC" --only mailpit
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ -f "$VHOSTY_DIR/proxies/mail.conf" ]
+  rm "$VHOSTY_DIR/proxies/mail.conf"
+  run linux main services init "$HOME/svc2" --only valkey
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+}
+
+@test "under Herd, no proxy: that route is Herd's" {
+  mail_config
+  echo 'VHOSTY_BACKEND="herd"' >>"$VHOSTY_DIR/config"
+  run vh mail_domain 8025
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+}
+

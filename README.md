@@ -531,9 +531,13 @@ MAIL_PASSWORD=null
 MAIL_ENCRYPTION=null
 ```
 
-SMTP is on 127.0.0.1:1025, and the web page is at `https://8025.yourdomain.dev`, which
-`VHOSTY_PORTS` includes by default. If yours leaves out 8025, `vhosty mail` says so and
-shows the setting to change. Mailpit keeps the newest 500 messages. It keeps them
+SMTP is on 127.0.0.1:1025. `mail add` and `services init` make the web page
+`https://mail.yourdomain.dev`, a [proxy](#named-proxies) like any other. If a site, a proxy,
+or a folder called `mail` in a parked folder already has that name, vhosty leaves it alone,
+warns, and the page stays at `https://8025.yourdomain.dev`. That address works either way
+while `VHOSTY_PORTS` includes 8025, as it does by default. If yours leaves it out, vhosty
+doesn't open the page for you: `vhosty mail` says so and shows the setting to change.
+Mailpit keeps the newest 500 messages. It keeps them
 across restarts, but `services backup` skips them: it's test mail. `vhosty doctor`
 lists which sites send to it.
 

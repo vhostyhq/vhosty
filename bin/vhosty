@@ -3964,6 +3964,7 @@ EOF
   else
     info "Start them with: vhosty services up"
   fi
+  case " $only " in *" mailpit "*) mail_domain 8025 ;; esac
 }
 
 # Run a snippet in a database container, over TCP: a fresh container runs a temporary
@@ -4338,6 +4339,50 @@ mail_service() {
        ((.value.ports // []) | map(select(.target == 8025))[0].published // "")] | join("|")'
 }
 
+# Is mail.<domain> this Mailpit's page?
+mail_proxied() { # mail_proxied WEB_PORT
+  if herd_mode; then return 1; fi
+  [ -f "$(proxy_file mail)" ] && [ "$(proxy_port mail)" = "$1" ]
+}
+
+# Any folder called mail in a parked folder, a site or not: it may be one tomorrow
+mail_folder_parked() {
+  local p f base
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    for f in "$p"/*/; do
+      f="${f%/}"; base="${f##*/}"
+      if [ -d "$f" ] && [ "$(lower "$base")" = "mail" ]; then echo "$f"; return 0; fi
+    done
+  done <<EOF
+$(parked_list)
+EOF
+  return 1
+}
+
+# Gives Mailpit's page mail.<domain> if nothing else has that name. What's there
+# stays, with a warning, and the page stays on its port's URL. VHOSTY_PORTS leaving
+# the port out means someone closed that page, so this doesn't open it again.
+mail_domain() { # mail_domain WEB_PORT
+  local web="$1" why="" url
+  if herd_mode || [ -z "$web" ] || ! mail_port_open "$web"; then return 0; fi
+  url="https://$web.$VHOSTY_DOMAIN"
+  if [ -f "$(proxy_file mail)" ]; then
+    mail_proxied "$web" || warn "The proxy 'mail' goes to port $(proxy_port mail), not Mailpit's, so vhosty left it alone. Mailpit's page stays at $url"
+    return 0
+  fi
+  if why="$(mail_folder_parked)"; then
+    why="$why already exists"
+  elif why="$(proxy_site_clash mail)"; then
+    why="there's already a site called mail ($why)"
+  else
+    cmd_proxy mail "$web"
+    return 0
+  fi
+  warn "$why, so vhosty left it alone. Mailpit's page stays at $url"
+  info "To use https://mail.$VHOSTY_DOMAIN instead, free up that name, then run: vhosty mail add"
+}
+
 mail_status() {
   local dir="$VHOSTY_SERVICES_DIR" file="" row="" svc="" smtp=1025 web=8025 rows s1 s2 s3 s4 st="" health="" later=" (once it's running)"
   printf "%sMail%s  Mailpit catches what your apps send; none of it leaves this machine\n" "$B" "$N"
@@ -4373,6 +4418,8 @@ EOF
   fi
   if [ -z "$web" ]; then
     warn "$svc doesn't publish its web page (port 8025 in the container). Add it to ports in $file"
+  elif mail_proxied "$web"; then
+    printf "  Caught mail: https://mail.%s%s\n" "$VHOSTY_DOMAIN" "$later"
   elif mail_port_open "$web"; then
     printf "  Caught mail: https://%s.%s%s\n" "$web" "$VHOSTY_DOMAIN" "$later"
   else
@@ -4450,7 +4497,7 @@ mail_insert_after() { # mail_insert_after FILE LINE TEXT
 mail_paste_block() {
   printf "\nAdd this under services:\n\n"
   compose_block mailpit 0 | sed '/^$/d'
-  printf "\nThis under the top-level volumes:\n\n  mailpit:\n\nThen: vhosty services up mailpit\n"
+  printf "\nThis under the top-level volumes:\n\n  mailpit:\n\nThen: vhosty services up mailpit, and vhosty mail add again for its address\n"
 }
 
 mail_refuse() { # mail_refuse FILE REASON
@@ -4486,7 +4533,9 @@ mail_add() {
   # Compose's own view counts first: it sees override and included files too
   if [ -n "$check" ]; then row="$(mail_service || true)"; fi
   if [ -n "$row" ] || [ "$MS_HAS" = 1 ] || [ "$MS_IMAGE" = 1 ]; then
-    ok "Mailpit is already set up in $dir, so nothing changed"
+    ok "Mailpit is already set up in $dir, so its compose file stays as it is"
+    # Compose says which port it's really on, and that it might not publish one
+    if [ -n "$row" ]; then mail_domain "$(printf '%s' "$row" | cut -d'|' -f3)"; else mail_domain 8025; fi
     echo
     mail_status
     return 0
@@ -4552,6 +4601,7 @@ mail_add() {
   else
     info "Start it with: vhosty services up mailpit"
   fi
+  mail_domain 8025
   echo
   mail_status
 }

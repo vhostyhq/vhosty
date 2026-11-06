@@ -29,6 +29,12 @@ _vhosty_sites() {
   (( ${#sites} )) && _values 'site' ${(u)sites}
 }
 
+_vhosty_proxies() {
+  local -a proxies
+  proxies=( "$(_vhosty_dir)"/proxies/*.conf(N:t:r) )
+  (( ${#proxies} )) && _values 'proxy' $proxies
+}
+
 _vhosty_links() {
   local f
   local -a links
@@ -77,6 +83,9 @@ _vhosty() {
     'link:Serve one folder as a site'
     'unlink:Remove a link'
     'links:List links'
+    'proxy:Send a name to a port on this machine'
+    'unproxy:Remove a proxy'
+    'proxies:List proxies'
     'sites:List sites and their URLs'
     'site:Everything about one site'
     'open:Open a site in the browser'
@@ -130,7 +139,12 @@ _vhosty() {
     park|unpark)   _files -/ ;;
     link)          _arguments '1:folder:_files -/' '--name[Site name]:name:' ;;
     unlink)        _vhosty_links ;;
-    open|url|site|unisolate) _vhosty_sites ;;
+    proxy)
+      if (( CURRENT == 3 )); then _vhosty_proxies
+      elif (( CURRENT == 4 )); then _message 'port'; fi ;;
+    unproxy)       _vhosty_proxies ;;
+    open|url|site) _alternative 'sites:site:_vhosty_sites' 'proxies:proxy:_vhosty_proxies' ;;
+    unisolate)     _vhosty_sites ;;
     isolate)
       if (( CURRENT == 3 )); then _vhosty_php_versions; else _vhosty_sites; fi ;;
     php)

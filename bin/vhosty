@@ -3723,7 +3723,7 @@ EOF
 # ---------------------------------------------------------------------------
 # Commands: services init, backup, restore
 # ---------------------------------------------------------------------------
-SERVICES_CATALOG="mysql postgres valkey meilisearch typesense rustfs"
+SERVICES_CATALOG="mysql postgres valkey meilisearch typesense rustfs mailpit"
 HELPER_IMAGE="alpine:3"   # archives volumes; anything with sh, tar and gzip works
 BACKUP_SKIP_DBS='^test$|_test(ing)?(_[0-9]+)?$'   # test databases: the test suites recreate them
 
@@ -3849,6 +3849,26 @@ EOF
 
 EOF
     ;;
+    mailpit) cat <<EOF
+  mailpit:
+    image: axllent/mailpit:v1.33 # catches outgoing mail: vhosty mail
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db # in the volume, so caught mail survives a restart
+      MP_MAX_MESSAGES: 500 # then the oldest go first
+      # Apps left with a MAIL_USERNAME still deliver: it only listens on 127.0.0.1
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+    ports:
+      - "127.0.0.1:1025:1025" # SMTP
+      - "127.0.0.1:8025:8025" # web page, at https://8025.<your domain>
+    volumes: [mailpit:/data]
+
+EOF
+    ;;
   esac
 }
 
@@ -3873,7 +3893,9 @@ cmd_services_init() { # [dir] [--only svc,..] [--force]
   mkdir -p "$dir"
   dir="$(cd "$dir" && pwd)"
   if [ -f "$dir/compose.yaml" ] && [ -z "$force" ]; then
-    die "$dir/compose.yaml already exists. Add --force to replace it (the data in Docker volumes stays)"
+    local hint=""
+    case " $only " in *" mailpit "*) hint=" To add Mailpit and change nothing else in it: vhosty mail add" ;; esac
+    die "$dir/compose.yaml already exists. Add --force to replace it (the data in Docker volumes stays).$hint"
   fi
   mem="$(services_mem_mb)"
   name="$(basename "$dir" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')"
@@ -3914,6 +3936,7 @@ EOF
   save_config
   ok "wrote $dir/compose.yaml: $(echo $only | tr ' ' ','), sized for $mem MB"
   ok "keys in $env_file"
+  case " $only " in *" mailpit "*) info "Mailpit catches mail from your apps. For its address and .env lines: vhosty mail" ;; esac
   for p in $(dc config --format json 2>/dev/null | jq -r '.services[].ports[]?.published // empty'); do
     [ -z "$(port_owner "$p")" ] || busy="$busy $p"
   done
@@ -3947,7 +3970,7 @@ pg_in() { # pg_in SERVICE 'snippet' [args, as $1..]
     '"$snip" sh "$@"
 }
 
-service_kind() { # image → mysql | postgres | volume
+service_kind() { # image → mysql | postgres | mail | volume
   # By the image's own name, without registry, owner or tag: mysql:8.4 and
   # pgvector/pgvector:pg18 are databases, prom/mysqld-exporter isn't
   local base="${1##*/}"
@@ -3955,6 +3978,7 @@ service_kind() { # image → mysql | postgres | volume
   case "$base" in
     mysql|mysql-server|mariadb|percona|percona-server) echo mysql ;;
     postgres|postgresql|pgvector|postgis|timescaledb|timescaledb-ha) echo postgres ;;
+    mailpit) echo mail ;;
     *) echo volume ;;
   esac
 }
@@ -4092,6 +4116,8 @@ cmd_services_backup() { # [--to DIR]
   [ -n "$images" ] || die "No services in $VHOSTY_SERVICES_DIR/compose.yaml"
   for line in $images; do
     svc="${line%%|*}"; image="${line#*|}"; kind="$(service_kind "$image")"
+    # Test mail, capped and throwaway: not worth stopping it, and dropping what's being sent
+    if [ "$kind" = "mail" ]; then info "$svc: caught mail isn't backed up"; continue; fi
     cid="$(service_container "$svc")"
     if [ -z "$cid" ]; then warn "$svc: no container yet, skipped (vhosty services up $svc)"; skipped="$skipped $svc"; continue; fi
     mkdir -p "$partial/$svc"
@@ -4245,6 +4271,274 @@ cmd_services_restore() { # <backup> [--into DIR] [--replace-config] [--yes]
   echo
   ok "restored $n item(s) in $(( $(date +%s) - t0 ))s"
   services_status
+}
+
+# ---------------------------------------------------------------------------
+# Commands: mail (Mailpit, one of the Docker services)
+# ---------------------------------------------------------------------------
+cmd_mail() {
+  need_config
+  local sub="${1:-status}"
+  [ $# -eq 0 ] || shift
+  case "$sub" in
+    status|st) mail_status ;;
+    add)       mail_add "$@" ;;
+    -h|--help|help) echo "Usage: vhosty mail [status | add]" ;;
+    *) die "Usage: vhosty mail [status | add]" ;;
+  esac
+}
+
+# Does <port>.domain reach this port? The same reading of VHOSTY_PORTS as port_expr
+mail_port_open() { # mail_port_open PORT
+  local r
+  for r in $VHOSTY_PORTS; do
+    case "$r" in
+      *-*) if [ "$1" -ge "${r%-*}" ] 2>/dev/null && [ "$1" -le "${r#*-}" ] 2>/dev/null; then return 0; fi ;;
+      *)   if [ "$1" = "$r" ]; then return 0; fi ;;
+    esac
+  done
+  return 1
+}
+
+# The file docker compose reads in a folder, in its own order of preference
+mail_compose_file() { # mail_compose_file DIR
+  local f
+  for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+    if [ -f "$1/$f" ]; then echo "$1/$f"; return 0; fi
+  done
+  return 1
+}
+
+# Mailpit in the compose project, by service name or image, as
+# service|SMTP port|web port. Its ports can be changed in compose.yaml, so the
+# ones it really publishes. Fails when compose can't read the project.
+mail_service() {
+  dc config --format json 2>/dev/null | jq -r '.services | to_entries[]
+    | select(.key == "mailpit" or ((.value.image // "") | test("(^|/)mailpit([:@]|$)")))
+    | [.key,
+       ((.value.ports // []) | map(select(.target == 1025))[0].published // ""),
+       ((.value.ports // []) | map(select(.target == 8025))[0].published // "")] | join("|")'
+}
+
+mail_status() {
+  local dir="$VHOSTY_SERVICES_DIR" file="" row="" svc="" smtp=1025 web=8025 rows s1 s2 s3 s4 st="" health="" later=" (once it's running)"
+  printf "%sMail%s  Mailpit catches what your apps send; none of it leaves this machine\n" "$B" "$N"
+  [ -z "$dir" ] || file="$(mail_compose_file "$dir" || true)"
+  if [ -z "$file" ]; then
+    warn "Mailpit isn't set up. Add it: vhosty mail add"
+  elif ! ( need_services ) 2>/dev/null; then
+    warn "Can't tell if Mailpit is running: $( ( need_services ) 2>&1 | sed 's/^error: //')"
+  elif ! row="$(mail_service)"; then
+    warn "docker compose can't read $file. Check it: vhosty services edit"
+  elif [ -z "$row" ]; then
+    warn "Mailpit isn't in $file. Add it: vhosty mail add"
+  else
+    IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+    rows="$(services_rows || true)"
+    while IFS="|" read -r s1 s2 s3 s4; do
+      if [ "$s1" = "$svc" ]; then st="$s2"; health="$s3"; fi
+    done <<EOF
+$rows
+EOF
+    if [ "$st" = "running" ] && [ "$health" != "unhealthy" ]; then ok "Mailpit running${health:+ ($health)}"; later=""
+    else warn "Mailpit ${st:-not created}${health:+ ($health)}. Start it: vhosty services up $svc"; fi
+    [ -n "$smtp" ] || warn "$svc doesn't publish SMTP (port 1025 in the container), so apps can't reach it. Add it to ports in $file"
+  fi
+  if [ -z "$web" ]; then
+    warn "$svc doesn't publish its web page (port 8025 in the container). Add it to ports in $file"
+  elif mail_port_open "$web"; then
+    printf "  Caught mail: https://%s.%s%s\n" "$web" "$VHOSTY_DOMAIN" "$later"
+  else
+    warn "VHOSTY_PORTS leaves out $web, so the mail page can't be reached from your tailnet"
+    info "To open it, set this in ~/.vhosty/config, then run: vhosty rebuild"
+    info "  VHOSTY_PORTS=\"${VHOSTY_PORTS:+$VHOSTY_PORTS }$web\""
+    info "On this machine it's at http://127.0.0.1:$web"
+  fi
+  printf "\nFor an app, add these to its .env (vhosty never edits it):\n\n"
+  printf 'MAIL_MAILER=smtp\nMAIL_SCHEME=null\nMAIL_HOST=127.0.0.1\nMAIL_PORT=%s\nMAIL_USERNAME=null\nMAIL_PASSWORD=null\nMAIL_ENCRYPTION=null\n\n' "${smtp:-1025}"
+  info "Remove MAIL_URL if the app has it: it overrides these."
+  info "Then: php artisan config:clear if its config is cached, and restart its queue workers and Octane."
+}
+
+# Reads a compose file without a YAML parser: top-level keys start in the first
+# column, so the two sections are found line by line. Sets MS_WHY to the reason
+# not to edit it, and for each section its key's line, its last line, its
+# children's indent and whether Mailpit is in it (MS_IMAGE: under another name).
+mail_scan() { # mail_scan FILE
+  local scan
+  scan="$(awk -v q="'" '
+  function plain(s) { gsub(/"/, "", s); gsub(q, "", s); return s }
+  function block(s, key) { return s ~ ("^" key ":[ \t]*$") || s ~ ("^" key ":[ \t]+#") }
+  /\r$/ { why = "it has Windows line endings" }
+  /^(---|\.\.\.)([ \t]|$)/ { if (keys) why = "it holds more than one YAML document"; next }
+  /^[ \t\r]*$/ || /^#/ { next }
+  /^\t/ { why = "it is indented with tabs"; next }
+  /^[^ ]/ {
+    keys = 1; sec = ""
+    if ($0 ~ /^services:/) {
+      if (sl) why = "it has two services: keys"
+      if (!block($0, "services")) why = "its services: is not a plain block"
+      sl = NR; se = NR; sec = "s"
+    } else if ($0 ~ /^volumes:/) {
+      if (vl) why = "it has two volumes: keys"
+      if (!block($0, "volumes")) why = "its volumes: is not a plain block"
+      vl = NR; ve = NR; sec = "v"
+    }
+    next
+  }
+  /^ *#/ { if (sec == "s") se = NR; if (sec == "v") ve = NR; next }
+  sec == "s" {
+    se = NR; match($0, /^ */); n = RLENGTH; if (!si) si = n
+    l = plain($0)
+    if (n == si && l ~ /^ *mailpit[ \t]*:/) has = 1
+    if (l ~ /^ +image:[ \t]*([^ \t#]*\/)?mailpit([:@ \t#]|$)/) img = 1
+  }
+  sec == "v" {
+    ve = NR; match($0, /^ */); n = RLENGTH; if (!vi) vi = n
+    if (n == vi && plain($0) ~ /^ *mailpit[ \t]*:/) vhas = 1
+  }
+  END {
+    if (!sl && !why) why = "it has no top-level services: block"
+    printf "%s|%d|%d|%d|%d|%d|%d|%d|%d\n", why, se, si ? si : 2, has, img, vl, ve ? ve : NR, vi ? vi : 2, vhas
+  }' "$1")"
+  IFS='|' read -r MS_WHY MS_SVC_END MS_SVC_INDENT MS_HAS MS_IMAGE MS_VOL MS_VOL_END MS_VOL_INDENT MS_VOL_HAS <<EOF
+$scan
+EOF
+}
+
+# FILE with TEXT after line LINE, and everything else byte for byte
+mail_insert_after() { # mail_insert_after FILE LINE TEXT
+  local total
+  total="$(awk 'END { print NR }' "$1")"
+  head -n "$2" "$1"
+  # At the end of a file with no final newline
+  if [ "$2" -ge "$total" ] && [ -n "$(tail -c1 "$1")" ]; then echo; fi
+  printf '%s\n' "$3"
+  tail -n +"$(($2 + 1))" "$1"
+}
+
+mail_paste_block() {
+  printf "\nAdd this under services:\n\n"
+  compose_block mailpit 0 | sed '/^$/d'
+  printf "\nThis under the top-level volumes:\n\n  mailpit:\n\nThen: vhosty services up mailpit\n"
+}
+
+mail_refuse() { # mail_refuse FILE REASON
+  warn "Can't safely edit $1: $2. It wasn't changed."
+  mail_paste_block
+  exit 1
+}
+
+# One config, without Mailpit, for comparing a file with and without it
+mail_config_rest() { # mail_config_rest DIR FILE
+  docker compose --project-directory "$1" -f "$2" config --format json 2>/dev/null \
+    | jq -S 'del(.services.mailpit, .volumes.mailpit) | if .volumes == {} then del(.volumes) else . end'
+}
+
+mail_add() {
+  [ $# -eq 0 ] || die "Usage: vhosty mail add"
+  local dir file new step bak text vol taken="" row="" p busy="" check=""
+  dir="${VHOSTY_SERVICES_DIR:-$VHOSTY_DIR/services}"
+  if ! file="$(mail_compose_file "$dir")"; then
+    cmd_services_init "$dir" --only mailpit
+    return
+  fi
+  # A compose file in the default folder, not set as the services folder yet
+  if [ -z "$VHOSTY_SERVICES_DIR" ]; then VHOSTY_SERVICES_DIR="$dir"; save_config; fi
+  if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then check=1; fi
+
+  mail_scan "$file"
+  # Compose's own view counts first: it sees override and included files too
+  if [ -n "$check" ]; then row="$(mail_service || true)"; fi
+  if [ -n "$row" ] || [ "$MS_HAS" = 1 ] || [ "$MS_IMAGE" = 1 ]; then
+    ok "Mailpit is already set up in $dir, so nothing changed"
+    echo
+    mail_status
+    return 0
+  fi
+  [ -z "$MS_WHY" ] || mail_refuse "$file" "$MS_WHY"
+  [ -w "$file" ] || mail_refuse "$file" "it isn't writable"
+  if [ -n "$check" ]; then
+    mail_config_rest "$dir" "$file" >/dev/null \
+      || mail_refuse "$file" "docker compose can't read it as it is (check it with: vhosty services edit)"
+    taken="$(dc config --format json 2>/dev/null | jq -r '.services | to_entries[]
+      | select([.value.ports[]?.published | tostring] | any(. == "1025" or . == "8025")) | .key' | tr '\n' ' ' || true)"
+    [ -z "$taken" ] || mail_refuse "$file" "${taken% } already publishes port 1025 or 8025, so change one of them first"
+  fi
+
+  # The new file sits next to the old one, so relative paths in it mean the same
+  new="$file.vhosty-new"
+  add_tmp "$new"
+  ( : >"$new" ) 2>/dev/null || mail_refuse "$file" "$dir isn't writable"
+  make_tmp step
+  # Services' block at their indent, which has to match the ones already there
+  text="$(printf '\n'; compose_block mailpit 0 | sed -e '/^$/d' -e "s/^  /$(printf "%${MS_SVC_INDENT}s" '')/")"
+  vol="$(printf "%${MS_VOL_INDENT}s" '')mailpit:"
+  [ "$MS_VOL" != 0 ] || vol="$(printf '\nvolumes:\n  mailpit:')"
+  # Bottom one first, so the other's line number still holds
+  if [ "$MS_VOL_HAS" = 1 ]; then
+    mail_insert_after "$file" "$MS_SVC_END" "$text" >"$new"
+  elif [ "$MS_VOL_END" -ge "$MS_SVC_END" ]; then
+    mail_insert_after "$file" "$MS_VOL_END" "$vol" >"$step"
+    mail_insert_after "$step" "$MS_SVC_END" "$text" >"$new"
+  else
+    mail_insert_after "$file" "$MS_SVC_END" "$text" >"$step"
+    mail_insert_after "$step" "$MS_VOL_END" "$vol" >"$new"
+  fi
+
+  # Compose has to read the result as the same project, plus Mailpit
+  if [ -n "$check" ]; then
+    docker compose --project-directory "$dir" -f "$new" config --services 2>/dev/null | grep -qx mailpit \
+      || mail_refuse "$file" "docker compose couldn't read the file with Mailpit added"
+    [ "$(mail_config_rest "$dir" "$file")" = "$(mail_config_rest "$dir" "$new")" ] \
+      || mail_refuse "$file" "adding Mailpit would have changed something else in it"
+  else
+    warn "docker compose isn't here to check the result (needs docker and jq). When it is, run: vhosty services edit"
+  fi
+
+  bak="$file.before-mailpit-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$file" "$bak" || mail_refuse "$file" "couldn't save a copy of it first"
+  # In place, which keeps its permissions, and a symlink a symlink
+  cat "$new" >"$file" || die "Couldn't write $file. The file as it was is in $bak"
+  ok "added Mailpit to $file, and changed nothing else"
+  info "the file as it was: $bak"
+
+  for p in 1025 8025; do
+    [ -z "$(port_owner "$p")" ] || busy="$busy $p"
+  done
+  if [ -n "$busy" ]; then
+    warn "not starting it: already in use:$busy. Stop what's using those ports (or change them in $file), then: vhosty services up mailpit"
+  elif ( need_docker ) 2>/dev/null && confirm "Start Mailpit now?" Y; then
+    dc up -d mailpit || warn "Mailpit didn't start. Check: vhosty services logs mailpit"
+  else
+    info "Start it with: vhosty services up mailpit"
+  fi
+  echo
+  mail_status
+}
+
+# For doctor, as information only: the sites whose .env sends mail to Mailpit.
+# Names only, and it reads just the two keys: .env values never get printed.
+mail_doctor_info() {
+  local row="" svc="" smtp="" web="" name dir names=""
+  row="$(mail_service || true)"
+  IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+  [ -n "$smtp" ] || return 0
+  while IFS='|' read -r name dir; do
+    if [ -n "$name" ] && [ -r "$dir/.env" ] && awk -F= -v port="$smtp" -v q="'" '
+      function val(s) { sub(/[ \t]#.*/, "", s); gsub(/["\r \t]/, "", s); gsub(q, "", s); return s }
+      /^MAIL_HOST=/ { h = val($2) } /^MAIL_PORT=/ { p = val($2) }
+      END { exit !((h == "127.0.0.1" || h == "localhost") && p == port) }' "$dir/.env"; then
+      names="$names $name"
+    fi
+  done <<EOF
+$(all_php_sites)
+EOF
+  [ -z "$names" ] || info "sites sending mail to Mailpit:$names"
 }
 
 # ---------------------------------------------------------------------------
@@ -4948,6 +5242,7 @@ doctor_checks() {
     if ( need_services ) 2>/dev/null; then
       services_status --no-header
       backup_status
+      mail_doctor_info || true
     else
       bad "$( ( need_services ) 2>&1 | sed 's/^error: //')"
     fi
@@ -5069,11 +5364,15 @@ ${B}Docker services${N} ${D}(docker compose in VHOSTY_SERVICES_DIR)${N}
   vhosty services pull [svc..]       Update images and recreate
   vhosty services exec <svc> [cmd]   Run a command in a service (e.g. mysql)
   vhosty services edit | dir [path]  Edit compose.yaml, or show/set the folder
-  vhosty services init [dir] [--only mysql,valkey,..]  Write a compose.yaml for MySQL, Postgres,
-                                     Valkey, Meilisearch, Typesense and RustFS, sized for this machine
+  vhosty services init [dir] [--only mysql,valkey,..]  Write a compose.yaml for MySQL, Postgres, Valkey,
+                                     Meilisearch, Typesense, RustFS and Mailpit, sized for this machine
   vhosty services backup [--to DIR]  Dump the databases, archive the other volumes, copy the config
   vhosty services restore <backup> [--into DIR] [--replace-config] [--yes]
                                      Put a backup back: config, volumes, then databases
+
+${B}Mail${N} ${D}(Mailpit, one of the Docker services)${N}
+  vhosty mail [status]               Is it running, its web page, and the lines for an app's .env
+  vhosty mail add                    Add it to an existing compose.yaml, changing nothing else
 
 ${B}Caddy and PHP-FPM${N}
   vhosty start   [caddy|php|php-8.x|octane-<site>] Start services (default: all)
@@ -5124,6 +5423,7 @@ main() {
     ini)                cmd_ini "$@" ;;
     ext|exts|extension|extensions) cmd_ext "$@" ;;
     services|svc|db)    cmd_services "$@" ;;
+    mail)               cmd_mail "$@" ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;
     url)                cmd_url "${1:-}" ;;

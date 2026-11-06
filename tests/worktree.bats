@@ -1439,12 +1439,27 @@ DB_CONNECTION=sqlite"
   refute_contains "$output" "isn't there"
 }
 
-@test "link: warns about a cached config, which still names the old database" {
+@test "link: a cached config stops it, as Laravel reads that and not .env" {
   repo_site ledger
   git -C "$PARKED/ledger" worktree add -q "$HOME/wt" -b x
   mkdir -p "$HOME/wt/bootstrap/cache"
   echo '<?php' >"$HOME/wt/bootstrap/cache/config.php"
   run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "config:clear"
+  assert_contains "$output" "Nothing changed"
+  [ ! -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+  rm "$HOME/wt/bootstrap/cache/config.php"
+  run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 0 ]
+}
+
+@test "link --share-db: a cached config only warns, as sharing was asked for" {
+  repo_site ledger
+  git -C "$PARKED/ledger" worktree add -q "$HOME/wt" -b x
+  mkdir -p "$HOME/wt/bootstrap/cache"
+  echo '<?php' >"$HOME/wt/bootstrap/cache/config.php"
+  run vhosty worktree link "$HOME/wt" --share-db
   [ "$status" -eq 0 ]
   assert_contains "$output" "config:clear"
 }
@@ -3421,10 +3436,10 @@ DB_DATABASE=wt_someone_else"
   not_dropped "$PARKED/ledger/.env still names it"
 }
 
-@test "guard: in capitals [A4], in a comment, in a longer name, under any key" {
+@test "guard: in capitals [A4], in a comment, under any key" {
   with_mysql_worktree
   cp "$PARKED/ledger/.env" "$HOME/o"
-  for line in 'DB_DATABASE=WT_FEATURE_X__LEDGER' '# old: wt_feature_x__ledger' 'DB_DATABASE=wt_feature_x__ledger_test' 'NOTES=wt_feature_x__ledger'; do
+  for line in 'DB_DATABASE=WT_FEATURE_X__LEDGER' '# old: wt_feature_x__ledger' 'NOTES=wt_feature_x__ledger'; do
     cp "$HOME/o" "$PARKED/ledger/.env"
     printf '%s\n' "$line" >>"$PARKED/ledger/.env"
     not_dropped "$PARKED/ledger/.env still names it"
@@ -3904,4 +3919,155 @@ DB_DATABASE=ledger_prod'
   assert_contains "$output" "Permission denied"
   assert_contains "$output" "Nothing was removed"
   [ "$(cat "$W/database/database.sqlite")" = precious ]
+}
+
+# ---------------------------------------------------------------- whose database is it?
+
+own_env_worktree() { # own_env_worktree SITE .ENV_TEXT
+  git -C "$PARKED/$1" worktree add -q "$HOME/wt" -b x
+  printf '%s\n' "$2" >"$HOME/wt/.env"
+}
+
+@test "link: a parent with no DB_DATABASE could be using any name, so that stops" {
+  services_on
+  repo_site ledger 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306'
+  mysql_db laravel
+  own_env_worktree ledger 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=laravel'
+  run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "can't tell"
+  [ ! -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+}
+
+@test "link: a sqlite parent with no DB_DATABASE can't be using that server database" {
+  services_on
+  repo_site ledger 'DB_CONNECTION=sqlite'
+  mysql_db mine
+  own_env_worktree ledger 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=mine'
+  run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "link: a worktree .env naming another site's database stops, unless --share-db" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  mysql_db otherdb
+  mkdir -p "$PARKED/other"
+  echo 'DB_DATABASE=otherdb' >"$PARKED/other/.env"
+  own_env_worktree ledger "${MYSQL_ENV/DB_DATABASE=ledger/DB_DATABASE=otherdb}"
+  run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "$PARKED/other/.env still names it"
+  assert_contains "$output" "--share-db"
+  run vhosty worktree link "$HOME/wt" --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ -f "$HOME/db/mysql/otherdb" ]
+}
+
+@test "link: a worktree .env naming another folder's sqlite file stops" {
+  repo_site ledger 'DB_CONNECTION=sqlite'
+  mkdir -p "$PARKED/other/database"
+  echo keep >"$PARKED/other/database/database.sqlite"
+  echo 'DB_CONNECTION=sqlite' >"$PARKED/other/.env"
+  own_env_worktree ledger "DB_CONNECTION=sqlite
+DB_DATABASE=$PARKED/other/database/database.sqlite"
+  run vhosty worktree link "$HOME/wt"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "$PARKED/other"
+  [ "$(cat "$PARKED/other/database/database.sqlite")" = keep ]
+}
+
+@test "remove: a read that fails partway doesn't count as nobody using it" {
+  [ -e /proc/self/mem ] || skip "needs /proc"
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add f --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  mkdir -p "$PARKED/aaa" "$PARKED/zzz"
+  ln -s /proc/self/mem "$PARKED/aaa/.env.x"
+  echo 'DB_DATABASE=wt_f__ledger' >"$PARKED/zzz/.env"
+  run vhosty worktree remove f--ledger --yes
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "Not dropping"
+  [ -f "$HOME/db/mysql/wt_f__ledger" ]
+}
+
+@test "remove: a longer database name isn't this one" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add f --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  mkdir -p "$PARKED/other"
+  echo 'DB_DATABASE=wt_f__ledger2' >"$PARKED/other/.env"
+  run vhosty worktree remove f--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -e "$HOME/db/mysql/wt_f__ledger" ]
+}
+
+@test "remove: names in any .env* count, and a database dropped by hand needs no guarding" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add f --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  mkdir -p "$PARKED/other"
+  echo 'DB_DATABASE=wt_f__ledger' >"$PARKED/other/.env-old"
+  run vhosty worktree remove f--ledger --yes
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "$PARKED/other/.env-old still names it"
+  [ -f "$HOME/db/mysql/wt_f__ledger" ]
+  rm "$HOME/db/mysql/wt_f__ledger"
+  run vhosty worktree remove f--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "already gone"
+}
+
+@test "add: a database left by --keep-db says how to drop it" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  mysql_db wt_f__ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add f --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "DROP DATABASE"
+  assert_contains "$output" "wt_f__ledger"
+}
+
+@test "warns about a shared test database and a shared search index" {
+  services_on
+  repo_site ledger "$MYSQL_ENV
+SCOUT_DRIVER=meilisearch"
+  mysql_db ledger
+  git -C "$PARKED/ledger" worktree add -q "$HOME/wt" -b x
+  printf 'DB_CONNECTION=mysql\nDB_DATABASE=ledger_test\n' >"$HOME/wt/.env.testing"
+  run vhosty worktree link "$HOME/wt" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" ".env.testing names the database ledger_test"
+  assert_contains "$output" "SCOUT_DRIVER (meilisearch)"
+}
+
+@test "no warning for a sqlite test database, which is the worktree's own file" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  git -C "$PARKED/ledger" worktree add -q "$HOME/wt" -b x
+  printf 'DB_CONNECTION=sqlite\nDB_DATABASE=database/testing.sqlite\n' >"$HOME/wt/.env.testing"
+  run vhosty worktree link "$HOME/wt" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" ".env.testing"
 }

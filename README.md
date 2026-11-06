@@ -462,10 +462,10 @@ it. npm is never run; it's printed as a next step if there's a lockfile.
   copy, even if the removal then fails. Only a database under vhosty's own name for this
   site is dropped, whatever the record says, and one that fails to drop is reported, with
   the site kept so you can run it again.
-- Nothing is dropped if its name appears anywhere in a `.env` or `.env.*` of the parent or
-  any other site or worktree, comments and longer names included, in any case, and after
-  decoding `%XX`. The search is blunt on purpose, so a sibling's `wt_x__ledger2` stops the
-  drop of `wt_x__ledger`. vhosty says which file named it. If one of those files or
+- Nothing is dropped if its whole name appears anywhere in a `.env*` file of the parent or
+  any other site or worktree, comments included, in any case, and after decoding `%XX`.
+  A longer name is another database, so a sibling's `wt_x__ledger2` doesn't stop the drop
+  of `wt_x__ledger`. vhosty says which file named it. If one of those files or
   folders can't be read, or the parent's database keys use a `${VAR}` that doesn't
   resolve, vhosty can't tell, so it refuses, and prints how to drop it by hand. A sibling
   folder that isn't there gets a note and is skipped. A sqlite file that has become a

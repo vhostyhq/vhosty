@@ -5162,7 +5162,7 @@ worktree_db_where_env() {
 
 # sqlite: what's the worktree's own, what's the parent's, what's outside
 worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
-  local env="$1" existing="$2" wt_db parent_file file default
+  local env="$1" existing="$2" wt_db parent_file file default key d
   parent_file="$(worktree_sqlite_path "$WT_PARENT_DIR/.env" "$WT_PARENT_DIR")"
   default="$WT_DIR/database/database.sqlite"
   wt_db="$(worktree_env_get "$env" DB_DATABASE)"
@@ -5175,6 +5175,15 @@ worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
       return 0
     fi
     if ! worktree_same_file "$file" "$default"; then
+      while IFS="$(printf '\t')" read -r key d; do
+        [ -n "$d" ] && [ "$d" != "$WT_DIR" ] || continue
+        worktree_same_file "$file" "$(worktree_sqlite_path "$d/.env" "$d")" || continue
+        WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $file"
+        WT_DB_WHY="that's the file $d uses"
+        return 0
+      done <<EOF
+$(worktree_guard_folders "$WT_NAME" "$WT_PARENT" "$WT_REPO")
+EOF
       WT_DB_PLAN="own"; WT_DB_OWN="$file"
       [ -e "$file" ] || WT_DB_MISSING="$file"
       return 0
@@ -5213,7 +5222,7 @@ worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
 # mysql, mariadb, pgsql: on a vhosty service, or somewhere else
 worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
   local env="$1" existing="$2" engine="$3" port="$4" parent_env="$WT_PARENT_DIR/.env"
-  local host parent_db wt_db st name own="" derived parent_conn key
+  local host parent_db wt_db st name own="" derived parent_conn key why
   parent_db="$(worktree_env_resolved "$parent_env" DB_DATABASE || true)"
   wt_db="$(worktree_env_get "$env" DB_DATABASE)"
   host="$(worktree_env_get "$env" DB_HOST)"
@@ -5231,7 +5240,7 @@ worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
   if worktree_env_has "$env" DB_HOST; then
     case "$host" in
       127.0.0.1) ;;
-      localhost) WT_DB_PLAN="shared"; WT_DB_WHY="DB_HOST=localhost may not reach vhosty's docker services (for MySQL it means the unix socket). Use DB_HOST=127.0.0.1"; return 0 ;;
+      localhost) WT_DB_PLAN="shared"; WT_DB_WHY="DB_HOST=localhost may not reach vhosty's docker services (for MySQL it means the unix socket). Use DB_HOST=127.0.0.1 in $env, then run this again"; return 0 ;;
       "") WT_DB_PLAN="shared"; WT_DB_WHY="DB_HOST is there but empty, which Laravel doesn't take to mean 127.0.0.1"; return 0 ;;
       *) WT_DB_PLAN="shared"; WT_DB_WHY="that isn't one of vhosty's docker services, which are on 127.0.0.1"; return 0 ;;
     esac
@@ -5247,7 +5256,13 @@ worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
       worktree_parent_names_db "$env" "$parent_env" "$wt_db" || st=$?
       case "$st" in
         0) ;;
-        1) own=1 ;;
+        1)
+          # Nothing to do with the parent isn't nothing to do with anyone
+          if why="$(worktree_db_still_used "$wt_db" "$WT_NAME" "$WT_DIR" "$WT_PARENT" "$WT_REPO")"; then
+            WT_DB_PLAN="shared"; WT_DB_WHY="$wt_db may belong to something else: $why"
+            return 0
+          fi
+          own=1 ;;
         *)
           WT_DB_PLAN="shared"; WT_DB_WHY="vhosty can't tell whether that's the database $WT_PARENT uses"
           return 0 ;;
@@ -5289,7 +5304,7 @@ worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
   case "$st" in
     0)
       if [ -n "$own" ]; then WT_DB_PLAN="own"; WT_DB_OWN="$name"; return 0; fi
-      worktree_plan_stop "A database called $name is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. Drop or rename it first." ;;
+      worktree_plan_stop "A database called $name is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. To drop it: $(worktree_db_drop_hint "$engine" "$WT_DB_SERVICE" "$name")" ;;
     1) ;;
     *) worktree_plan_stop "Couldn't reach the database on $WT_DB_SERVICE. Check: vhosty services logs $WT_DB_SERVICE." ;;
   esac
@@ -5315,14 +5330,21 @@ worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
 # Does the parent's .env name this database? 0 yes, 1 no, 2 can't tell: no .env
 # to read, or a variable under a database key that the file doesn't fill in.
 worktree_parent_names_db() { # worktree_parent_names_db WORKTREE_ENV PARENT_ENV NAME
-  local key v
+  local key v hit
   case "$3" in *'$'*) return 2 ;; esac
   [ -f "$2" ] && [ -r "$2" ] || return 2
   for key in $(worktree_env_db_vars "$2"); do
     v="$(worktree_env_resolved "$2" "$key")" || return 2
     [ "$(lower "$v")" != "$(lower "$3")" ] || return 0
   done
-  [ -n "$(worktree_text_names word "$3" "$2")" ] && return 0
+  hit="$(worktree_text_names word "$3" "$2")" || return 2
+  [ -z "$hit" ] || return 0
+  # Nothing naming it, but no name at all on a server is Laravel's default. A URL
+  # was searched just now, and sqlite's default is a file.
+  if [ "$(worktree_env_get "$2" DB_CONNECTION)" != "sqlite" ] \
+    && [ -z "$(worktree_env_get "$2" DB_URL)$(worktree_env_get "$2" DATABASE_URL)" ]; then
+    worktree_env_has "$2" DB_DATABASE || return 2
+  fi
   return 1
 }
 
@@ -5351,6 +5373,10 @@ worktree_db_plan() {
   local parent_env="$WT_PARENT_DIR/.env" wt_env="$WT_DIR/.env" env existing="" conn url
   WT_DB_PLAN="none"; WT_DB_ENGINE=""; WT_DB_SERVICE=""; WT_DB_NAME=""; WT_DB_SRC=""; WT_DB_WHY=""; WT_DB_USER=""
   WT_DB_WHERE=""; WT_DB_SHARE_FILE=""; WT_DB_OWN=""; WT_DB_MISSING=""; WT_DB_PARENT_DB=""
+  # Laravel reads a cached config instead of .env, so nothing below would hold
+  if [ "$WT_SHARE" != "1" ] && [ -f "$WT_DIR/bootstrap/cache/config.php" ]; then
+    worktree_plan_stop "$WT_DIR/bootstrap/cache/config.php is a cached config. Laravel reads it instead of .env, so migrations here would use whatever database it names, whatever vhosty sets." "Run php artisan config:clear in that folder, then this again."
+  fi
   for env in "$parent_env" "$wt_env"; do
     if [ -e "$env" ] && [ ! -r "$env" ]; then
       worktree_plan_stop "Can't read $env, so vhosty can't tell which database this would use."
@@ -5537,7 +5563,7 @@ worktree_db_setup() {
     ok "database: $WT_DB_NAME, a copy of $WT_DB_SRC"
     if [ "$WT_DB_ENGINE" = "mysql" ]; then
       if left="$(worktree_mysql_not_copied "$WT_DB_SERVICE" "$WT_DB_SRC")"; then
-        [ -z "$left" ] || warn "not copied, as any of them could write to another database: $(printf '%s' "$left" | tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g'). Recreate the ones you need."
+        [ -z "$left" ] || warn "not copied, as any of them could write to another database: $(printf '%s' "$left" | tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g'). Recreate the ones you need.$(case "$left" in (*function*) echo " A copied view that calls one still calls it in $WT_DB_SRC." ;; esac)"
       else
         warn "$WT_DB_SRC's triggers, routines and events aren't copied, as any of them could write to another database, and vhosty couldn't list them"
       fi
@@ -5603,8 +5629,13 @@ worktree_env_isolate() {
 
 # What a copied .env still shares with the parent. Names only: values can be secrets.
 worktree_env_warnings() {
-  local wt_env="$WT_DIR/.env" keys shared
+  local wt_env="$WT_DIR/.env" keys shared testing
   [ -f "$wt_env" ] || return 0
+  # vhosty only sets up .env. A server's test database here is the parent's too.
+  testing="$(worktree_env_get "$WT_DIR/.env.testing" DB_DATABASE 2>/dev/null || true)"
+  if [ -n "$testing" ] && [ "$(worktree_env_get "$WT_DIR/.env.testing" DB_CONNECTION)" != "sqlite" ]; then
+    warn ".env.testing names the database $testing, which $WT_PARENT's tests use too. Tests that reset it here reset it for both."
+  fi
   # Not the worktree's own address, which ends in the parent's name and domain
   keys="$(WT_HOST="$WT_PARENT.$VHOSTY_DOMAIN" awk -F= '
     NF > 1 && $1 !~ /^[ \t]*#/ {
@@ -5627,6 +5658,7 @@ worktree_env_warnings() {
       if (k == "APP_ENV") { if (v == "production") add("APP_ENV (production)") }
       else if (k == "FILESYSTEM_DISK") { if (v == "s3") add("FILESYSTEM_DISK (s3)") }
       else if (k == "AWS_BUCKET") add(k)
+      else if (k == "SCOUT_DRIVER") { if (v != "collection" && v != "database" && v != "null") add("SCOUT_DRIVER (" v ")") }
       else if (k ~ /^(STRIPE|PLAID|PADDLE|BRAINTREE|TWILIO|POSTMARK|MAILGUN|RESEND|OPENAI|ANTHROPIC)_/) { sub(/_.*/, "_*", k); add(k) }
       else if (k ~ /^DB_.+_DATABASE$/) add(k)
     }
@@ -5960,7 +5992,7 @@ EOF
   } | awk -F'\t' '!seen[$2]++'
 }
 
-# Blunt on purpose: the database's name anywhere in any .env or .env.* of anything
+# Blunt on purpose: the database's whole name anywhere in any .env* of anything
 # else stops the drop, and so does anything that can't be read. Says why, and returns 0.
 worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO
   local token="$1" self="$2" dir="$3" parent="$4" repo="$5" own kind d f key v name seen_parent=0 hit
@@ -5979,7 +6011,7 @@ worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO
       echo "$d can't be read, so vhosty can't tell whether that uses it"
       return 0
     fi
-    for f in "$d/.env" "$d"/.env.*; do
+    for f in "$d"/.env*; do
       [ -e "$f" ] || [ -L "$f" ] || continue
       if [ ! -r "$f" ]; then
         echo "$f can't be read, so vhosty can't tell whether that uses it"
@@ -5993,7 +6025,7 @@ worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO
           echo "$f builds $key from a variable, so vhosty can't tell whether that's this one"
           return 0
         fi
-        if [ -n "$(printf '%s\n' "$v" | LC_ALL=C grep -iF -- "$token" || true)" ]; then
+        if [ -n "$(printf '%s\n' "$v" | LC_ALL=C grep -iwF -- "$token" || true)" ]; then
           echo "$f still names it"
           return 0
         fi
@@ -6006,7 +6038,10 @@ EOF
     echo "$parent's folder isn't there (is it moved?), so vhosty can't read its .env, or tell whether it still uses it"
     return 0
   fi
-  hit="$(worktree_text_names any "$token" "$@" | sed -n 1p)"
+  if ! hit="$(worktree_text_names word "$token" "$@" | sed -n 1p)"; then
+    echo "not every .env file could be read, so vhosty can't tell whether one uses it"
+    return 0
+  fi
   if [ -n "$hit" ]; then
     echo "$hit still names it"
     return 0
@@ -6165,15 +6200,16 @@ cmd_worktree_remove() {
       mysql|postgres)
         worktree_db_name_ok "$db_name" && [ "$db_name" = "$(worktree_db_name "$name")" ] && [ -n "$db_service" ] \
           || die "The site's config records database '$db_name', which isn't the name vhosty gives this site's own. Not dropping it, and nothing removed. To remove the site without it: --keep-db"
-        if why="$(worktree_db_still_used "$db_name" "$name" "$dir" "$parent" "$repo")"; then
-          die "Not dropping $db_name: $why. Nothing removed. To remove the site and leave the database: --keep-db. To drop it by hand once you're sure: $hint"
-        fi
         st="$( ( need_services ) 2>&1 | sed 's/^error: //' || true )"
         [ -z "$st" ] || die "Can't reach $db_service to drop $db_name: $st. Nothing removed. To remove the site and leave the database: --keep-db"
         st=0
         worktree_db_exists "$db_kind" "$db_service" "$db_name" || st=$?
         case "$st" in
-          0) drop=1 ;;
+          0)
+            if why="$(worktree_db_still_used "$db_name" "$name" "$dir" "$parent" "$repo")"; then
+              die "Not dropping $db_name: $why. Nothing removed. To remove the site and leave the database: --keep-db. To drop it by hand once you're sure: $hint"
+            fi
+            drop=1 ;;
           1) info "$label is already gone" ;;
           *) die "Couldn't reach $db_service to drop $db_name. Check: vhosty services logs $db_service. Nothing removed. To remove the site and leave the database: --keep-db" ;;
         esac ;;
@@ -6274,7 +6310,7 @@ cmd_worktree_remove() {
           # The record stays, so running this again can still drop it
           cmd_rebuild
           bad "couldn't drop the $label. It's still there, and the site's config still records it."
-          die "Check: vhosty services logs $db_service. Then run again: vhosty worktree remove $name (or --keep-db, and it's yours to drop: $hint)"
+          die "Something may still be connected to it (a database GUI, queue:work). Close that, or check: vhosty services logs $db_service. Then run again: vhosty worktree remove $name (or --keep-db, and it's yours to drop: $hint)"
         fi ;;
     esac
   fi

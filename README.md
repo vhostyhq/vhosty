@@ -310,12 +310,39 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
+| `vhosty logs <site> [N]` / `vhosty tail <site>` | A Laravel app's own log, from its `storage/logs`. See [Site logs](#site-logs) |
 | `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
 | `vhosty prune` | Remove configs for sites whose folder is gone or no longer parked, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
 | `vhosty update [self\|caddy\|php [version]]` | Update vhosty to the latest release, re-download Caddy, and upgrade PHP (apt on Linux, Homebrew on macOS). See [Updating](#updating) |
 | `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
 | `vhosty rebuild` | Regenerate the config and reload the services |
+
+### Site logs
+
+`vhosty logs` and `vhosty tail` take a site as well as a service, and read the
+app's own log:
+
+```bash
+vhosty logs myapp        # the last 100 lines
+vhosty logs myapp 500
+vhosty tail myapp        # follow it
+vhosty logs myapp | grep ERROR
+```
+
+- **The log is the newest `*.log` in the site's `storage/logs`**, so this works with
+  Laravel's daily driver (`laravel-2026-11-05.log`) and its single driver (`laravel.log`).
+  If another log there was written last (`worker.log`, say), that's the one you get.
+  vhosty prints the file's path on stderr, so a pipe only gets the log.
+- **`vhosty tail` follows a daily log across midnight.** It checks every couple of
+  seconds for the next day's file in the same series, and carries on from that file's
+  first line. It stays on the file it started with otherwise, so a busy `worker.log`
+  won't take over from `laravel.log`.
+- **A service wins when a site has the same name**: `caddy`, `php`, `all`, an installed
+  PHP version, and so on, and `rotate` for `vhosty logs`. To read such a site's log, use
+  plain `tail` on its `storage/logs` (`vhosty site <name>` shows the folder).
+- **With [Herd](#with-laravel-herd-macos)**, this doesn't look up Herd's sites, so
+  `vhosty logs` and `vhosty tail` only cover services. Use plain `tail` for an app's log.
 
 ### What gets served
 

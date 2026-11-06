@@ -93,8 +93,8 @@ _vhosty() {
     'stop:Stop Caddy and PHP-FPM'
     'restart:Validate config and restart'
     'status:Service state and sockets'
-    'logs:Show recent logs'
-    'tail:Follow logs live'
+    'logs:Show recent logs of a service or site'
+    'tail:Follow the logs of a service or site'
     'edit:Edit settings, PHP settings, or the token'
     'rebuild:Regenerate config and reload'
     'dns:Point *.domain at this machine'
@@ -117,9 +117,11 @@ _vhosty() {
   fi
 
   case "${words[2]}" in
-    start|stop|restart|tail) _vhosty_services ;;
+    start|stop|restart) _vhosty_services ;;
+    tail)
+      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'sites:site:_vhosty_sites'; fi ;;
     logs|log)
-      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'actions:action:(rotate)'
+      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'sites:site:_vhosty_sites' 'actions:action:(rotate)'
       elif [ "${words[3]}" = "rotate" ]; then _values 'option' --force; fi ;;
     edit)          _values 'file' config php env ;;
     validate)      _values 'config' caddy php ;;

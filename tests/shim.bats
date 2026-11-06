@@ -111,5 +111,6 @@ SITE_INI='error_prepend_string=a \$(touch $HOME/pwned) b'"
 @test "the shim reads no files when it runs" {
   shim_setup
   # no sourcing, and no tools that read files, outside the comments
-  ! grep -v '^#' "$VHOSTY_DIR/bin/php" | grep -qE '(^|[;{&|] *)(\.|source|cat|sed|grep|awk) '
+  run sh -c 'grep -v "^#" "$1" | grep -E "$2"' sh "$VHOSTY_DIR/bin/php" '(^|[;{&|] *)(\.|source|cat|sed|grep|awk) '
+  [ "$status" -ne 0 ] || { echo "$output" >&2; false; }
 }

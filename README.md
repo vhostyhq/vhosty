@@ -304,6 +304,7 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
 | `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
 | `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
+| `vhosty worktree [add\|link\|remove\|list]` | A git worktree as a site of its own, with its own URL, `.env` and database. See [Git worktrees](#git-worktrees) |
 | `vhosty open [site\|proxy\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
 | `vhosty php [list\|install\|default\|which]` | PHP versions |
 | `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
@@ -410,6 +411,142 @@ reloads every 2 seconds until it comes up. Errors from your app itself (Laravel'
 (`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
 with no config. Laravel setup and mixed-content fixes are in
 [docs/laravel-vite.md](docs/laravel-vite.md).
+
+### Git worktrees
+
+When coding agents work on branches side by side, each branch can have its own
+site: its own URL, `.env` and database, so it can migrate without touching the
+parent's data. Nothing happens by itself: a worktree is a site once you say so.
+
+```bash
+cd ~/Sites/ledger
+vhosty worktree add feature/x          # https://feature-x--ledger.yourdomain.dev
+vhosty worktree add feature/x --copy-db   # the same, with a clone of ledger's data
+vhosty worktree link ~/.t3/worktrees/ledger/t3-1234   # a worktree something else made
+vhosty worktree                        # list them
+vhosty worktree remove feature-x--ledger
+```
+
+`add` takes an existing local or remote branch, or makes a new one from the HEAD
+you're on. Git refuses a branch that's checked out elsewhere, and vhosty says so.
+The folder goes in `~/.vhosty/worktrees/<site>/<branch>`, not a parked folder, where
+it would also be served by its folder name; `--path` picks another. `link` is for
+worktrees that already exist, such as those from T3 Code: run it inside one, or
+point it at one, and it finds the parent through git. The parent has to be a site.
+
+**The name** is `<branch>--<site>`, one DNS label, as the wildcard certificate covers
+only one level. It's lowercase letters, numbers and dashes, at most 63 characters; a
+longer one is cut, with a short hash of the original. A detached worktree uses its
+folder's name. A name that's taken is refused, so `feature/x` and `feature-x` can't
+both have a site. The name stays if the worktree changes branch later.
+
+**`.env`** is a copy of the parent's, with the same file permissions, or
+`.env.example` if the parent has none. `APP_URL` and `DB_DATABASE` are set in the
+copy; the parent's `.env` is only ever read. `REDIS_PREFIX` and `CACHE_PREFIX` are set
+too, to the worktree's name, so it can't overwrite the parent's keys or take its queue
+jobs. A prefix can't stop `php artisan cache:clear`, which flushes the whole Redis
+database: with `CACHE_STORE=redis`, vhosty warns that it also empties the parent's cache
+unless you give the worktree its own `REDIS_CACHE_DB`. If the parent sets `SESSION_DOMAIN`, the copy's becomes `null`, so its
+cookies aren't shared across the parent's sites. vhosty warns, by key name and never by
+value, about settings that still name the parent's address, and once about the riskier
+things a copy still shares: `APP_ENV=production`, `FILESYSTEM_DISK=s3` or `AWS_BUCKET`,
+payment and API credentials such as `STRIPE_*` and `PLAID_*`, and other databases
+(`DB_*_DATABASE`). `HORIZON_PREFIX` isn't set: if the worktree runs Horizon, set it
+yourself. With `link`, a `.env` already in the worktree is kept and edited (a prefix of
+its own stays), but a symlink there is replaced, never written through.
+
+**The database** is new and empty, so vhosty prints `php artisan migrate --seed`.
+A new Postgres database gets the parent's extensions, each in its own schema, since an
+app's role usually can't create them. `--copy-db` clones the parent's without holding
+it up, in a single-transaction dump that only reads it, with no global lock. On MySQL
+and MariaDB the copy leaves out triggers, routines and events, as any of them could
+write to another database, and vhosty names what it left out. On Postgres, a parent with
+`dblink`, `postgres_fdw` or `file_fdw`, or any foreign table, isn't copied: the database
+stays empty, vhosty says why, and exits non-zero.
+
+| The parent's `.env` says | What the worktree gets |
+|---|---|
+| `mysql`, `mariadb` or `pgsql`, with `DB_HOST=127.0.0.1` (or none) and a port that a running [Docker service](#docker-services) publishes on 127.0.0.1 right now | A new database, `wt_feature_x__ledger`. A database user other than root gets access to it |
+| `sqlite` | Its own file, `database/database.sqlite` in the worktree |
+| Anything else: another host, `localhost`, `::1`, an empty `DB_HOST`, `DB_SOCKET`, `DB_READ_HOST`, `DB_WRITE_HOST`, `DB_URL`, or a sqlite file that resolves to the parent's | **It stops,** naming the host and database (never a password), as migrating there would change the parent's data |
+
+`--share-db` is how to say that sharing is what you want: the worktree keeps the
+parent's database, the site's config records that, and `vhosty worktree list`, `vhosty
+site` and `vhosty doctor` show it. `--copy-db` can't copy a database like that, and
+can't be combined with `--share-db`. Without one or the other, `composer install` isn't
+reached either.
+
+`DB_HOST=localhost` stops it too, with a message to use `127.0.0.1`: `pdo_mysql` takes
+`localhost` for the unix socket, and libpq tries whatever the resolver lists first, which
+on a Mac can be `::1`.
+
+`add` looks twice: before git changes anything, and again once the checkout is there, at
+the `.env` the worktree really ends up with, as a branch can bring its own `.env` or
+`.env.example` and a `post-checkout` hook can write one. If that one isn't managed,
+vhosty undoes the worktree it made, with `git worktree remove` and never `--force`, and
+says if the branch was new and stays.
+
+If the service is down, or the database name is taken, `add` stops rather than guess.
+With `link`, a `.env` keeps its database only if that's vhosty's own name for the site,
+or it differs from everything in the parent's `.env`, compared case-insensitively. One
+that names the parent's database gets a new one of its own instead, and if the parent's
+can't be worked out (no `.env`, or a `${VAR}` that the file doesn't fill in), `link`
+stops unless you pass `--share-db`. vhosty's own name is created if it's missing, so
+`link` run again repairs a failed create; another name that's missing gets a warning.
+`link --copy-db` on a site that already has its database is an error: remove it and add
+it again.
+
+**PHP:** a worktree site gets the parent's PHP pin, settings and extensions, copied
+when it's made. It runs on PHP-FPM, even if the parent is on Octane, until
+`vhosty octane on <name>`. `composer install` runs through the `php` shim, so with the
+site's version; if it fails the site stays and vhosty says so. `--no-install` skips
+it. npm is never run; it's printed as a next step if there's a lockfile.
+
+**`remove`** does only what vhosty set up, and the site's config records what that is:
+
+- A worktree from `add` is removed with `git worktree remove`, never `--force`, so
+  uncommitted or untracked files, submodules or a lock stop it, and vhosty says which
+  and what to run by hand. The branch always stays. git can also fail partway, once it
+  has started deleting. vhosty compares the folder before and after, and if it changed,
+  says files may be gone and names what's left.
+- Ignored files go with the folder, as git doesn't count them. vhosty lists them (leaving
+  out `vendor`, `node_modules` and the like) and asks. `--yes` goes ahead, and still lists
+  them. It warns the same way about commits on a detached HEAD that no branch or tag
+  contains.
+- A worktree from `link` isn't vhosty's: the folder stays, and only the site and
+  vhosty's database go.
+- The database vhosty created is dropped after a confirmation that names it. `--yes`
+  skips that, for scripts; without a terminal, it's required. `--keep-db` keeps the
+  database and prints how to drop it. For sqlite, it first copies the file the app really
+  uses (with no database settings, Laravel's `database/database.sqlite`) to a name of its
+  own in `~/.vhosty/worktrees`, before touching the folder. vhosty never deletes that
+  copy, even if the removal then fails. Only a database under vhosty's own name for this
+  site is dropped, whatever the record says, and one that fails to drop is reported, with
+  the site kept so you can run it again.
+- Nothing is dropped if its whole name appears anywhere in a `.env*` file of the parent or
+  any other site or worktree, comments included, in any case, and after decoding `%XX`.
+  Templates such as `.env.example` don't count, as nothing loads them.
+  A longer name is another database, so a sibling's `wt_x__ledger2` doesn't stop the drop
+  of `wt_x__ledger`. vhosty says which file named it. If one of those files or
+  folders can't be read, or the parent's database keys use a `${VAR}` that doesn't
+  resolve, vhosty can't tell, so it refuses, and prints how to drop it by hand. A sibling
+  folder that isn't there gets a note and is skipped. A sqlite file that has become a
+  link, or is reached through one, or is the parent's file, is refused too, and so is a
+  folder that now resolves somewhere other than where the site was made. These are all
+  checked again after the confirmation.
+
+If the folder is deleted some other way (`git worktree remove` by hand, or by T3),
+`vhosty doctor` says so and `vhosty worktree remove` still works. `vhosty prune` leaves
+that site's config alone while it records a database, and says how to drop it: the
+record is what lets vhosty drop it safely.
+
+Unlinking or unparking the parent leaves its worktree sites working, as they have
+their own folder, URL, `.env` and database; vhosty says which ones. `vhosty unlink`
+refuses a worktree site: use `vhosty worktree remove`.
+
+Worktree databases are throwaway, so `vhosty services backup` skips exactly the ones
+current worktree sites record, and says which. With [Herd](#with-laravel-herd-macos) serving the sites, these
+commands are off.
 
 ### PHP versions
 
@@ -558,8 +695,12 @@ A backup is one folder holding:
   files). Each of those services stops for the few seconds its archive takes.
   Mailpit is left out, and keeps running: caught mail isn't backed up.
 
-Test databases (`test`, `*_test`, `*_testing`, `*_test_<n>`) are skipped; test
-suites recreate them. Bind-mounted folders aren't included. Backups are readable
+Test databases (`test`, `*_test`, `*_testing`, `*_test_<n>`) are skipped, as test
+suites recreate them, and so are the databases current [worktree](#git-worktrees) sites
+record, which are throwaway. Anything else is backed up, whatever it's called: a database
+called `wt_payroll`, or one kept with `--keep-db`. A backup that has a worktree's database
+restores it like any other.
+Bind-mounted folders aren't included. Backups are readable
 by you only, and hold your keys, so copy them somewhere safe. The newest
 `VHOSTY_BACKUP_KEEP` (default 7) are kept; set `VHOSTY_BACKUP_DIR` to save
 elsewhere by default. `vhosty doctor` warns when the last backup is over a week old.
@@ -579,6 +720,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── config                 domain, parked folders, default PHP, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
+├── worktrees/<site>/      git worktrees from `vhosty worktree add`
 ├── proxies/<name>.conf    one per named proxy (vhosty proxy): its port
 ├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
@@ -674,7 +816,9 @@ shellcheck --severity=warning bin/vhosty install.sh scripts/*.sh
 They run in a scratch home with a fake `tailscale`, so they don't touch your
 setup. `tests/caddy.bats` runs the generated Caddyfile in a real Caddy with the
 DNS plugins (`VHOSTY_TEST_CADDY`, or the one vhosty installed); without one
-it's skipped. CI runs everything on Ubuntu and on macOS's bash 3.2.
+it's skipped. `tests/worktree-db.bats` runs worktree databases on real MySQL and
+Postgres servers, in scratch containers of its own; without docker or the images
+it's skipped, as it never pulls one. CI runs everything on Ubuntu and on macOS's bash 3.2.
 
 ## Uninstall
 

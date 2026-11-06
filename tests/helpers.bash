@@ -66,3 +66,10 @@ assert_contains() {
 refute_contains() {
   case "$1" in *"$2"*) printf 'expected not to find:\n  %s\nin:\n%s\n' "$2" "$1" >&2; return 1 ;; esac
 }
+# refute CMD [ARGS...]: CMD has to fail. A bare `! cmd` can't fail a bats test.
+refute() {
+  if "$@"; then
+    printf 'expected this to fail: %s\n' "$*" >&2
+    return 1
+  fi
+}

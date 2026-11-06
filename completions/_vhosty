@@ -29,6 +29,12 @@ _vhosty_sites() {
   (( ${#sites} )) && _values 'site' ${(u)sites}
 }
 
+_vhosty_worktrees() {
+  local -a names
+  names=( ${(f)"$(grep -lE '^SITE_WT_KIND=' "$(_vhosty_dir)"/sites/*.conf(N) 2>/dev/null | sed 's#.*/##; s/\.conf$//')"} )
+  (( ${#names} )) && _values 'worktree site' $names
+}
+
 _vhosty_proxies() {
   local -a proxies
   proxies=( "$(_vhosty_dir)"/proxies/*.conf(N:t:r) )
@@ -88,6 +94,7 @@ _vhosty() {
     'proxies:List proxies'
     'sites:List sites and their URLs'
     'site:Everything about one site'
+    'worktree:A git worktree as a site (list, add, link, remove)'
     'open:Open a site in the browser'
     'url:Print and copy a site URL'
     'php:PHP versions (list, install, default, which)'
@@ -140,6 +147,25 @@ _vhosty() {
     park|unpark)   _files -/ ;;
     link)          _arguments '1:folder:_files -/' '--name[Site name]:name:' ;;
     unlink)        _vhosty_links ;;
+    worktree)
+      if (( CURRENT == 3 )); then
+        _values 'action' list add link remove
+      elif [ "${words[CURRENT-1]}" = "--site" ]; then
+        _vhosty_sites
+      elif [ "${words[CURRENT-1]}" = "--path" ]; then
+        _files -/
+      elif [[ "${words[CURRENT]}" == -* ]]; then
+        case "${words[3]}" in
+          add)    _values 'option' --copy-db --share-db --no-install --site --path ;;
+          link)   _values 'option' --copy-db --share-db --no-install ;;
+          remove|rm) _values 'option' --yes --keep-db ;;
+        esac
+      else
+        case "${words[3]}" in
+          link)   _files -/ ;;
+          remove|rm) _vhosty_worktrees ;;
+        esac
+      fi ;;
     proxy)
       if (( CURRENT == 3 )); then _vhosty_proxies
       elif (( CURRENT == 4 )); then _message 'port'; fi ;;

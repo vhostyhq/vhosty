@@ -23,7 +23,7 @@ esac"
   fake_cloudflare 100.64.0.9
   vh dns_sync
   [ -f "$HOME/updated" ]
-  ! grep -q secret-token-123 "$HOME/curl.args"
+  refute grep -q secret-token-123 "$HOME/curl.args"
   grep -q 'Authorization: Bearer secret-token-123' "$HOME/curl.stdin"
 }
 

@@ -3856,9 +3856,6 @@ EOF
     environment:
       MP_DATABASE: /data/mailpit.db # in the volume, so caught mail survives a restart
       MP_MAX_MESSAGES: 500 # then the oldest go first
-      # Apps left with a MAIL_USERNAME still deliver: it only listens on 127.0.0.1
-      MP_SMTP_AUTH_ACCEPT_ANY: 1
-      MP_SMTP_AUTH_ALLOW_INSECURE: 1
     healthcheck:
       test: ["CMD", "/mailpit", "readyz"]
       interval: 10s
@@ -4144,7 +4141,8 @@ cmd_services_backup() { # [--to DIR]
   keep="${VHOSTY_BACKUP_KEEP:-7}"
   [ "$keep" -ge 1 ] 2>/dev/null || keep=7
   old="$(for f in "$root"/services-[0-9]*; do
-    case "$f" in *.partial) ;; *) [ ! -d "$f" ] || printf '%s\n' "$f" ;; esac
+    # The opening parens matter: bash 3.2 misreads a bare pattern inside $(...)
+    case "$f" in (*.partial) ;; (*) [ ! -d "$f" ] || printf '%s\n' "$f" ;; esac
   done | sort -r | tail -n +$((keep + 1)))"
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f/MANIFEST" ] || continue
@@ -4311,9 +4309,10 @@ mail_compose_file() { # mail_compose_file DIR
 
 # Mailpit in the compose project, by service name or image, as
 # service|SMTP port|web port. Its ports can be changed in compose.yaml, so the
-# ones it really publishes. Fails when compose can't read the project.
+# ones it really publishes. Fails when compose can't read the project. Profiles
+# count: `up mailpit` starts a service behind one, by naming it.
 mail_service() {
-  dc config --format json 2>/dev/null | jq -r '.services | to_entries[]
+  dc --profile '*' config --format json 2>/dev/null | jq -r '.services | to_entries[]
     | select(.key == "mailpit" or ((.value.image // "") | test("(^|/)mailpit([:@]|$)")))
     | [.key,
        ((.value.ports // []) | map(select(.target == 1025))[0].published // ""),
@@ -4328,6 +4327,13 @@ mail_status() {
     warn "Mailpit isn't set up. Add it: vhosty mail add"
   elif ! ( need_services ) 2>/dev/null; then
     warn "Can't tell if Mailpit is running: $( ( need_services ) 2>&1 | sed 's/^error: //')"
+    # Compose reads the file without the Docker daemon, so the ports can still be right
+    row="$(mail_service 2>/dev/null || true)"
+    if [ -n "$row" ]; then
+      IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+    fi
   elif ! row="$(mail_service)"; then
     warn "docker compose can't read $file. Check it: vhosty services edit"
   elif [ -z "$row" ]; then
@@ -4390,13 +4396,16 @@ mail_scan() { # mail_scan FILE
   }
   /^ *#/ { if (sec == "s") se = NR; if (sec == "v") ve = NR; next }
   sec == "s" {
-    se = NR; match($0, /^ */); n = RLENGTH; if (!si) si = n
-    l = plain($0)
+    se = NR; match($0, /^ */); n = RLENGTH; l = plain($0)
+    if (!si) { si = n; if (l ~ /^ *[{*&[]/) why = "its services: is not a plain block" }
+    if (n == si) ci = 0; else if (!ci) ci = n
     if (n == si && l ~ /^ *mailpit[ \t]*:/) has = 1
-    if (l ~ /^ +image:[ \t]*([^ \t#]*\/)?mailpit([:@ \t#]|$)/) img = 1
+    # A key of the service itself, not one further in, like an environment variable
+    if (n == ci && l ~ /^ +image:[ \t]*([^ \t#]*\/)?mailpit([:@ \t#]|$)/) img = 1
   }
   sec == "v" {
-    ve = NR; match($0, /^ */); n = RLENGTH; if (!vi) vi = n
+    ve = NR; match($0, /^ */); n = RLENGTH
+    if (!vi) { vi = n; if ($0 ~ /^ *[{*&[]/) why = "its volumes: is not a plain block" }
     if (n == vi && plain($0) ~ /^ *mailpit[ \t]*:/) vhas = 1
   }
   END {
@@ -4431,10 +4440,14 @@ mail_refuse() { # mail_refuse FILE REASON
   exit 1
 }
 
-# One config, without Mailpit, for comparing a file with and without it
+# One config, without Mailpit, for comparing a file with and without it. Compose
+# makes the default network for a service on no other, like Mailpit in a file whose
+# services all name theirs, so that isn't a change to anything else.
 mail_config_rest() { # mail_config_rest DIR FILE
   docker compose --project-directory "$1" -f "$2" config --format json 2>/dev/null \
-    | jq -S 'del(.services.mailpit, .volumes.mailpit) | if .volumes == {} then del(.volumes) else . end'
+    | jq -S 'del(.services.mailpit, .volumes.mailpit, .networks.default)
+      | if .volumes == {} then del(.volumes) else . end
+      | if .networks == {} then del(.networks) else . end'
 }
 
 mail_add() {
@@ -4449,6 +4462,7 @@ mail_add() {
   if [ -z "$VHOSTY_SERVICES_DIR" ]; then VHOSTY_SERVICES_DIR="$dir"; save_config; fi
   if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then check=1; fi
 
+  [ -r "$file" ] || mail_refuse "$file" "it isn't readable"
   mail_scan "$file"
   # Compose's own view counts first: it sees override and included files too
   if [ -n "$check" ]; then row="$(mail_service || true)"; fi
@@ -4469,9 +4483,9 @@ mail_add() {
   fi
 
   # The new file sits next to the old one, so relative paths in it mean the same
-  new="$file.vhosty-new"
+  # mktemp makes it private (the file may hold secrets) and never reuses a name
+  new="$(mktemp "$file.vhosty-new.XXXXXX" 2>/dev/null)" || mail_refuse "$file" "$dir isn't writable"
   add_tmp "$new"
-  ( : >"$new" ) 2>/dev/null || mail_refuse "$file" "$dir isn't writable"
   make_tmp step
   # Services' block at their indent, which has to match the ones already there
   text="$(printf '\n'; compose_block mailpit 0 | sed -e '/^$/d' -e "s/^  /$(printf "%${MS_SVC_INDENT}s" '')/")"
@@ -4489,9 +4503,13 @@ mail_add() {
   fi
 
   # Compose has to read the result as the same project, plus Mailpit
-  if [ -n "$check" ]; then
-    docker compose --project-directory "$dir" -f "$new" config --services 2>/dev/null | grep -qx mailpit \
+  # Only docker is needed to parse it. Not grep -q: it'd leave compose writing to a
+  # closed pipe, which pipefail reports as a failure
+  if command -v docker >/dev/null 2>&1; then
+    docker compose --project-directory "$dir" -f "$new" config --services 2>/dev/null | grep -x mailpit >/dev/null \
       || mail_refuse "$file" "docker compose couldn't read the file with Mailpit added"
+  fi
+  if [ -n "$check" ]; then
     [ "$(mail_config_rest "$dir" "$file")" = "$(mail_config_rest "$dir" "$new")" ] \
       || mail_refuse "$file" "adding Mailpit would have changed something else in it"
   else
@@ -4529,7 +4547,7 @@ $row
 EOF
   [ -n "$smtp" ] || return 0
   while IFS='|' read -r name dir; do
-    if [ -n "$name" ] && [ -r "$dir/.env" ] && awk -F= -v port="$smtp" -v q="'" '
+    if [ -n "$name" ] && [ -f "$dir/.env" ] && [ -r "$dir/.env" ] && awk -F= -v port="$smtp" -v q="'" '
       function val(s) { sub(/[ \t]#.*/, "", s); gsub(/["\r \t]/, "", s); gsub(q, "", s); return s }
       /^MAIL_HOST=/ { h = val($2) } /^MAIL_PORT=/ { p = val($2) }
       END { exit !((h == "127.0.0.1" || h == "localhost") && p == port) }' "$dir/.env"; then

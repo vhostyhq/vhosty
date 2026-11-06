@@ -172,7 +172,9 @@ mailpit_config() {
   # A backup, byte for byte, and no temp file left
   bak="$(ls "$SVC"/compose.yaml.before-mailpit-*)"
   cmp "$bak" "$HOME/orig.yaml"
-  [ ! -e "$SVC/compose.yaml.vhosty-new" ]
+  ls -a "$SVC" >"$HOME/ls.out"
+  run grep -c vhosty-new "$HOME/ls.out"
+  [ "$output" = 0 ]
   # In the two sections: the service before the col-0 volumes comment, the volume before networks
   awk '/^  mailpit:$/ { n++; line[n] = NR } /^# Named volumes/ { c = NR } /^volumes:/ { v = NR } /^networks:/ { w = NR }
        END { exit !(n == 2 && line[1] < c && line[2] > v && line[2] < w) }' "$SVC/compose.yaml"
@@ -217,6 +219,101 @@ mailpit_config() {
   grep -qx 'volumes:' "$SVC/compose.yaml"
   "$REAL_DOCKER" compose --project-directory "$SVC" config -q
   [ "$("$REAL_DOCKER" compose --project-directory "$SVC" config --services | sort | tr '\n' ' ')" = "mailpit web " ]
+}
+
+@test "mail add ends a file with no final newline properly, on every platform" {
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\nvolumes:\n  data:' >"$SVC/compose.yaml"
+  run vh cmd_mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -qx '  data:' "$SVC/compose.yaml"
+  grep -qx '  mailpit:' "$SVC/compose.yaml"
+  [ "$(grep -c '^  mailpit:$' "$SVC/compose.yaml")" = 2 ]
+}
+
+@test "mail add takes a file whose services all use a named network" {
+  real_compose_config
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\n    networks: [back]\nnetworks:\n  back:\n' >"$SVC/compose.yaml"
+  run vh cmd_mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^  mailpit:$' "$SVC/compose.yaml"
+  "$REAL_DOCKER" compose --project-directory "$SVC" config -q
+}
+
+@test "mail add still refuses when the result changes something else" {
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\n' >"$SVC/compose.yaml"
+  cp "$SVC/compose.yaml" "$HOME/before"
+  cat >"$HOME/run.sh" <<'SH'
+source "$VHOSTY_SRC"; trap cleanup_tmp EXIT; load_config
+mail_config_rest() { echo "$2"; }
+cmd_mail add
+SH
+  run env VHOSTY_SRC="$ROOT/bin/vhosty" bash "$HOME/run.sh"
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "would have changed something else"
+  cmp "$SVC/compose.yaml" "$HOME/before"
+}
+
+@test "mail add refuses services or volumes written in flow style, with or without compose" {
+  use_svc
+  printf 'services:\n  {web: {image: nginx}}\n' >"$SVC/compose.yaml"
+  cp "$SVC/compose.yaml" "$HOME/before"
+  run vh cmd_mail add
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "not a plain block"
+  cmp "$SVC/compose.yaml" "$HOME/before"
+  printf 'services:\n  web:\n    image: nginx\nvolumes:\n  {a: {}}\n' >"$SVC/compose.yaml"
+  run vh cmd_mail add
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "not a plain block"
+}
+
+@test "mail add's temp copy is private, and leaves a file of the same name alone" {
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\n' >"$SVC/compose.yaml"
+  chmod 600 "$SVC/compose.yaml"
+  echo mine >"$SVC/compose.yaml.vhosty-new"
+  stub docker '
+case "$*" in
+  *" -f "*" config --services"*) while [ "$1" != "-f" ]; do shift; done; ls -l "$2" >>"$HOME/temp.log"; echo mailpit ;;
+esac
+exit 0'
+  run vh cmd_mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat "$HOME/temp.log")" "-rw-------"
+  [ "$(cat "$SVC/compose.yaml.vhosty-new")" = mine ]
+}
+
+@test "mail add on a file it can't read says so, and shows the block" {
+  [ "$(id -u)" != 0 ] || skip "root reads everything"
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\n' >"$SVC/compose.yaml"
+  chmod 000 "$SVC/compose.yaml"
+  run vh cmd_mail add
+  chmod 600 "$SVC/compose.yaml"
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "isn't readable"
+  assert_contains "$output" "Add this under services"
+}
+
+@test "an image: further in than a service's own keys isn't Mailpit" {
+  use_svc
+  printf 'services:\n  web:\n    image: nginx:1\n    environment:\n      image: mailpit\n' >"$SVC/compose.yaml"
+  run vh cmd_mail add
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "already set up"
+  grep -q '^  mailpit:$' "$SVC/compose.yaml"
+}
+
+@test "a Mailpit behind a compose profile is found" {
+  real_compose_config
+  use_svc
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n    profiles: [mail]\n    ports: ["127.0.0.1:2025:1025"]\n' >"$SVC/compose.yaml"
+  run vh cmd_mail
+  refute_contains "$output" "Add it: vhosty mail add"
+  printf '%s\n' "$output" | grep -qx "MAIL_PORT=2025"
 }
 
 @test "mail add copes with volumes above services, and one already named mailpit" {
@@ -453,6 +550,28 @@ refused() {
   assert_contains "$output" "MAIL_PORT=1025"
 }
 
+@test "vhosty mail with the Docker daemon down still gets the ports right" {
+  use_svc
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
+  mailpit_config 2025 8026
+  stub docker 'case "$*" in *" config"*) cat "$HOME/config.json"; exit 0 ;; esac; exit 1'
+  run vh cmd_mail
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "Can't tell if Mailpit is running"
+  printf '%s\n' "$output" | grep -qx "MAIL_PORT=2025"
+  assert_contains "$output" "https://8026.test.example"
+}
+
+@test "vhosty mail says when compose can't read the file" {
+  use_svc
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
+  stub docker 'case "$1 $*" in info*) exit 0 ;; compose*" config"*) exit 1 ;; esac; exit 0'
+  run vh cmd_mail
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "can't read"
+  refute_contains "$output" "Mailpit running"
+}
+
 @test "vhosty mail uses the ports Mailpit really publishes" {
   use_svc
   printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
@@ -540,6 +659,27 @@ refused() {
   refute_contains "$output" "smtp.example.com"
 }
 
+@test "doctor runs the note" {
+  use_svc
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
+  mailpit_config
+  php_site caught
+  printf 'MAIL_HOST=127.0.0.1\nMAIL_PORT=1025\n' >"$PARKED/caught/.env"
+  run linux main doctor
+  assert_contains "$output" "sites sending mail to Mailpit: caught"
+}
+
+@test "doctor's note ignores a folder named .env" {
+  use_svc
+  printf 'services:\n  mailpit:\n    image: axllent/mailpit:v1.33\n' >"$SVC/compose.yaml"
+  mailpit_config
+  php_site odd
+  mkdir "$PARKED/odd/.env"
+  run vh mail_doctor_info
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
 @test "doctor's note can't fail, and says nothing without Mailpit" {
   use_svc
   printf 'services:\n  web:\n    image: nginx:1\n' >"$SVC/compose.yaml"
@@ -587,7 +727,8 @@ exit 0'
   refute_contains "$output" "not backed up:"
   b="$(ls -d "$HOME"/backups/services-*)"
   grep -q '^volume|valkey|' "$b/MANIFEST"
-  ! grep -q 'mailpit' "$b/MANIFEST"
+  run grep -c 'mailpit' "$b/MANIFEST"
+  [ "$output" = 0 ]
   [ ! -e "$b/mailpit" ]
   refute_contains "$(cat "$HOME/docker.log")" "stop mailpit"
   # The compose file with Mailpit in it is saved

@@ -310,6 +310,7 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
 | `vhosty ext [require\|install\|check]` | PHP extensions each site needs |
 | `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
+| `vhosty mail [status\|add]` | Catch outgoing mail with Mailpit: its address and the lines for an app's `.env` |
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
@@ -477,11 +478,11 @@ project's `composer.json` (`"ext-name": "*"`) instead, so it travels with the co
 
 ### Docker services
 
-Databases, caches, search and S3 run in Docker, managed with `docker compose`.
+Databases, caches, search, S3 and a mail catcher run in Docker, managed with `docker compose`.
 Start with the standard set, or point vhosty at a `compose.yaml` you already have:
 
 ```bash
-vhosty services init         # MySQL 8.4, Postgres 18 + pgvector, Valkey, Meilisearch, Typesense, RustFS
+vhosty services init         # MySQL 8.4, Postgres 18 + pgvector, Valkey, Meilisearch, Typesense, RustFS, Mailpit
 vhosty services init --only mysql,valkey
 vhosty services dir ~/Sites/services   # or use your own compose.yaml
 ```
@@ -502,6 +503,44 @@ Docker bypasses the firewall for published ports, so publish them on localhost
 (`"127.0.0.1:3306:3306"`). `vhosty services` and `vhosty doctor` flag any port
 that isn't.
 
+#### Catching mail
+
+[Mailpit](https://mailpit.axllent.org) catches what your apps send, so you can
+test password resets from any device on your tailnet without a message going out.
+It's part of `services init`. If your `compose.yaml` is older than that:
+
+```bash
+vhosty mail add    # adds it to your compose.yaml, changing nothing else in the file
+vhosty mail        # is it running, its address, and the lines for an app's .env
+```
+
+`mail add` leaves your comments, edits and other services as they are, keeps a copy
+of the file as `compose.yaml.before-mailpit-<date>`, and does nothing the second
+time. When it can't safely edit the file (Windows line endings, say, or
+`services:` written inline), it says why and prints the block to paste.
+
+vhosty never edits an app's `.env`. `vhosty mail` prints what to add:
+
+```dotenv
+MAIL_MAILER=smtp
+MAIL_SCHEME=null
+MAIL_HOST=127.0.0.1
+MAIL_PORT=1025
+MAIL_USERNAME=null
+MAIL_PASSWORD=null
+MAIL_ENCRYPTION=null
+```
+
+SMTP is on 127.0.0.1:1025, and the web page is at `https://8025.yourdomain.dev`, which
+`VHOSTY_PORTS` includes by default. If yours leaves out 8025, `vhosty mail` says so and
+shows the setting to change. Mailpit keeps the newest 500 messages. It keeps them
+across restarts, but `services backup` skips them: it's test mail. `vhosty doctor`
+lists which sites send to it.
+
+**Anyone who can reach your sites can read caught mail**, with its reset links and
+any real addresses your test data holds, the same as the sites themselves. See
+[Security](#security).
+
 #### Backups
 
 ```bash
@@ -517,6 +556,7 @@ A backup is one folder holding:
   which loads into newer versions too,
 - a `.tar.gz` of every volume of the other services (Valkey, search indexes, S3
   files). Each of those services stops for the few seconds its archive takes.
+  Mailpit is left out, and keeps running: caught mail isn't backed up.
 
 Test databases (`test`, `*_test`, `*_testing`, `*_test_<n>`) are skipped; test
 suites recreate them. Bind-mounted folders aren't included. Backups are readable
@@ -600,6 +640,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 ## Security
 
 - Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that (below).
+- [Mailpit](#catching-mail)'s page has no login: anyone who can reach your sites can read the mail it caught.
 - Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. That's fine when only you can reach the machine; if others can, limit access (below) or turn debug off.
 
 To let only yourself reach the box's sites, tag the machine and grant HTTPS to it

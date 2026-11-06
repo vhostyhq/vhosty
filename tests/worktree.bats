@@ -82,8 +82,8 @@ fake_docker() {
 }}
 JSON
   cat >"$HOME/ps.json" <<'JSON'
-{"Service":"mysql","State":"running","Health":"healthy","Publishers":[{"URL":"127.0.0.1","TargetPort":3306,"PublishedPort":3306}]}
-{"Service":"postgres","State":"running","Health":"healthy","Publishers":[{"URL":"127.0.0.1","TargetPort":5432,"PublishedPort":5432}]}
+{"Service":"mysql","Image":"mysql:8.4","State":"running","Health":"healthy","Publishers":[{"URL":"127.0.0.1","TargetPort":3306,"PublishedPort":3306}]}
+{"Service":"postgres","Image":"pgvector/pgvector:pg18-trixie","State":"running","Health":"healthy","Publishers":[{"URL":"127.0.0.1","TargetPort":5432,"PublishedPort":5432}]}
 JSON
   stub docker 'printf "%s\n" "docker $*" >>"$HOME/docker.log"
 /bin/pwd >/dev/null 2>&1 || { echo "getwd: no such file or directory" >&2; exit 1; }
@@ -91,7 +91,7 @@ case "$1" in info|image) exit 0 ;; compose) ;; *) exit 1 ;; esac
 shift 3   # compose --project-directory DIR
 case "$1" in
   config) [ ! -f "$HOME/compose-fails" ] && cat "$HOME/compose.json" ;;
-  ps) cat "$HOME/ps.json" ;;
+  ps) [ ! -f "$HOME/ps-fails" ] && cat "$HOME/ps.json" ;;
   up) exit 0 ;;
   exec)
     shift; [ "$1" != "-T" ] || shift; shift   # -T, the service
@@ -114,7 +114,7 @@ fi
 printf "%s\n" "$sql" >>"$HOME/sql.log"
 n="$(printf "%s" "$sql" | sed -n "s/.*\`\([^\`]*\)\`.*/\1/p")"
 case "$sql" in
-  *information_schema.TRIGGERS*) [ ! -f "$HOME/blockers-fail" ] || exit 1; [ ! -f "$HOME/blockers" ] || cat "$HOME/blockers" ;;
+  *information_schema.TRIGGERS*) [ ! -f "$HOME/not-copied-fails" ] || exit 1; [ ! -f "$HOME/not-copied" ] || cat "$HOME/not-copied" ;;
   *information_schema.schemata*) n="$(printf "%s" "$sql" | sed -n "s/.*schema_name = .\(.*\).$/\1/p")"
     if [ -e "$HOME/db/mysql/$n" ]; then echo 1; else echo 0; fi ;;
   "show databases") ls "$HOME/db/mysql" ;;
@@ -146,6 +146,7 @@ case "$sql" in
     if [ -e "$HOME/db/postgres/$n" ]; then echo 1; else echo 0; fi ;;
   *"from pg_roles"*) echo 1 ;;
   *"from pg_class"*) echo 0 ;;
+  *"pg_foreign_table"*) [ ! -f "$HOME/reach-fails" ] || exit 1; [ ! -f "$HOME/reach" ] || cat "$HOME/reach" ;;
   *"from pg_extension"*) [ ! -f "$HOME/ext-fails" ] || exit 1; if [ -f "$HOME/extensions" ]; then cat "$HOME/extensions"; else echo "vector|public"; fi ;;
   "CREATE EXTENSION"*|"CREATE SCHEMA"*) ;;
   "CREATE DATABASE"*) [ ! -e "$HOME/db/postgres/$n" ] || exit 1; : >"$HOME/db/postgres/$n" ;;
@@ -278,10 +279,10 @@ EOF2
 @test ".env writing never goes through a symlink" {
   printf 'A=target\n' >"$HOME/target"
   ln -s "$HOME/target" "$HOME/e"
-  vh worktree_env_set "$HOME/e" A changed
+  run vh worktree_env_set "$HOME/e" A changed
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "is a link"
   [ "$(cat "$HOME/target")" = "A=target" ]
-  [ ! -L "$HOME/e" ]
-  [ "$(cat "$HOME/e")" = "A=changed" ]
 }
 
 # ---------------------------------------------------------------- add
@@ -679,19 +680,27 @@ DB_URL=mysql://u:hunter2secret@db.example.com/x'
   cd "$PARKED/ledger"
   run vhosty worktree add feature/x
   [ "$status" -ne 0 ]
-  assert_contains "$output" "isn't running"
+  assert_contains "$output" "Start it"
+  assert_contains "$output" "vhosty services up mysql"
   [ ! -e "$VHOSTY_DIR/worktrees" ]
 }
 
 @test "mysql: compose that can't be read stops it, rather than sharing the database" {
   repo_site ledger "$MYSQL_ENV"
   services_on
-  touch "$HOME/compose-fails"
+  touch "$HOME/ps-fails"
   cd "$PARKED/ledger"
   run vhosty worktree add feature/x
   [ "$status" -ne 0 ]
   assert_contains "$output" "Can't read the docker services"
   [ ! -e "$VHOSTY_DIR/worktrees" ]
+  # Nothing running there, and a file it can't read either
+  rm "$HOME/ps-fails"
+  : >"$HOME/ps.json"
+  touch "$HOME/compose-fails"
+  run vhosty worktree add feature/x
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "Can't read the docker services"
 }
 
 # ---------------------------------------------------------------- Postgres
@@ -1144,10 +1153,11 @@ sqlite_shared_case() {
   cd "$PARKED/ledger"
   run vhosty worktree add linked
   [ "$status" -ne 0 ]
-  assert_contains "$output" "link out of it"
+  assert_contains "$output" "link out of the worktree"
   [ -z "$(ls "$HOME/elsewhere")" ]
   [ ! -e "$HOME/composer.log" ]
-  [ -z "$(conf_value linked--ledger SITE_WT_DB_KIND)" ]
+  [ ! -e "$VHOSTY_DIR/sites/linked--ledger.conf" ]
+  [ ! -e "$VHOSTY_DIR/worktrees/ledger/linked" ]
 }
 
 # ---------------------------------------------------------------- PHP
@@ -1680,9 +1690,9 @@ SITE_WT_DB_NAME=$(printf '%q' "$bad")"
   done
   [ ! -e "$HOME/sql.log" ] || refute_contains "$(cat "$HOME/sql.log")" "DROP"
   [ -e "$HOME/db/mysql/ledger" ]
-  # Named like vhosty's, but it's what the parent uses now
-  sed -i.bak 's/^DB_DATABASE=.*/DB_DATABASE=wt_mine/' "$PARKED/ledger/.env"
-  mysql_db wt_mine
+  # vhosty's name for it, but it's what the parent uses now
+  sed -i.bak 's/^DB_DATABASE=.*/DB_DATABASE=wt_x__ledger/' "$PARKED/ledger/.env"
+  mysql_db wt_x__ledger
   site_conf x--ledger "SITE_PATH=$HOME/wt
 SITE_LINKED=yes
 SITE_WT_KIND=adopted
@@ -1690,11 +1700,11 @@ SITE_WT_PARENT=ledger
 SITE_WT_REPO=$PARKED/ledger
 SITE_WT_DB_KIND=mysql
 SITE_WT_DB_SERVICE=mysql
-SITE_WT_DB_NAME=wt_mine"
+SITE_WT_DB_NAME=wt_x__ledger"
   run vhosty worktree remove x--ledger --yes
   [ "$status" -ne 0 ]
-  assert_contains "$output" "still names it (DB_DATABASE)"
-  [ -e "$HOME/db/mysql/wt_mine" ]
+  assert_contains "$output" "$PARKED/ledger/.env still names it"
+  [ -e "$HOME/db/mysql/wt_x__ledger" ]
 }
 
 @test "remove: a sqlite record outside the worktree is refused" {
@@ -2246,47 +2256,57 @@ not_dropped() {
   [ "$(vh worktree_env_get "$HOME/e" C)" = 1 ]
 }
 
-@test ".env: which keys name a database, whole, in any form, never comments or parts of a name" {
-  cat >"$HOME/e" <<'EOF'
+@test ".env: the search is blunt: any case, comments, longer names, every %XX, and only names the file" {
+  cat >"$HOME/plain" <<'EOF'
 DB_DATABASE=wt_x
-export OTHER="mysql://u:p@h/wt_x?ssl=1"
-ENCODED=mysql://u:p@h/wt%5Fx
-# COMMENT=wt_x
-LONGER=wt_x_y
-PREFIXED=my_wt_x
 EOF
-  [ "$(vh worktree_env_keys_naming "$HOME/e" wt_x)" = "DB_DATABASE OTHER ENCODED" ]
+  printf 'A=1\n# old WT_X here\n' >"$HOME/comment"
+  printf 'B=my_wt_x_y\n' >"$HOME/longer"
+  printf 'C=mysql://u:p@h/%%77%%74%%5F%%78\n' >"$HOME/encoded"
+  printf 'D=mysql://u:p@h/%%2577t_x\n' >"$HOME/twice"
+  printf 'E=wt_y\nF=wt-x\n' >"$HOME/none"
+  out="$(vh worktree_text_names any wt_x "$HOME/plain" "$HOME/comment" "$HOME/longer" "$HOME/encoded" "$HOME/twice" "$HOME/none")"
+  assert_contains "$out" "$HOME/plain"
+  assert_contains "$out" "$HOME/comment"
+  assert_contains "$out" "$HOME/longer"
+  assert_contains "$out" "$HOME/encoded"
+  assert_contains "$out" "$HOME/twice"
+  refute_contains "$out" "$HOME/none"
+  refute_contains "$out" "DB_DATABASE"
+  # The whole word, for what a worktree's own .env keeps
+  [ -z "$(vh worktree_text_names word wt_x "$HOME/longer")" ]
+  [ -n "$(vh worktree_text_names word wt_x "$HOME/encoded")" ]
 }
 
 @test "remove: the parent's DB_URL names it: not dropped" {
   with_mysql_worktree
   echo 'DB_URL=mysql://u:p@127.0.0.1/wt_feature_x__ledger' >>"$PARKED/ledger/.env"
-  not_dropped "still names it (DB_URL)"
+  not_dropped "$PARKED/ledger/.env still names it"
 }
 
 @test "remove: the parent's URL-encoded DATABASE_URL names it: not dropped" {
   with_mysql_worktree
   echo 'DATABASE_URL=mysql://u:p@127.0.0.1/wt%5Ffeature%5Fx%5F%5Fledger' >>"$PARKED/ledger/.env"
-  not_dropped "still names it (DATABASE_URL)"
+  not_dropped "$PARKED/ledger/.env still names it"
 }
 
 @test "remove: the parent's second DB_DATABASE names it: not dropped" {
   with_mysql_worktree
   echo 'DB_DATABASE=wt_feature_x__ledger' >>"$PARKED/ledger/.env"
-  not_dropped "still names it (DB_DATABASE)"
+  not_dropped "$PARKED/ledger/.env still names it"
 }
 
 @test "remove: the parent's first DB_DATABASE names it, a later one doesn't: still not dropped" {
   with_mysql_worktree
   { echo 'DB_DATABASE=wt_feature_x__ledger'; cat "$PARKED/ledger/.env"; } >"$HOME/e"
   cp "$HOME/e" "$PARKED/ledger/.env"
-  not_dropped "still names it (DB_DATABASE)"
+  not_dropped "$PARKED/ledger/.env still names it"
 }
 
 @test "remove: another key of the parent's names it: not dropped" {
   with_mysql_worktree
   echo 'DB_REPORTS_DATABASE=wt_feature_x__ledger' >>"$PARKED/ledger/.env"
-  not_dropped "still names it (DB_REPORTS_DATABASE)"
+  not_dropped "$PARKED/ledger/.env still names it"
 }
 
 @test "remove: a variable in the settings that pick a database can't be told: not dropped" {
@@ -2300,7 +2320,7 @@ EOF
   mv "$PARKED/ledger" "$HOME/moved"
   run vhosty worktree remove feature-x--ledger --yes
   [ "$status" -ne 0 ]
-  assert_contains "$output" "can't be read"
+  assert_contains "$output" "isn't there"
   assert_contains "$output" "by hand"
   assert_contains "$output" "DROP DATABASE"
   assert_contains "$output" "--keep-db"
@@ -2514,7 +2534,7 @@ parents_files_intact() {
   [ -z "$(find "$VHOSTY_DIR/worktrees" -name '.feature-x*')" ]
 }
 
-@test "sqlite: --keep-db when git refuses: the copy goes, the earlier one stays, and nothing moved" {
+@test "sqlite: --keep-db when git refuses: the copy stays and is named, the earlier one too, and the file's where it was" {
   repo_site ledger "$SQLITE_ENV"
   cd "$PARKED/ledger"
   run vhosty worktree add feature/x
@@ -2529,7 +2549,8 @@ parents_files_intact() {
   [ "$(cat "$VHOSTY_DIR/worktrees/feature-x--ledger.sqlite")" = earlier ]
   [ "$(cat "$wt/database/database.sqlite")" = migrated ]
   [ -z "$(find "$VHOSTY_DIR/worktrees" -name '.feature-x*')" ]
-  [ ! -e "$VHOSTY_DIR/worktrees/feature-x--ledger.2.sqlite" ]
+  [ "$(cat "$VHOSTY_DIR/worktrees/feature-x--ledger.2.sqlite")" = migrated ]
+  assert_contains "$output" "$VHOSTY_DIR/worktrees/feature-x--ledger.2.sqlite"
   [ -f "$VHOSTY_DIR/sites/feature-x--ledger.conf" ]
 }
 
@@ -2550,41 +2571,81 @@ parents_files_intact() {
 
 # ---- --copy-db on MySQL, and what it leaves alone
 
-@test "mysql: triggers, routines or events that name the parent stop the copy, with read-only queries" {
+@test "mysql: --copy-db leaves out triggers, routines and events, and names them" {
   repo_site ledger "$MYSQL_ENV"
   services_on
   mysql_db ledger
-  printf 'trigger audit_after_insert\nprocedure rollup\nevent nightly\n' >"$HOME/blockers"
+  printf 'trigger audit_after_insert\nprocedure rollup\nevent nightly\n' >"$HOME/not-copied"
   cd "$PARKED/ledger"
   run vhosty worktree add feature/x --copy-db
-  [ "$status" -ne 0 ]
-  assert_contains "$output" "not copying ledger"
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "not copied"
   assert_contains "$output" "trigger audit_after_insert, procedure rollup, event nightly"
-  assert_contains "$output" "stays empty"
-  [ ! -e "$HOME/dump.log" ]
-  [ ! -s "$HOME/db/mysql/wt_feature_x__ledger" ]
-  [ "$(conf_value feature-x--ledger SITE_WT_DB_NAME)" = wt_feature_x__ledger ]
-  assert_contains "$output" "php artisan migrate --seed"
+  dump="$(cat "$HOME/dump.log")"
+  assert_contains "$dump" "--skip-triggers"
+  assert_contains "$dump" "--skip-routines"
+  assert_contains "$dump" "--skip-events"
+  refute_contains "$dump" " --routines"
+  refute_contains "$dump" " --triggers"
+  refute_contains "$dump" " --events"
+  assert_contains "$(cat "$HOME/db/mysql/wt_feature_x__ledger")" "row of ledger"
   [ "$(cat "$HOME/db/mysql/ledger")" = "row of ledger" ]
-  # They asked about the parent, and changed nothing
   q="$(cat "$HOME/sql.log")"
   assert_contains "$q" "TRIGGER_SCHEMA = 'ledger'"
-  assert_contains "$q" "information_schema.ROUTINES"
-  assert_contains "$q" "information_schema.EVENTS"
   refute_contains "$q" "load into ledger"
 }
 
-@test "mysql: if that check can't run, nothing's copied" {
+@test "mysql: nothing to leave out, no word about it" {
   repo_site ledger "$MYSQL_ENV"
   services_on
   mysql_db ledger
-  touch "$HOME/blockers-fail"
   cd "$PARKED/ledger"
   run vhosty worktree add feature/x --copy-db
-  [ "$status" -ne 0 ]
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "not copied"
+}
+
+@test "mysql: a list of what's left out that can't be had is a warning, and it's still left out" {
+  repo_site ledger "$MYSQL_ENV"
+  services_on
+  mysql_db ledger
+  touch "$HOME/not-copied-fails"
+  cd "$PARKED/ledger"
+  run vhosty worktree add feature/x --copy-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "aren't copied"
+  assert_contains "$(cat "$HOME/dump.log")" "--skip-triggers"
+}
+
+@test "postgres: a parent that can reach outside itself isn't copied: empty, recorded, exit 1, says why" {
+  repo_site ledger "$PG_ENV"
+  services_on
+  pg_db ledger
+  printf 'extension dblink\nforeign table remote_log\n' >"$HOME/reach"
+  cd "$PARKED/ledger"
+  run vhosty worktree add feature/x --copy-db
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "not copying ledger"
+  assert_contains "$output" "extension dblink"
+  assert_contains "$output" "foreign table remote_log"
+  assert_contains "$output" "stays empty"
+  assert_contains "$output" "php artisan migrate --seed"
+  [ ! -e "$HOME/dump.log" ]
+  [ ! -s "$HOME/db/postgres/wt_feature_x__ledger" ]
+  [ "$(conf_value feature-x--ledger SITE_WT_DB_NAME)" = wt_feature_x__ledger ]
+}
+
+@test "postgres: if that can't be checked, nothing's copied" {
+  repo_site ledger "$PG_ENV"
+  services_on
+  pg_db ledger
+  touch "$HOME/reach-fails"
+  cd "$PARKED/ledger"
+  run vhosty worktree add feature/x --copy-db
+  [ "$status" -eq 1 ]
   assert_contains "$output" "couldn't check"
   [ ! -e "$HOME/dump.log" ]
-  [ ! -s "$HOME/db/mysql/wt_feature_x__ledger" ]
+  [ ! -s "$HOME/db/postgres/wt_feature_x__ledger" ]
 }
 
 @test "mysql: --set-gtid-purged only where the dump tool knows it (mariadb-dump doesn't)" {
@@ -2825,29 +2886,45 @@ parents_files_intact() {
 
 # ---- backups
 
-@test "backup skips worktree databases, and says so" {
-  mysql_db ledger
-  mysql_db wt_feature_x__ledger
+@test "backup skips exactly what worktree sites record, and says so" {
+  mysql_db wt_ledger
+  mysql_db wt_payroll
+  mysql_db wt_x__ledger
+  mysql_db wt_kept__ledger
+  mysql_db wt_y__ledger
   pg_db books
-  pg_db wt_y__books
+  pg_db wt_money
+  pg_db wt_z__books
   stub pg_dumpall 'echo roles'
   services_on
+  rec() { # rec SITE KIND SERVICE NAME
+    site_conf "$1" "SITE_PATH=$HOME/$1
+SITE_LINKED=yes
+SITE_WT_KIND=created
+SITE_WT_PARENT=ledger
+SITE_WT_REPO=$PARKED/ledger
+SITE_WT_DB_KIND=$2
+SITE_WT_DB_SERVICE=$3
+SITE_WT_DB_NAME=$4"
+  }
+  rec x--ledger mysql mysql wt_x__ledger
+  rec z--books postgres postgres wt_z__books
+  # A hand-edited record names something else, on another service, or nothing
+  rec odd--ledger mysql mysql wt_payroll
+  rec y--ledger mysql mysql2 wt_y__ledger
   mkdir -p "$HOME/out/mysql" "$HOME/out/postgres"
   : >"$HOME/out/MANIFEST"
   run vh backup_mysql mysql "$HOME/out"
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
-  assert_contains "$output" "1 database(s) dumped (skipped test and worktree databases: wt_feature_x__ledger)"
+  assert_contains "$output" "4 database(s) dumped (skipped test and worktree databases: wt_x__ledger)"
   run vh backup_postgres postgres "$HOME/out"
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
-  assert_contains "$output" "(skipped test and worktree databases: wt_y__books)"
-  [ -f "$HOME/out/mysql/ledger.sql.gz" ]
-  [ -f "$HOME/out/postgres/books.sql.gz" ]
-  [ ! -e "$HOME/out/mysql/wt_feature_x__ledger.sql.gz" ]
-  [ ! -e "$HOME/out/postgres/wt_y__books.sql.gz" ]
-  refute grep -q 'wt_' "$HOME/out/MANIFEST"
-  # A name that only has wt_ in the middle is an ordinary database
-  vh is_test_db wt_x
-  refute vh is_test_db my_wt_x
+  assert_contains "$output" "(skipped test and worktree databases: wt_z__books)"
+  for db in wt_ledger wt_payroll wt_kept__ledger wt_y__ledger; do [ -f "$HOME/out/mysql/$db.sql.gz" ]; done
+  [ -f "$HOME/out/postgres/wt_money.sql.gz" ]
+  [ ! -e "$HOME/out/mysql/wt_x__ledger.sql.gz" ]
+  [ ! -e "$HOME/out/postgres/wt_z__books.sql.gz" ]
+  refute vh is_test_db wt_x
 }
 
 @test "restore: an old backup that has a worktree's database loads it like any other" {
@@ -2860,4 +2937,971 @@ parents_files_intact() {
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   assert_contains "$output" "wt_old__ledger loaded"
   assert_contains "$(cat "$HOME/sql.log")" "load into (none): old row"
+}
+
+# ---------------------------------------------------------------- the .env it ends up with
+
+# branch_with_env BRANCH TEXT: a branch that tracks a .env of its own
+branch_with_env() {
+  local d="$PARKED/ledger"
+  [ ! -f "$d/.env" ] || cp "$d/.env" "$HOME/parent.env"
+  git -C "$d" checkout -qb "$1"
+  grep -v '^\.env$' "$d/.gitignore" >"$HOME/gitignore"
+  cp "$HOME/gitignore" "$d/.gitignore"
+  printf '%s\n' "$2" >"$d/.env"
+  git -C "$d" add -f .env .gitignore
+  git -C "$d" commit -qm cfg
+  git -C "$d" checkout -q main
+  [ ! -f "$HOME/parent.env" ] || cp "$HOME/parent.env" "$d/.env"
+  cd "$d"
+}
+
+# undone BRANCH: stopped, with the worktree it made gone and nothing else made
+undone() {
+  [ "$status" -eq 1 ]
+  [ ! -e "$VHOSTY_DIR/worktrees/ledger/$1" ]
+  [ ! -e "$VHOSTY_DIR/sites/$1--ledger.conf" ]
+  [ "$(git -C "$PARKED/ledger" worktree list | wc -l | tr -d ' ')" = 1 ]
+  [ ! -e "$HOME/composer.log" ]
+  assert_contains "$output" "removed the worktree"
+  assert_contains "$output" "--share-db"
+}
+
+@test "add: a branch's own .env with a remote DB_URL is caught, and undone [A7]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  branch_with_env remote-cfg 'DB_CONNECTION=mysql
+DB_URL=mysql://root:sekrit@prod.example.com:3306/ledger_prod'
+  run vhosty worktree add remote-cfg --no-install
+  undone remote-cfg
+  assert_contains "$output" "database URL"
+  refute_contains "$output" "sekrit"
+  [ "$(ls "$HOME/db/mysql")" = ledger ]
+  # It was there already, so nothing to say about the branch
+  refute_contains "$output" "which this command created"
+  git -C "$PARKED/ledger" show-ref --verify --quiet refs/heads/remote-cfg
+}
+
+@test "add: a branch's own .env with a remote host is caught, and --share-db lets it through [A7b]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  branch_with_env remote-cfg 'DB_CONNECTION=mysql
+DB_HOST=prod.example.com
+DB_DATABASE=ledger_prod'
+  run vhosty worktree add remote-cfg --no-install
+  undone remote-cfg
+  assert_contains "$output" "prod.example.com"
+  [ "$(ls "$HOME/db/mysql")" = ledger ]
+  run vhosty worktree add remote-cfg --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat "$VHOSTY_DIR/worktrees/ledger/remote-cfg/.env")" "DB_HOST=prod.example.com"
+  assert_contains "$(conf_value remote-cfg--ledger SITE_WT_DB_SHARED)" "prod.example.com"
+}
+
+@test "add: a .env.example only the branch has is what counts, with no .env in the parent [B4]" {
+  services_on
+  repo_site ledger
+  cd "$PARKED/ledger"
+  git checkout -qb remote-cfg
+  printf 'DB_CONNECTION=mysql\nDB_HOST=prod.example.com\nDB_DATABASE=ledger_prod\n' >.env.example
+  git add .env.example
+  git commit -qm e
+  git checkout -q main
+  run vhosty worktree add remote-cfg --no-install
+  undone remote-cfg
+}
+
+@test "add: a post-checkout hook's .env is caught, and a branch this made is said to stay" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cat >"$PARKED/ledger/.git/hooks/post-checkout" <<'EOF'
+#!/bin/sh
+printf 'DB_CONNECTION=mysql\nDB_HOST=prod.example.com\nDB_DATABASE=ledger_prod\n' >.env
+EOF
+  chmod +x "$PARKED/ledger/.git/hooks/post-checkout"
+  cd "$PARKED/ledger"
+  run vhosty worktree add hooked --no-install
+  undone hooked
+  assert_contains "$output" "The branch hooked, which this command created, stays"
+  git -C "$PARKED/ledger" show-ref --verify --quiet refs/heads/hooked
+  [ "$(ls "$HOME/db/mysql")" = ledger ]
+}
+
+@test "add: what git won't undo stays and is said, without --force" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cat >"$PARKED/ledger/.git/hooks/post-checkout" <<'EOF'
+#!/bin/sh
+printf 'DB_CONNECTION=mysql\nDB_HOST=prod.example.com\nDB_DATABASE=ledger_prod\n' >.env
+echo draft >notes.txt
+EOF
+  chmod +x "$PARKED/ledger/.git/hooks/post-checkout"
+  cd "$PARKED/ledger"
+  run vhosty worktree add hooked --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "git wouldn't remove the worktree"
+  [ "$(cat "$VHOSTY_DIR/worktrees/ledger/hooked/notes.txt")" = draft ]
+  [ ! -e "$VHOSTY_DIR/sites/hooked--ledger.conf" ]
+  [ "$(ls "$HOME/db/mysql")" = ledger ]
+}
+
+@test "add: a branch's own .env on vhosty's service naming another database is fine" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  mysql_db branchdb
+  branch_with_env own-db 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=branchdb'
+  run vhosty worktree add own-db --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "kept what its .env names (branchdb)"
+  [ -z "$(conf_value own-db--ledger SITE_WT_DB_KIND)" ]
+}
+
+# ---------------------------------------------------------------- --keep-db, and git failing partway
+
+# sqlite_precious: a worktree whose sqlite file holds the only copy of something
+sqlite_precious() {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  printf 'storage/\n' >>.gitignore
+  git add .gitignore
+  git commit -qm i
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/x"
+  echo precious >"$W/database/database.sqlite"
+  cd /
+}
+
+# stub_git_partway: git deletes database/ and then fails, as it can
+stub_git_partway() {
+  local real
+  real="$(command -v git)"
+  stub git "case \"\$*\" in *'worktree remove'*) rm -rf \"$W/database\"; echo 'error: failed to delete' >&2; exit 1 ;; esac; exec \"$real\" \"\$@\""
+}
+
+@test "keep-db: git fails partway: the copy is safe, and it doesn't say nothing was removed [P1]" {
+  sqlite_precious
+  stub_git_partway
+  run vhosty worktree remove x--ledger --keep-db
+  [ "$status" -ne 0 ]
+  refute_contains "$output" "Nothing was removed"
+  assert_contains "$output" "files may be gone"
+  assert_contains "$output" "What's left there"
+  assert_contains "$output" "public"
+  assert_contains "$output" "$VHOSTY_DIR/worktrees/x--ledger.sqlite"
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = precious ]
+  [ -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+}
+
+@test "keep-db: real git on a read-only folder: the copy is safe, whatever got deleted [P1]" {
+  sqlite_precious
+  mkdir -p "$W/storage/logs"
+  echo l >"$W/storage/logs/laravel.log"
+  chmod 555 "$W/storage/logs"
+  mv "$W/database" "$W/database.tmp"
+  mv "$W/database.tmp" "$W/database"
+  # Asks first without --yes, as storage/ goes with it
+  run vhosty worktree remove x--ledger --keep-db </dev/null
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "storage/"
+  [ "$(cat "$W/database/database.sqlite")" = precious ]
+  run vhosty worktree remove x--ledger --keep-db --yes </dev/null
+  chmod -R u+w "$W"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = precious ]
+  [ -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+  if [ -e "$W/database/database.sqlite" ] && [ -e "$W/.env" ]; then :; else
+    refute_contains "$output" "Nothing was removed"
+    assert_contains "$output" "files may be gone"
+  fi
+}
+
+@test "remove: git fails partway on mysql: says so, keeps the database and the record [P2]" {
+  with_mysql_worktree
+  W="$VHOSTY_DIR/worktrees/ledger/feature-x"
+  stub_git_partway
+  run vhosty worktree remove feature-x--ledger --yes
+  [ "$status" -ne 0 ]
+  refute_contains "$output" "Nothing was removed"
+  assert_contains "$output" "files may be gone"
+  [ -e "$HOME/db/mysql/wt_feature_x__ledger" ]
+  [ -f "$VHOSTY_DIR/sites/feature-x--ledger.conf" ]
+}
+
+@test "keep-db: killed during the Octane stop, after git: the copy is safe [S1]" {
+  sqlite_precious
+  run vh eval 'svc_installed() { return 0; }; cmd_rebuild() { :; }; svc_stop() { kill -TERM $$; sleep 1; }
+    site_load x--ledger; SITE_OCTANE=on; site_save x--ledger; cmd_worktree_remove x--ledger --keep-db'
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = precious ]
+}
+
+@test "keep-db: killed straight after git: the copy is safe [B1t]" {
+  sqlite_precious
+  real="$(command -v git)"
+  stub git "\"$real\" \"\$@\"; rc=\$?; case \"\$*\" in *'worktree remove'*) kill -TERM \$PPID; sleep 1 ;; esac; exit \$rc"
+  run vhosty worktree remove x--ledger --keep-db
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = precious ]
+}
+
+@test "keep-db: a file it can't copy stops it before the folder is touched" {
+  sqlite_precious
+  mkdir -p "$VHOSTY_DIR/worktrees"
+  stub cp 'exit 1'
+  run vhosty worktree remove x--ledger --keep-db
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "nothing was removed"
+  [ "$(cat "$W/database/database.sqlite")" = precious ]
+}
+
+# ---------------------------------------------------------------- what counts as managed
+
+# plan_says LINE [refused text]: the parent's .env with LINE added, and what add makes of it
+plan_refused() {
+  cp "$HOME/o" "$PARKED/ledger/.env"
+  printf '%b\n' "$1" >>"$PARKED/ledger/.env"
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "${2:-would share}"
+  assert_contains "$output" "Nothing changed"
+  [ ! -e "$VHOSTY_DIR/worktrees/ledger/z" ]
+}
+plan_managed() {
+  cp "$HOME/o" "$PARKED/ledger/.env"
+  [ -z "$1" ] || printf '%b\n' "$1" >>"$PARKED/ledger/.env"
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "new empty mysql database wt_z__ledger"
+  run vhosty worktree remove z--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "managed means 127.0.0.1 and nothing else [B14]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cp "$PARKED/ledger/.env" "$HOME/o"
+  cd "$PARKED/ledger"
+  plan_refused 'export DB_HOST=prod.example.com'
+  plan_refused 'DB_HOST="prod.example.com" # c'
+  plan_refused 'DB_HOST = prod.example.com'
+  plan_refused 'DB_HOST=prod.example.com\r'
+  plan_refused 'DB_HOST=127.0.0.2'
+  plan_refused 'DB_HOST=0.0.0.0'
+  plan_refused 'DB_HOST=host.docker.internal'
+  plan_refused 'DB_HOST=::1'
+  plan_refused 'DB_HOST=[::1]'
+  plan_refused 'DB_HOST=' 'empty'
+  plan_refused 'DB_HOST=localhost' 'Use DB_HOST=127.0.0.1'
+  plan_refused 'DB_SOCKET=/tmp/mysql.sock' 'DB_SOCKET'
+  plan_refused 'DB_READ_HOST=prod.example.com' 'DB_READ_HOST'
+  plan_refused 'DB_WRITE_HOST=127.0.0.1' 'DB_WRITE_HOST'
+  plan_refused 'DATABASE_URL=mysql://u:p@h/x' 'database URL'
+  plan_refused 'DB_PORT=13306' 'no vhosty docker service'
+  plan_refused 'DB_PORT="13306"' 'no vhosty docker service'
+  plan_managed ''
+  plan_managed 'DB_HOST="127.0.0.1"'
+  plan_managed 'export DB_HOST=127.0.0.1'
+  plan_managed 'DB_HOST=127.0.0.1\r'
+  plan_managed 'DB_URL='
+  plan_managed 'DB_READ_HOST='
+  # No key at all is what Laravel takes for 127.0.0.1
+  grep -v '^DB_HOST=' "$HOME/o" >"$HOME/o2"
+  mv "$HOME/o2" "$HOME/o"
+  plan_managed ''
+}
+
+@test "managed: localhost stops on postgres too" {
+  services_on
+  repo_site ledger "$PG_ENV
+DB_HOST=localhost"
+  pg_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Use DB_HOST=127.0.0.1"
+  [ ! -e "$HOME/db/postgres/wt_z__ledger" ]
+}
+
+@test "managed: the running container has to publish that port on 127.0.0.1, whatever compose.yaml says [T2]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  # An edit to compose.yaml that hasn't been applied: something else is on that port
+  cat >"$HOME/ps.json" <<'JSON'
+{"Service":"mysql","Image":"mysql:8.4","State":"running","Publishers":[{"URL":"127.0.0.1","TargetPort":3306,"PublishedPort":3307}]}
+JSON
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "no running container does"
+  assert_contains "$output" "vhosty services up mysql"
+  [ ! -e "$HOME/db/mysql/wt_z__ledger" ]
+  # On another address only
+  cat >"$HOME/ps.json" <<'JSON'
+{"Service":"mysql","Image":"mysql:8.4","State":"running","Publishers":[{"URL":"192.168.1.5","TargetPort":3306,"PublishedPort":3306}]}
+JSON
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  # Stopped, with its row still there
+  cat >"$HOME/ps.json" <<'JSON'
+{"Service":"mysql","Image":"mysql:8.4","State":"exited","Publishers":[]}
+JSON
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Start it"
+  # Listed, but not running, with the port still shown
+  cat >"$HOME/ps.json" <<'JSON'
+{"Service":"mysql","Image":"mysql:8.4","State":"restarting","Publishers":[{"URL":"127.0.0.1","TargetPort":3306,"PublishedPort":3306}]}
+JSON
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  # On all addresses, 127.0.0.1 is one of them
+  cat >"$HOME/ps.json" <<'JSON'
+{"Service":"mysql","Image":"mysql:8.4","State":"running","Publishers":[{"URL":"0.0.0.0","TargetPort":3306,"PublishedPort":3306},{"URL":"::","TargetPort":3306,"PublishedPort":3306}]}
+JSON
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "managed: a port held by a service of the wrong kind isn't it" {
+  services_on
+  repo_site ledger "$PG_ENV
+DB_PORT=3306"
+  pg_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add z --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "no vhosty docker service publishes postgres"
+}
+
+# ---------------------------------------------------------------- a worktree's own .env
+
+# wt_with_env TEXT: an adopted worktree y, with its own .env
+wt_with_env() {
+  git -C "$PARKED/ledger" worktree add -q -b y "$HOME/wty"
+  printf '%s\n' "$1" >"$HOME/wty/.env"
+  cd "$HOME/wty"
+}
+OWN_ENV='DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306'
+
+@test "link: a .env naming what the parent reaches by DB_URL gets its own [A6]" {
+  services_on
+  repo_site ledger "DB_CONNECTION=mysql
+DB_URL=mysql://root:p@127.0.0.1:3306/ledger"
+  mysql_db ledger
+  # The parent's own plan isn't what's asked about here: its URL stops an add, not this
+  wt_with_env "$OWN_ENV
+DB_DATABASE=ledger"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat .env)" "DB_DATABASE=wt_y__ledger"
+  [ -e "$HOME/db/mysql/wt_y__ledger" ]
+  [ "$(conf_value y--ledger SITE_WT_DB_NAME)" = wt_y__ledger ]
+}
+
+@test "link: a .env naming what the parent's \${VAR} comes to gets its own [A6b]" {
+  services_on
+  repo_site ledger 'APP_SLUG=ledger
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=${APP_SLUG}'
+  mysql_db ledger
+  wt_with_env "$OWN_ENV
+DB_DATABASE=ledger"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat .env)" "DB_DATABASE=wt_y__ledger"
+}
+
+@test "link: a .env naming the parent's database in capitals gets its own [L2]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  wt_with_env "$OWN_ENV
+DB_DATABASE=LEDGER"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat .env)" "DB_DATABASE=wt_y__ledger"
+}
+
+@test "link: when the parent's database can't be worked out, it stops, unless --share-db" {
+  services_on
+  repo_site ledger 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=${NOT_SET}'
+  mysql_db other
+  wt_with_env "$OWN_ENV
+DB_DATABASE=other"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "can't tell"
+  [ ! -e "$VHOSTY_DIR/sites/y--ledger.conf" ] || [ -z "$(conf_value y--ledger SITE_WT_DB_KIND)" ]
+  # Its own .env is what it asked to keep
+  run vhosty worktree link --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat .env)" "DB_DATABASE=other"
+}
+
+@test "link: with no .env in the parent, it stops, unless --share-db" {
+  services_on
+  repo_site ledger
+  mysql_db other
+  wt_with_env "$OWN_ENV
+DB_DATABASE=other"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "can't tell"
+  run vhosty worktree link --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "link: vhosty's own name is kept, with or without a parent's .env, and made if missing" {
+  services_on
+  repo_site ledger
+  wt_with_env "$OWN_ENV
+DB_DATABASE=wt_y__ledger"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ -e "$HOME/db/mysql/wt_y__ledger" ]
+  [ "$(conf_value y--ledger SITE_WT_DB_NAME)" = wt_y__ledger ]
+}
+
+@test "link: another wt_ name that's missing isn't made" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  wt_with_env "$OWN_ENV
+DB_DATABASE=wt_someone_else"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "isn't there"
+  [ ! -e "$HOME/db/mysql/wt_someone_else" ]
+  [ -z "$(conf_value y--ledger SITE_WT_DB_KIND)" ]
+}
+
+@test "link --copy-db on a site that already has its database is an error [A8]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run vhosty worktree link "$VHOSTY_DIR/worktrees/ledger/s" --copy-db --no-install
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "--copy-db can't do anything here"
+  assert_contains "$output" "vhosty worktree remove s--ledger"
+  [ ! -e "$HOME/dump.log" ]
+  run vhosty worktree add r --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run vhosty worktree link "$VHOSTY_DIR/worktrees/ledger/r" --copy-db --no-install
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "--copy-db can't do anything here"
+  # Without it, running it again is still fine
+  run vhosty worktree link "$VHOSTY_DIR/worktrees/ledger/r" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+# ---------------------------------------------------------------- the drop guard
+
+@test "guard: any %XX in the parent's URL, any number of times [A3]" {
+  with_mysql_worktree
+  printf '\nDB_URL=mysql://root:p@127.0.0.1:3306/%%77t_feature_x__ledger\n' >>"$PARKED/ledger/.env"
+  not_dropped "$PARKED/ledger/.env still names it"
+  sed -i.bak '$d' "$PARKED/ledger/.env"
+  printf 'X=%%2577t%%255Ffeature_x__ledger\n' >>"$PARKED/ledger/.env"
+  not_dropped "$PARKED/ledger/.env still names it"
+}
+
+@test "guard: in capitals [A4], in a comment, in a longer name, under any key" {
+  with_mysql_worktree
+  cp "$PARKED/ledger/.env" "$HOME/o"
+  for line in 'DB_DATABASE=WT_FEATURE_X__LEDGER' '# old: wt_feature_x__ledger' 'DB_DATABASE=wt_feature_x__ledger_test' 'NOTES=wt_feature_x__ledger'; do
+    cp "$HOME/o" "$PARKED/ledger/.env"
+    printf '%s\n' "$line" >>"$PARKED/ledger/.env"
+    not_dropped "$PARKED/ledger/.env still names it"
+    refute_contains "$output" "hunter2secret"
+  done
+}
+
+@test "guard: the parent's .env.local or .env.testing [A5]" {
+  with_mysql_worktree
+  printf 'DB_DATABASE=wt_feature_x__ledger\n' >"$PARKED/ledger/.env.local"
+  not_dropped "$PARKED/ledger/.env.local still names it"
+  rm "$PARKED/ledger/.env.local"
+  printf 'DB_DATABASE=wt_feature_x__ledger\n' >"$PARKED/ledger/.env.testing"
+  not_dropped "$PARKED/ledger/.env.testing still names it"
+}
+
+@test "guard: a parked sibling that can't be read can't be told [A2]" {
+  with_mysql_worktree
+  mkdir -p "$PARKED/other"
+  printf 'DB_DATABASE=wt_feature_x__ledger\n' >"$PARKED/other/.env"
+  chmod 000 "$PARKED/other"
+  not_dropped "$PARKED/other can't be read"
+  chmod 755 "$PARKED/other"
+  chmod 000 "$PARKED/other/.env"
+  not_dropped "$PARKED/other/.env can't be read"
+  assert_contains "$output" "DROP DATABASE"
+  chmod 644 "$PARKED/other/.env"
+}
+
+@test "guard: a parent folder that can't be read can't be told, with a worktree outside it [A2d]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  git -C "$PARKED/ledger" worktree add -q -b x "$HOME/wtx"
+  cd "$HOME/wtx"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd /
+  chmod 000 "$PARKED/ledger"
+  run vhosty worktree remove x--ledger --yes
+  chmod 755 "$PARKED/ledger"
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "can't be read"
+  [ -e "$HOME/db/mysql/wt_x__ledger" ]
+  [ -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+}
+
+@test "guard: a dangling link for a .env can't be told" {
+  with_mysql_worktree
+  mkdir -p "$PARKED/other"
+  ln -s /nonexistent/env "$PARKED/other/.env"
+  not_dropped "$PARKED/other/.env can't be read"
+}
+
+@test "guard: a sibling site that's absent is skipped with a note, and the drop goes on [B9b]" {
+  with_mysql_worktree
+  site_conf other "SITE_PATH=$HOME/disk/other
+SITE_LINKED=yes"
+  run vhosty worktree remove feature-x--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "not checking $HOME/disk/other"
+  [ ! -e "$HOME/db/mysql/wt_feature_x__ledger" ]
+}
+
+@test "guard: variables in the parent's database keys: resolved, or can't tell [B9]" {
+  with_mysql_worktree
+  cp "$PARKED/ledger/.env" "$HOME/o"
+  for line in 'DB_DATABASE=${NOT_SET}' 'DB_DATABASE=$NOT_SET' 'DB_URL=mysql://h/${NOT_SET}' 'DATABASE_URL=${NOT_SET}' 'DB_REPORTS_DATABASE=${NOT_SET}' 'DB_DATABASE=${A}${NOT_SET}'; do
+    cp "$HOME/o" "$PARKED/ledger/.env"
+    printf '%s\n' "$line" >>"$PARKED/ledger/.env"
+    not_dropped "from a variable"
+  done
+  # Resolved, and comes to this one
+  cp "$HOME/o" "$PARKED/ledger/.env"
+  printf 'P=wt_feature_x\nDB_DATABASE="${P}__ledger"\n' >>"$PARKED/ledger/.env"
+  not_dropped "$PARKED/ledger/.env still names it"
+  # Resolved, and comes to something else
+  cp "$HOME/o" "$PARKED/ledger/.env"
+  printf 'P=books\nDB_DATABASE="${P}"\n' >>"$PARKED/ledger/.env"
+  run vhosty worktree remove feature-x--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "guard: a password with a \$ in it isn't a reason to refuse" {
+  with_mysql_worktree
+  printf 'DB_PASSWORD=pa$$word${x}\n' >>"$PARKED/ledger/.env"
+  run vhosty worktree remove feature-x--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+# ---------------------------------------------------------------- the record
+
+@test "drop: only vhosty's own name for this site, whatever the record says [A13]" {
+  with_mysql_worktree
+  mysql_db wt_payroll
+  sed -i.bak 's/^SITE_WT_DB_NAME=.*/SITE_WT_DB_NAME=wt_payroll/' "$VHOSTY_DIR/sites/feature-x--ledger.conf"
+  run vhosty worktree remove feature-x--ledger --yes
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "isn't the name vhosty gives this site"
+  assert_contains "$output" "--keep-db"
+  [ -e "$HOME/db/mysql/wt_payroll" ]
+  refute_contains "$(cat "$HOME/sql.log")" "DROP"
+  # And the function itself, for anything that gets that far
+  refute vh worktree_db_drop mysql mysql wt_payroll feature-x--ledger
+  refute vh worktree_db_drop mysql mysql wt_payroll
+  [ -e "$HOME/db/mysql/wt_payroll" ]
+  vh worktree_db_drop mysql mysql wt_feature_x__ledger feature-x--ledger
+  [ ! -e "$HOME/db/mysql/wt_feature_x__ledger" ]
+}
+
+@test "drop: a parent really called wt_something, recorded by hand, stays [G1]" {
+  services_on
+  repo_site ledger 'DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_DATABASE=wt_ledger_live'
+  mysql_db wt_ledger_live
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd /
+  sed -i.bak 's/^SITE_WT_DB_NAME=.*/SITE_WT_DB_NAME=wt_ledger_live/' "$VHOSTY_DIR/sites/x--ledger.conf"
+  run vhosty worktree remove x--ledger --yes
+  [ "$status" -ne 0 ]
+  [ -e "$HOME/db/mysql/wt_ledger_live" ]
+}
+
+# ---------------------------------------------------------------- where it all points now
+
+@test "remove: a created folder replaced by a link to a sibling: refused, and doesn't blame uncommitted files [A12]" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  run vhosty worktree add y --no-install
+  X="$VHOSTY_DIR/worktrees/ledger/x"
+  Y="$VHOSTY_DIR/worktrees/ledger/y"
+  echo ydata >"$Y/database/database.sqlite"
+  mv "$X" "$HOME/xmoved"
+  ln -s "$Y" "$X"
+  cd /
+  for flag in --yes --keep-db; do
+    run vhosty worktree remove x--ledger "$flag"
+    [ "$status" -ne 0 ]
+    assert_contains "$output" "now resolves to $Y"
+    refute_contains "$output" "uncommitted"
+    [ "$(cat "$Y/database/database.sqlite")" = ydata ]
+    [ -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+  done
+}
+
+@test "remove: an adopted folder replaced by a link to a sibling, or the parent: refused [A12b, A12c, A12d]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  git -C "$PARKED/ledger" worktree add -q -b x "$HOME/wtx"
+  cd "$HOME/wtx"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd /
+  mv "$HOME/wtx" "$HOME/xmoved"
+  ln -s "$PARKED/ledger" "$HOME/wtx"
+  printf '\nDB_URL=mysql://r:p@127.0.0.1/wt_x__ledger\n' >>"$PARKED/ledger/.env"
+  run vhosty worktree remove x--ledger --yes
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "now resolves to $PARKED/ledger"
+  [ -e "$HOME/db/mysql/wt_x__ledger" ]
+}
+
+@test "remove: database/ swapped for a link at the prompt: the parent's file stays [B2]" {
+  repo_site ledger "$SQLITE_ENV"
+  echo pdata >"$PARKED/ledger/database/database.sqlite"
+  git -C "$PARKED/ledger" worktree add -q -b x "$HOME/wtx"
+  cd "$HOME/wtx"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd /
+  export PARKED
+  run vh eval '
+    confirm() { mv "$HOME/wtx/database" "$HOME/wtx/database.old"; ln -s "$PARKED/ledger/database" "$HOME/wtx/database"; return 0; }
+    has_tty() { return 0; }; cmd_rebuild() { :; }
+    cmd_worktree_remove x--ledger'
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "is a link"
+  [ "$(cat "$PARKED/ledger/database/database.sqlite")" = pdata ]
+  [ -f "$VHOSTY_DIR/sites/x--ledger.conf" ]
+}
+
+@test "remove: the folder swapped for a link at the prompt: refused" {
+  repo_site ledger "$SQLITE_ENV"
+  echo pdata >"$PARKED/ledger/database/database.sqlite"
+  git -C "$PARKED/ledger" worktree add -q -b x "$HOME/wtx"
+  cd "$HOME/wtx"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd /
+  export PARKED
+  run vh eval '
+    confirm() { mv "$HOME/wtx" "$HOME/xmoved"; ln -s "$PARKED/ledger" "$HOME/wtx"; return 0; }
+    has_tty() { return 0; }; cmd_rebuild() { :; }
+    cmd_worktree_remove x--ledger'
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "now resolves to"
+  [ "$(cat "$PARKED/ledger/database/database.sqlite")" = pdata ]
+}
+
+@test "remove: the record is the physical path, even from a linked path" {
+  repo_site ledger "$SQLITE_ENV"
+  git -C "$PARKED/ledger" worktree add -q -b x "$HOME/wtx"
+  ln -s "$HOME/wtx" "$HOME/alias"
+  run vhosty worktree link "$HOME/alias" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(conf_value x--ledger SITE_WT_REAL)" = "$HOME/wtx" ]
+  run vhosty worktree remove x--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+# ---------------------------------------------------------------- what goes with the folder
+
+@test "remove: ignored files are listed and asked about, vendor and friends left out [A17]" {
+  repo_site ledger "$MYSQL_ENV"
+  cd "$PARKED/ledger"
+  printf 'storage/app/\nnode_modules/\n' >>.gitignore
+  git add .gitignore
+  git commit -qm i
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/s"
+  mkdir -p "$W/storage/app" "$W/vendor/x" "$W/node_modules/y"
+  echo receipt >"$W/storage/app/receipt.pdf"
+  echo v >"$W/vendor/x/v"
+  echo n >"$W/node_modules/y/n"
+  cd /
+  run vhosty worktree remove s--ledger </dev/null
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "storage/"
+  refute_contains "$output" "vendor"
+  refute_contains "$output" "node_modules"
+  assert_contains "$output" "no terminal"
+  [ "$(cat "$W/storage/app/receipt.pdf")" = receipt ]
+  run vhosty worktree remove s--ledger --yes </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "storage/"
+  [ ! -e "$W" ]
+}
+
+@test "remove: nothing but what can be rebuilt asks nothing" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/s"
+  mkdir -p "$W/vendor/x"
+  echo v >"$W/vendor/x/v"
+  cd /
+  run vhosty worktree remove s--ledger </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "Ignored files"
+}
+
+@test "remove: a long list of ignored files says how many more" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  printf 'up*\n' >>.gitignore
+  git add .gitignore
+  git commit -qm i
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/s"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13; do echo x >"$W/up$i"; done
+  cd /
+  run vhosty worktree remove s--ledger --yes
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "and 3 more"
+}
+
+@test "remove: no database settings: Laravel's default file counts [B3]" {
+  repo_site ledger 'APP_KEY=base64:x
+APP_NAME=Ledger'
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/x"
+  [ ! -e "$W/database/database.sqlite" ]
+  echo appdata >"$W/database/database.sqlite"
+  cd /
+  run vhosty worktree remove x--ledger </dev/null
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "database/database.sqlite"
+  [ "$(cat "$W/database/database.sqlite")" = appdata ]
+  run vhosty worktree remove x--ledger --keep-db </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = appdata ]
+  assert_contains "$output" "$VHOSTY_DIR/worktrees/x--ledger.sqlite"
+  [ ! -e "$W" ]
+}
+
+@test "remove: --keep-db saves the file .env really names, not just the one on record [A10]" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/x"
+  grep -v '^DB_DATABASE=' "$W/.env" >"$HOME/e"
+  echo "DB_DATABASE=$W/database/mine.sqlite" >>"$HOME/e"
+  cp "$HOME/e" "$W/.env"
+  echo work >"$W/database/mine.sqlite"
+  cd /
+  run vhosty worktree remove x--ledger --keep-db </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = work ]
+  # The empty file on record isn't worth a second copy
+  [ ! -e "$VHOSTY_DIR/worktrees/x--ledger.2.sqlite" ]
+  [ ! -e "$W" ]
+}
+
+@test "remove: --keep-db saves both when the one on record holds data too" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/x"
+  echo earlier >"$W/database/database.sqlite"
+  grep -v '^DB_DATABASE=' "$W/.env" >"$HOME/e"
+  echo "DB_DATABASE=database/mine.sqlite" >>"$HOME/e"
+  cp "$HOME/e" "$W/.env"
+  echo work >"$W/database/mine.sqlite"
+  cd /
+  run vhosty worktree remove x--ledger --keep-db </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.sqlite")" = work ]
+  [ "$(cat "$VHOSTY_DIR/worktrees/x--ledger.2.sqlite")" = earlier ]
+}
+
+@test "link: a created worktree's sqlite file isn't said to stay; an adopted one's is [A10b]" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/x"
+  sed -i.bak "s/^SITE_WT_DB_KIND=.*/SITE_WT_DB_KIND=''/; s/^SITE_WT_DB_NAME=.*/SITE_WT_DB_NAME=''/" "$VHOSTY_DIR/sites/x--ledger.conf"
+  echo work >"$W/database/database.sqlite"
+  run vhosty worktree link "$W" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "remove leaves it"
+  assert_contains "$output" "goes with the folder"
+  cd /
+  run vhosty worktree remove x--ledger </dev/null
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "database/database.sqlite"
+  [ "$(cat "$W/database/database.sqlite")" = work ]
+  # Adopted, it does stay
+  git -C "$PARKED/ledger" worktree add -q -b y "$HOME/wty"
+  echo mine >"$HOME/wty/database/database.sqlite"
+  cd "$HOME/wty"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "so remove leaves it"
+}
+
+# ---------------------------------------------------------------- small ones
+
+@test "add: a tracked symlink where the temp file used to go can't be written through [A9]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  cp .env "$HOME/parent.before"
+  ln -s "$PARKED/ledger/.env" .env.vhosty-tmp
+  git add -f .env.vhosty-tmp
+  git commit -qm link
+  rm .env.vhosty-tmp
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cmp "$HOME/parent.before" "$PARKED/ledger/.env"
+  assert_contains "$(cat "$VHOSTY_DIR/worktrees/ledger/x/.env")" "DB_DATABASE=wt_x__ledger"
+}
+
+@test "remove: a detached HEAD with commits only it has: warned, asked, and --yes still prints it [A16]" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/s"
+  git -C "$W" checkout -q --detach
+  echo w >"$W/work.txt"
+  git -C "$W" add work.txt
+  git -C "$W" commit -qm precious
+  cd /
+  run vhosty worktree remove s--ledger </dev/null
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "no branch or tag contains"
+  [ -d "$W" ]
+  run vhosty worktree remove s--ledger --yes </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "no branch or tag contains"
+}
+
+@test "remove: a detached HEAD on a commit a branch has says nothing" {
+  repo_site ledger "$SQLITE_ENV"
+  cd "$PARKED/ledger"
+  run vhosty worktree add s --no-install --share-db
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  W="$VHOSTY_DIR/worktrees/ledger/s"
+  git -C "$W" checkout -q --detach
+  cd /
+  run vhosty worktree remove s--ledger </dev/null
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  refute_contains "$output" "no branch or tag contains"
+}
+
+@test "an unreadable parent .env is a proper message, at add and link [B11]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cd "$PARKED/ledger"
+  chmod 000 .env
+  run vhosty worktree add x --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Can't read $PARKED/ledger/.env"
+  refute_contains "$output" "awk"
+  [ "$(git worktree list | wc -l | tr -d ' ')" = 1 ]
+  git -C "$PARKED/ledger" worktree add -q -b y "$HOME/wty"
+  run vhosty worktree link "$HOME/wty" --no-install
+  chmod 644 .env
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Can't read"
+  refute_contains "$output" "awk"
+}
+
+@test "guard: a linked site outside the parked folders counts too" {
+  with_mysql_worktree
+  mkdir -p "$HOME/elsewhere"
+  printf 'DB_DATABASE=wt_feature_x__ledger\n' >"$HOME/elsewhere/.env"
+  site_conf other "SITE_PATH=$HOME/elsewhere
+SITE_LINKED=yes"
+  not_dropped "$HOME/elsewhere/.env still names it"
+}
+
+@test "link again with no record, and a .env linked back to the parent's: replaced, and the parent's stays [B7]" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  cp "$PARKED/ledger/.env" "$HOME/parent.before"
+  git -C "$PARKED/ledger" worktree add -q -b a "$HOME/a"
+  cd "$HOME/a"
+  run vhosty worktree link --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  sed -i.bak "s/^SITE_WT_DB_KIND=.*/SITE_WT_DB_KIND=''/; s/^SITE_WT_DB_NAME=.*/SITE_WT_DB_NAME=''/" "$VHOSTY_DIR/sites/a--ledger.conf"
+  rm -f "$HOME/db/mysql/wt_a__ledger" .env
+  ln -s "$PARKED/ledger/.env" .env
+  run vhosty worktree link "$HOME/a" --no-install
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ ! -L .env ]
+  assert_contains "$(cat .env)" "DB_DATABASE=wt_a__ledger"
+  cmp "$HOME/parent.before" "$PARKED/ledger/.env"
+}
+
+@test "add: a branch's own .env isn't called the parent's database" {
+  services_on
+  repo_site ledger "$MYSQL_ENV"
+  mysql_db ledger
+  branch_with_env remote-cfg 'DB_CONNECTION=mysql
+DB_HOST=prod.example.com
+DB_DATABASE=ledger_prod'
+  run vhosty worktree add remote-cfg --no-install
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "own .env uses a database vhosty doesn't manage"
+  refute_contains "$output" "share ledger's database"
+}
+
+@test "remove: git failing with nothing changed doesn't blame uncommitted files" {
+  sqlite_precious
+  real="$(command -v git)"
+  stub git "case \"\$*\" in *'worktree remove'*) echo 'error: failed to delete: Permission denied' >&2; exit 1 ;; esac; exec \"$real\" \"\$@\""
+  run vhosty worktree remove x--ledger --yes
+  [ "$status" -ne 0 ]
+  refute_contains "$output" "uncommitted"
+  assert_contains "$output" "Permission denied"
+  assert_contains "$output" "Nothing was removed"
+  [ "$(cat "$W/database/database.sqlite")" = precious ]
 }

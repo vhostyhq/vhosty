@@ -12,6 +12,7 @@ domain, reachable from your phone, laptop, or any device on your
 ~/Sites/myspace    →  https://myspace.yourdomain.dev
 ~/Sites/geocities  →  https://geocities.yourdomain.dev
 localhost:5173     →  https://5173.yourdomain.dev
+localhost:3001     →  https://grafana.yourdomain.dev
 ```
 
 - Real HTTPS: a trusted Let's Encrypt wildcard certificate, with no browser warnings and no local CA to install.
@@ -28,6 +29,7 @@ Runs on **Linux** (systemd) and **macOS** (launchd).
 your phone ──tailnet──▶ dev box (100.x.y.z)
                          └─ Tailscale Serve :443 ─▶ Caddy 127.0.0.1:48443   *.yourdomain.dev, wildcard cert
                               ├─ <port>.yourdomain.dev  → localhost:<port>
+                              ├─ <name>.yourdomain.dev  → localhost:<port> (vhosty proxy)
                               ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
                               ├─ <site>.yourdomain.dev  → Laravel Octane on a local port (vhosty octane on)
                               └─ <site>.yourdomain.dev  → static (site/index.html)
@@ -299,24 +301,53 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 |---|---|
 | `vhosty park [dir]` / `unpark [dir]` | Serve, or stop serving, every folder inside `dir`. Park as many as you like |
 | `vhosty link [dir] [--name N]` / `unlink [name]` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
+| `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
 | `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
 | `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
 | `vhosty worktree [add\|link\|remove\|list]` | A git worktree as a site of its own, with its own URL, `.env` and database. See [Git worktrees](#git-worktrees) |
-| `vhosty open [site\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
+| `vhosty open [site\|proxy\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
 | `vhosty php [list\|install\|default\|which]` | PHP versions |
 | `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
 | `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
 | `vhosty ext [require\|install\|check]` | PHP extensions each site needs |
 | `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
+| `vhosty mail [status\|add]` | Catch outgoing mail with Mailpit: its address and the lines for an app's `.env` |
 | `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
 | `vhosty status` | Service state, process IDs, and sockets |
 | `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
+| `vhosty logs <site> [N]` / `vhosty tail <site>` | A Laravel app's own log, from its `storage/logs`. See [Site logs](#site-logs) |
 | `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
 | `vhosty prune` | Remove configs for sites whose folder is gone or no longer parked, and generated files nothing uses |
 | `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
 | `vhosty update [self\|caddy\|php [version]]` | Update vhosty to the latest release, re-download Caddy, and upgrade PHP (apt on Linux, Homebrew on macOS). See [Updating](#updating) |
 | `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
 | `vhosty rebuild` | Regenerate the config and reload the services |
+
+### Site logs
+
+`vhosty logs` and `vhosty tail` take a site as well as a service, and read the
+app's own log:
+
+```bash
+vhosty logs myapp        # the last 100 lines
+vhosty logs myapp 500
+vhosty tail myapp        # follow it
+vhosty logs myapp | grep ERROR
+```
+
+- **The log is the newest `*.log` in the site's `storage/logs`**, so this works with
+  Laravel's daily driver (`laravel-2026-11-05.log`) and its single driver (`laravel.log`).
+  If another log there was written last (`worker.log`, say), that's the one you get.
+  vhosty prints the file's path on stderr, so a pipe only gets the log.
+- **`vhosty tail` follows a daily log across midnight.** It checks every couple of
+  seconds for the next day's file in the same series, and carries on from that file's
+  first line. It stays on the file it started with otherwise, even if a later-dated file sits unwritten, so a busy `worker.log`
+  won't take over from `laravel.log`.
+- **A service wins when a site has the same name**: `caddy`, `php`, `all`, an installed
+  PHP version, and so on, and `rotate` for `vhosty logs`. To read such a site's log, use
+  plain `tail` on its `storage/logs` (`vhosty site <name>` shows the folder).
+- **With [Herd](#with-laravel-herd-macos)**, this doesn't look up Herd's sites, so
+  `vhosty logs` and `vhosty tail` only cover services. Use plain `tail` for an app's log.
 
 ### What gets served
 
@@ -340,9 +371,39 @@ localhost, like an admin console or a search engine, stay private to it. To open
 another, add it in `~/.vhosty/config` (`VHOSTY_PORTS="3000-5999 6006 8000-8099 8888 9001"`)
 and run `vhosty rebuild`.
 
+For an address that stays the same, give a port a name. It's for what isn't a PHP
+site: a Node app, Grafana, anything that speaks plain HTTP on this machine.
+
+```bash
+vhosty proxy grafana 3001       # https://grafana.yourdomain.dev → localhost:3001
+vhosty proxies                  # vhosty sites lists them too
+vhosty unproxy grafana
+```
+
+- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to every device
+  on your tailnet, with no login from vhosty. Think twice about admin consoles.
+- Websockets and server-sent events work. A `vhosty rebuild` drops open websockets,
+  so they have to reconnect. The app sees its real `Host`, plus
+  `X-Forwarded-Host`, `-Proto` and `-For`, so one that checks the host (Vite's
+  `server.allowedHosts`) or builds links from it may need telling.
+- Caddy sets those `X-Forwarded-*` headers itself, and removes `Forwarded`, `X-Real-IP`,
+  `Tailscale-*` and `X-Webauth-*` from requests. Other headers pass through, so don't
+  point an app's login at a header a client could send.
+- A name that's already a site (parked with PHP or a plain `index.html`, linked or on
+  Octane) is refused, as is one that's only numbers. A folder with a `package.json`
+  doesn't count as a site, so a Node or Vite app in `~/Sites/shop` can run its server as
+  `vhosty proxy shop 3000`. If a parked folder later becomes a site under the same name,
+  the proxy keeps the name and `vhosty sites` and `doctor` say so. `octane on`, `isolate`
+  and `ini --site` refuse a proxy's name.
+- Nothing listening is normal for a dev server: `doctor` warns rather than fails, and
+  the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
+  stop the app.
+- Run it again with another port to move it. With [Herd](#with-laravel-herd-macos),
+  use the port route instead.
+
 When something isn't there, vhosty says what and why instead of showing a blank
 page: a name with no site lists the paths it checked and links to your sites; a
-port with nothing listening, or a PHP version that's down, shows what to run and
+port or proxy with nothing listening, or a PHP version that's down, shows what to run and
 reloads every 2 seconds until it comes up. Errors from your app itself (Laravel's
 500s, missing assets) pass through untouched.
 
@@ -553,11 +614,11 @@ project's `composer.json` (`"ext-name": "*"`) instead, so it travels with the co
 
 ### Docker services
 
-Databases, caches, search and S3 run in Docker, managed with `docker compose`.
+Databases, caches, search, S3 and a mail catcher run in Docker, managed with `docker compose`.
 Start with the standard set, or point vhosty at a `compose.yaml` you already have:
 
 ```bash
-vhosty services init         # MySQL 8.4, Postgres 18 + pgvector, Valkey, Meilisearch, Typesense, RustFS
+vhosty services init         # MySQL 8.4, Postgres 18 + pgvector, Valkey, Meilisearch, Typesense, RustFS, Mailpit
 vhosty services init --only mysql,valkey
 vhosty services dir ~/Sites/services   # or use your own compose.yaml
 ```
@@ -578,6 +639,44 @@ Docker bypasses the firewall for published ports, so publish them on localhost
 (`"127.0.0.1:3306:3306"`). `vhosty services` and `vhosty doctor` flag any port
 that isn't.
 
+#### Catching mail
+
+[Mailpit](https://mailpit.axllent.org) catches what your apps send, so you can
+test password resets from any device on your tailnet without a message going out.
+It's part of `services init`. If your `compose.yaml` is older than that:
+
+```bash
+vhosty mail add    # adds it to your compose.yaml, changing nothing else in the file
+vhosty mail        # is it running, its address, and the lines for an app's .env
+```
+
+`mail add` leaves your comments, edits and other services as they are, keeps a copy
+of the file as `compose.yaml.before-mailpit-<date>`, and does nothing the second
+time. When it can't safely edit the file (Windows line endings, say, or
+`services:` written inline), it says why and prints the block to paste.
+
+vhosty never edits an app's `.env`. `vhosty mail` prints what to add:
+
+```dotenv
+MAIL_MAILER=smtp
+MAIL_SCHEME=null
+MAIL_HOST=127.0.0.1
+MAIL_PORT=1025
+MAIL_USERNAME=null
+MAIL_PASSWORD=null
+MAIL_ENCRYPTION=null
+```
+
+SMTP is on 127.0.0.1:1025, and the web page is at `https://8025.yourdomain.dev`, which
+`VHOSTY_PORTS` includes by default. If yours leaves out 8025, `vhosty mail` says so and
+shows the setting to change. Mailpit keeps the newest 500 messages. It keeps them
+across restarts, but `services backup` skips them: it's test mail. `vhosty doctor`
+lists which sites send to it.
+
+**Anyone who can reach your sites can read caught mail**, with its reset links and
+any real addresses your test data holds, the same as the sites themselves. See
+[Security](#security).
+
 #### Backups
 
 ```bash
@@ -593,6 +692,7 @@ A backup is one folder holding:
   which loads into newer versions too,
 - a `.tar.gz` of every volume of the other services (Valkey, search indexes, S3
   files). Each of those services stops for the few seconds its archive takes.
+  Mailpit is left out, and keeps running: caught mail isn't backed up.
 
 Test databases (`test`, `*_test`, `*_testing`, `*_test_<n>`) are skipped, as test
 suites recreate them, and so are the databases current [worktree](#git-worktrees) sites
@@ -620,6 +720,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
 ├── worktrees/<site>/      git worktrees from `vhosty worktree add`
+├── proxies/<name>.conf    one per named proxy (vhosty proxy): its port
 ├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
 ├── error.html             generated: the page for "no site", and PHP or a dev server down
@@ -672,7 +773,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 | Works on one network but not another | Some routers and DNS filters (Pi-hole, NextDNS) block public names that resolve to private IPs. Allowlist your domain there. |
 | "No site called …" (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
 | 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
-| 502 on a port site | Nothing is listening on that port, or it only listens on another interface. |
+| 502 on a port site or a proxy | Nothing is listening on that port, or it only listens on another interface. |
 | A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |
 | Sites stopped working after pairing an app over Tailscale (T3 Code, say) | It published itself on Tailscale Serve's port 443, vhosty's. `vhosty doctor` says what it is and how to move it to another port (`tailscale serve --bg --https=8443 …`); then `vhosty rebuild`. |
 | Site can't be reached from other devices | Tailscale Serve isn't forwarding to Caddy. `vhosty doctor` checks it; `vhosty rebuild` sets it up again. |
@@ -680,6 +781,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 ## Security
 
 - Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that (below).
+- [Mailpit](#catching-mail)'s page has no login: anyone who can reach your sites can read the mail it caught.
 - Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. That's fine when only you can reach the machine; if others can, limit access (below) or turn debug off.
 
 To let only yourself reach the box's sites, tag the machine and grant HTTPS to it

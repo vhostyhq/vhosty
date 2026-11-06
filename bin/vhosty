@@ -416,6 +416,7 @@ herd_refuse() {
     ini|ext|exts|extension|extensions) alt="Herd's PHP settings" ;;
     octane) alt="php artisan octane:start, reached at https://<port>.<domain>" ;;
     worktree) alt="git worktree add, then herd link" ;;
+    proxy|unproxy|proxies) alt="the port route, https://<port>.<domain>" ;;
     *) return 0 ;;
   esac
   die "Herd serves the sites on this machine (VHOSTY_BACKEND=herd), so this is Herd's job. Use: $alt"
@@ -723,8 +724,10 @@ port_owner() {
       if (match($0, /users:\(\("[^"]+"/)) { s = substr($0, RSTART + 9, RLENGTH - 10); print s } else print "?"
     }' | sort -u | tr '\n' ' ' | sed 's/ $//' \
       | { IFS= read -r o || true
-          # Older vhosty's setcap'd Caddy hides its sockets from ss; "?" is ours if it's running
-          if [ "$o" = "?" ] && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && svc_running caddy; then o="caddy"; fi
+          # Older vhosty's setcap'd Caddy hides its sockets from ss; "?" on its ports is
+          # ours if it's running. Elsewhere it's any process of another user, like Docker's
+          if [ "$o" = "?" ] && { [ "$1" = 443 ] || [ "$1" = 80 ] || proxy_port_is_caddy "$1"; } \
+            && [ -f "$UNIT_DIR/vhosty-caddy.service" ] && svc_running caddy; then o="caddy"; fi
           printf '%s' "$o"; } || true
   fi
 }
@@ -1194,6 +1197,8 @@ site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT SITE_OCTAN
 # Writes the loaded SITE_* values, or removes the file when nothing differs
 # from the defaults any more
 site_save() {
+  # A proxy wins the name's route, so settings under that name would do nothing
+  if [ -f "$(proxy_file "$1")" ]; then die "'$1' is a proxy, so it can't have site settings. Remove it first (vhosty unproxy $1), or use another name"; fi
   local f
   f="$(site_file "$1")"
   if [ "$SITE_LINKED" != "yes" ] && [ -z "$SITE_PHP" ] && [ -z "$SITE_INI" ] && [ -z "$SITE_EXT" ] && [ -z "$SITE_OCTANE" ]; then
@@ -1349,7 +1354,7 @@ octane_watches() {
 octane_free_port() {
   local p="$OCTANE_FIRST_PORT" used
   # With the settings `vhosty link` set aside: unlink brings their port back
-  used=" $(cat "$SITES_DIR"/*.conf "$SITES_DIR"/*.conf.parked 2>/dev/null | sed -n 's/^SITE_OCTANE=//p' | tr '\n' ' ' || true) "
+  used=" $(cat "$SITES_DIR"/*.conf "$SITES_DIR"/*.conf.parked "$PROXIES_DIR"/*.conf 2>/dev/null | sed -n -e 's/^SITE_OCTANE=//p' -e 's/^PROXY_PORT=//p' | tr '\n' ' ' || true) "
   while :; do
     case "$used" in
       *" $p "*) ;;
@@ -1649,6 +1654,9 @@ write_caddyfile() {
       dir="$(site_dir "$name" || true)"
       [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
     done
+    for name in $(proxy_names); do
+      [ -z "$(proxy_port "$name")" ] || sites="$sites $name"
+    done
   fi
   {
     cat <<EOF
@@ -1736,6 +1744,7 @@ EOF
     if herd_mode; then
       herd_routes "$depth"
     else
+      caddy_proxies
       caddy_sites "$cased"
       caddy_parked "$v" "$depth"
     fi
@@ -1937,6 +1946,12 @@ summary { cursor: pointer; }
 <pre>vhosty status
 vhosty restart octane-{{html $label}}
 vhosty logs octane-{{html $label}}</pre>
+{{- else if and (eq $kind "proxy") (ne $status "504")}}
+{{- $port := placeholder "http.vars.vhosty_proxy_port"}}
+<h1>Nothing is answering on port {{html $port}}</h1>
+<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $port}}</code>, but nothing answered there.</p>
+<p>Start what runs on port {{html $port}}. It has to listen on <code>localhost</code> and speak plain HTTP. If it moved to another port:</p>
+<pre>vhosty proxy {{html $label}} &lt;port&gt;</pre>
 {{- else if and (eq $kind "php") (ne $status "504")}}
 <h1>PHP {{html $php}} isn't answering</h1>
 <p class="muted">Caddy couldn't reach PHP-FPM for <strong>{{html .Host}}</strong>.</p>
@@ -2782,6 +2797,7 @@ cmd_link() {
   name="$(lower "$name")"
   valid_name "$name" || die "'$name' isn't a valid site name (letters, numbers, dashes). Pick one with --name"
   printf '%s' "$name" | grep -qE '^[0-9]+$' && die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick one with --name"
+  if [ -f "$(proxy_file "$name")" ]; then die "'$name' is a proxy. Remove it first (vhosty unproxy $name), or pick another name with --name"; fi
   site_load "$name"
   if [ "$SITE_LINKED" = "yes" ] && [ "$SITE_PATH" != "$dir" ]; then
     die "'$name' is already linked to $SITE_PATH. Unlink it first, or pick another name with --name"
@@ -2856,6 +2872,7 @@ cmd_site() {
   need_config
   local name dir kind v source settings sock missing blocker kv worktrees
   name="$(resolve_site "${1:-}")"
+  if [ -f "$(proxy_file "$name")" ]; then proxy_show "$name"; return 0; fi
   site_load "$name"
   dir="$(site_dir "$name" || true)"
   [ -n "$dir" ] || die "No site '$name'. Run: vhosty sites"
@@ -2976,6 +2993,7 @@ cmd_status() {
     if [ -n "$(port_owner "$SITE_OCTANE")" ]; then ok "Octane $s → 127.0.0.1:$SITE_OCTANE"
     else bad "nothing listening on $SITE_OCTANE for $s (see: vhosty logs octane-$s)"; fi
   done
+  proxy_checks
   echo
 }
 
@@ -3023,6 +3041,7 @@ cmd_octane_on() {
     *[!0-9]*|0*) die "--workers needs a number, 1 or more" ;;
   esac
   name="$(resolve_site "$arg")"
+  if [ -f "$(proxy_file "$name")" ]; then die "'$name' is a proxy. Remove it first (vhosty unproxy $name), or link the app under another name"; fi
   dir="$(site_dir "$name")" || die "No folder for '$name' in your parked folders. Run: vhosty sites"
   [ -d "$dir" ] || die "No folder for '$name' in your parked folders. Run: vhosty sites"
   [ -f "$dir/vendor/laravel/octane/composer.json" ] || die "$name doesn't have Laravel Octane. In its folder, run: composer require laravel/octane && php artisan octane:install"
@@ -3748,7 +3767,7 @@ EOF
 # ---------------------------------------------------------------------------
 # Commands: services init, backup, restore
 # ---------------------------------------------------------------------------
-SERVICES_CATALOG="mysql postgres valkey meilisearch typesense rustfs"
+SERVICES_CATALOG="mysql postgres valkey meilisearch typesense rustfs mailpit"
 HELPER_IMAGE="alpine:3"   # archives volumes; anything with sh, tar and gzip works
 BACKUP_SKIP_DBS='^test$|_test(ing)?(_[0-9]+)?$'   # test databases: the test suites recreate them
 
@@ -3874,6 +3893,23 @@ EOF
 
 EOF
     ;;
+    mailpit) cat <<EOF
+  mailpit:
+    image: axllent/mailpit:v1.33 # catches outgoing mail: vhosty mail
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db # in the volume, so caught mail survives a restart
+      MP_MAX_MESSAGES: 500 # then the oldest go first
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+    ports:
+      - "127.0.0.1:1025:1025" # SMTP
+      - "127.0.0.1:8025:8025" # web page, at https://8025.<your domain>
+    volumes: [mailpit:/data]
+
+EOF
+    ;;
   esac
 }
 
@@ -3898,7 +3934,9 @@ cmd_services_init() { # [dir] [--only svc,..] [--force]
   mkdir -p "$dir"
   dir="$(cd "$dir" && pwd)"
   if [ -f "$dir/compose.yaml" ] && [ -z "$force" ]; then
-    die "$dir/compose.yaml already exists. Add --force to replace it (the data in Docker volumes stays)"
+    local hint=""
+    case " $only " in *" mailpit "*) hint=" To add Mailpit and change nothing else in it: vhosty mail add" ;; esac
+    die "$dir/compose.yaml already exists. Add --force to replace it (the data in Docker volumes stays).$hint"
   fi
   mem="$(services_mem_mb)"
   name="$(basename "$dir" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')"
@@ -3939,6 +3977,7 @@ EOF
   save_config
   ok "wrote $dir/compose.yaml: $(echo $only | tr ' ' ','), sized for $mem MB"
   ok "keys in $env_file"
+  case " $only " in *" mailpit "*) info "Mailpit catches mail from your apps. For its address and .env lines: vhosty mail" ;; esac
   for p in $(dc config --format json 2>/dev/null | jq -r '.services[].ports[]?.published // empty'); do
     [ -z "$(port_owner "$p")" ] || busy="$busy $p"
   done
@@ -3972,7 +4011,7 @@ pg_in() { # pg_in SERVICE 'snippet' [args, as $1..]
     '"$snip" sh "$@"
 }
 
-service_kind() { # image → mysql | postgres | volume
+service_kind() { # image → mysql | postgres | mail | volume
   # By the image's own name, without registry, owner or tag: mysql:8.4 and
   # pgvector/pgvector:pg18 are databases, prom/mysqld-exporter isn't
   local base="${1##*/}"
@@ -3980,6 +4019,7 @@ service_kind() { # image → mysql | postgres | volume
   case "$base" in
     mysql|mysql-server|mariadb|percona|percona-server) echo mysql ;;
     postgres|postgresql|pgvector|postgis|timescaledb|timescaledb-ha) echo postgres ;;
+    mailpit) echo mail ;;
     *) echo volume ;;
   esac
 }
@@ -4135,6 +4175,8 @@ cmd_services_backup() { # [--to DIR]
   [ -n "$images" ] || die "No services in $VHOSTY_SERVICES_DIR/compose.yaml"
   for line in $images; do
     svc="${line%%|*}"; image="${line#*|}"; kind="$(service_kind "$image")"
+    # Test mail, capped and throwaway: not worth stopping it, and dropping what's being sent
+    if [ "$kind" = "mail" ]; then info "$svc: caught mail isn't backed up"; continue; fi
     cid="$(service_container "$svc")"
     if [ -z "$cid" ]; then warn "$svc: no container yet, skipped (vhosty services up $svc)"; skipped="$skipped $svc"; continue; fi
     mkdir -p "$partial/$svc"
@@ -4292,6 +4334,294 @@ cmd_services_restore() { # <backup> [--into DIR] [--replace-config] [--yes]
 }
 
 # ---------------------------------------------------------------------------
+# Commands: mail (Mailpit, one of the Docker services)
+# ---------------------------------------------------------------------------
+cmd_mail() {
+  need_config
+  local sub="${1:-status}"
+  [ $# -eq 0 ] || shift
+  case "$sub" in
+    status|st) mail_status ;;
+    add)       mail_add "$@" ;;
+    -h|--help|help) echo "Usage: vhosty mail [status | add]" ;;
+    *) die "Usage: vhosty mail [status | add]" ;;
+  esac
+}
+
+# Does <port>.domain reach this port? The same reading of VHOSTY_PORTS as port_expr
+mail_port_open() { # mail_port_open PORT
+  local r
+  for r in $VHOSTY_PORTS; do
+    case "$r" in
+      *-*) if [ "$1" -ge "${r%-*}" ] 2>/dev/null && [ "$1" -le "${r#*-}" ] 2>/dev/null; then return 0; fi ;;
+      *)   if [ "$1" = "$r" ]; then return 0; fi ;;
+    esac
+  done
+  return 1
+}
+
+# The file docker compose reads in a folder, in its own order of preference
+mail_compose_file() { # mail_compose_file DIR
+  local f
+  for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+    if [ -f "$1/$f" ]; then echo "$1/$f"; return 0; fi
+  done
+  return 1
+}
+
+# Mailpit in the compose project, by service name or image, as
+# service|SMTP port|web port. Its ports can be changed in compose.yaml, so the
+# ones it really publishes. Fails when compose can't read the project. Profiles
+# count: `up mailpit` starts a service behind one, by naming it.
+mail_service() {
+  dc --profile '*' config --format json 2>/dev/null | jq -r '.services | to_entries[]
+    | select(.key == "mailpit" or ((.value.image // "") | test("(^|/)mailpit([:@]|$)")))
+    | [.key,
+       ((.value.ports // []) | map(select(.target == 1025))[0].published // ""),
+       ((.value.ports // []) | map(select(.target == 8025))[0].published // "")] | join("|")'
+}
+
+mail_status() {
+  local dir="$VHOSTY_SERVICES_DIR" file="" row="" svc="" smtp=1025 web=8025 rows s1 s2 s3 s4 st="" health="" later=" (once it's running)"
+  printf "%sMail%s  Mailpit catches what your apps send; none of it leaves this machine\n" "$B" "$N"
+  [ -z "$dir" ] || file="$(mail_compose_file "$dir" || true)"
+  if [ -z "$file" ]; then
+    warn "Mailpit isn't set up. Add it: vhosty mail add"
+  elif ! ( need_services ) 2>/dev/null; then
+    warn "Can't tell if Mailpit is running: $( ( need_services ) 2>&1 | sed 's/^error: //')"
+    # Compose reads the file without the Docker daemon, so the ports can still be right
+    row="$(mail_service 2>/dev/null || true)"
+    if [ -n "$row" ]; then
+      IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+    fi
+  elif ! row="$(mail_service)"; then
+    warn "docker compose can't read $file. Check it: vhosty services edit"
+  elif [ -z "$row" ]; then
+    warn "Mailpit isn't in $file. Add it: vhosty mail add"
+  else
+    IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+    rows="$(services_rows || true)"
+    while IFS="|" read -r s1 s2 s3 s4; do
+      if [ "$s1" = "$svc" ]; then st="$s2"; health="$s3"; fi
+    done <<EOF
+$rows
+EOF
+    if [ "$st" = "running" ] && [ "$health" != "unhealthy" ]; then ok "Mailpit running${health:+ ($health)}"; later=""
+    else warn "Mailpit ${st:-not created}${health:+ ($health)}. Start it: vhosty services up $svc"; fi
+    [ -n "$smtp" ] || warn "$svc doesn't publish SMTP (port 1025 in the container), so apps can't reach it. Add it to ports in $file"
+  fi
+  if [ -z "$web" ]; then
+    warn "$svc doesn't publish its web page (port 8025 in the container). Add it to ports in $file"
+  elif mail_port_open "$web"; then
+    printf "  Caught mail: https://%s.%s%s\n" "$web" "$VHOSTY_DOMAIN" "$later"
+  else
+    warn "VHOSTY_PORTS leaves out $web, so the mail page can't be reached from your tailnet"
+    info "To open it, set this in ~/.vhosty/config, then run: vhosty rebuild"
+    info "  VHOSTY_PORTS=\"${VHOSTY_PORTS:+$VHOSTY_PORTS }$web\""
+    info "On this machine it's at http://127.0.0.1:$web"
+  fi
+  printf "\nFor an app, add these to its .env (vhosty never edits it):\n\n"
+  printf 'MAIL_MAILER=smtp\nMAIL_SCHEME=null\nMAIL_HOST=127.0.0.1\nMAIL_PORT=%s\nMAIL_USERNAME=null\nMAIL_PASSWORD=null\nMAIL_ENCRYPTION=null\n\n' "${smtp:-1025}"
+  info "Remove MAIL_URL if the app has it: it overrides these."
+  info "Then: php artisan config:clear if its config is cached, and restart its queue workers and Octane."
+}
+
+# Reads a compose file without a YAML parser: top-level keys start in the first
+# column, so the two sections are found line by line. Sets MS_WHY to the reason
+# not to edit it, and for each section its key's line, its last line, its
+# children's indent and whether Mailpit is in it (MS_IMAGE: under another name).
+mail_scan() { # mail_scan FILE
+  local scan
+  scan="$(awk -v q="'" '
+  function plain(s) { gsub(/"/, "", s); gsub(q, "", s); return s }
+  function block(s, key) { return s ~ ("^" key ":[ \t]*$") || s ~ ("^" key ":[ \t]+#") }
+  /\r$/ { why = "it has Windows line endings" }
+  /^(---|\.\.\.)([ \t]|$)/ { if (keys) why = "it holds more than one YAML document"; next }
+  /^[ \t\r]*$/ || /^#/ { next }
+  /^\t/ { why = "it is indented with tabs"; next }
+  /^[^ ]/ {
+    keys = 1; sec = ""
+    if ($0 ~ /^services:/) {
+      if (sl) why = "it has two services: keys"
+      if (!block($0, "services")) why = "its services: is not a plain block"
+      sl = NR; se = NR; sec = "s"
+    } else if ($0 ~ /^volumes:/) {
+      if (vl) why = "it has two volumes: keys"
+      if (!block($0, "volumes")) why = "its volumes: is not a plain block"
+      vl = NR; ve = NR; sec = "v"
+    }
+    next
+  }
+  /^ *#/ { if (sec == "s") se = NR; if (sec == "v") ve = NR; next }
+  sec == "s" {
+    se = NR; match($0, /^ */); n = RLENGTH; l = plain($0)
+    if (!si) { si = n; if (l ~ /^ *[{*&[]/) why = "its services: is not a plain block" }
+    if (n == si) ci = 0; else if (!ci) ci = n
+    if (n == si && l ~ /^ *mailpit[ \t]*:/) has = 1
+    # A key of the service itself, not one further in, like an environment variable
+    if (n == ci && l ~ /^ +image:[ \t]*([^ \t#]*\/)?mailpit([:@ \t#]|$)/) img = 1
+  }
+  sec == "v" {
+    ve = NR; match($0, /^ */); n = RLENGTH
+    if (!vi) { vi = n; if ($0 ~ /^ *[{*&[]/) why = "its volumes: is not a plain block" }
+    if (n == vi && plain($0) ~ /^ *mailpit[ \t]*:/) vhas = 1
+  }
+  END {
+    if (!sl && !why) why = "it has no top-level services: block"
+    printf "%s|%d|%d|%d|%d|%d|%d|%d|%d\n", why, se, si ? si : 2, has, img, vl, ve ? ve : NR, vi ? vi : 2, vhas
+  }' "$1")"
+  IFS='|' read -r MS_WHY MS_SVC_END MS_SVC_INDENT MS_HAS MS_IMAGE MS_VOL MS_VOL_END MS_VOL_INDENT MS_VOL_HAS <<EOF
+$scan
+EOF
+}
+
+# FILE with TEXT after line LINE, and everything else byte for byte
+mail_insert_after() { # mail_insert_after FILE LINE TEXT
+  local total
+  total="$(awk 'END { print NR }' "$1")"
+  head -n "$2" "$1"
+  # At the end of a file with no final newline
+  if [ "$2" -ge "$total" ] && [ -n "$(tail -c1 "$1")" ]; then echo; fi
+  printf '%s\n' "$3"
+  tail -n +"$(($2 + 1))" "$1"
+}
+
+mail_paste_block() {
+  printf "\nAdd this under services:\n\n"
+  compose_block mailpit 0 | sed '/^$/d'
+  printf "\nThis under the top-level volumes:\n\n  mailpit:\n\nThen: vhosty services up mailpit\n"
+}
+
+mail_refuse() { # mail_refuse FILE REASON
+  warn "Can't safely edit $1: $2. It wasn't changed."
+  mail_paste_block
+  exit 1
+}
+
+# One config, without Mailpit, for comparing a file with and without it. Compose
+# makes the default network for a service on no other, like Mailpit in a file whose
+# services all name theirs, so that isn't a change to anything else.
+mail_config_rest() { # mail_config_rest DIR FILE
+  docker compose --project-directory "$1" -f "$2" config --format json 2>/dev/null \
+    | jq -S 'del(.services.mailpit, .volumes.mailpit, .networks.default)
+      | if .volumes == {} then del(.volumes) else . end
+      | if .networks == {} then del(.networks) else . end'
+}
+
+mail_add() {
+  [ $# -eq 0 ] || die "Usage: vhosty mail add"
+  local dir file new step bak text vol taken="" row="" p busy="" check=""
+  dir="${VHOSTY_SERVICES_DIR:-$VHOSTY_DIR/services}"
+  if ! file="$(mail_compose_file "$dir")"; then
+    cmd_services_init "$dir" --only mailpit
+    return
+  fi
+  # A compose file in the default folder, not set as the services folder yet
+  if [ -z "$VHOSTY_SERVICES_DIR" ]; then VHOSTY_SERVICES_DIR="$dir"; save_config; fi
+  if command -v docker >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then check=1; fi
+
+  [ -r "$file" ] || mail_refuse "$file" "it isn't readable"
+  mail_scan "$file"
+  # Compose's own view counts first: it sees override and included files too
+  if [ -n "$check" ]; then row="$(mail_service || true)"; fi
+  if [ -n "$row" ] || [ "$MS_HAS" = 1 ] || [ "$MS_IMAGE" = 1 ]; then
+    ok "Mailpit is already set up in $dir, so nothing changed"
+    echo
+    mail_status
+    return 0
+  fi
+  [ -z "$MS_WHY" ] || mail_refuse "$file" "$MS_WHY"
+  [ -w "$file" ] || mail_refuse "$file" "it isn't writable"
+  if [ -n "$check" ]; then
+    mail_config_rest "$dir" "$file" >/dev/null \
+      || mail_refuse "$file" "docker compose can't read it as it is (check it with: vhosty services edit)"
+    taken="$(dc config --format json 2>/dev/null | jq -r '.services | to_entries[]
+      | select([.value.ports[]?.published | tostring] | any(. == "1025" or . == "8025")) | .key' | tr '\n' ' ' || true)"
+    [ -z "$taken" ] || mail_refuse "$file" "${taken% } already publishes port 1025 or 8025, so change one of them first"
+  fi
+
+  # The new file sits next to the old one, so relative paths in it mean the same
+  # mktemp makes it private (the file may hold secrets) and never reuses a name
+  new="$(mktemp "$file.vhosty-new.XXXXXX" 2>/dev/null)" || mail_refuse "$file" "$dir isn't writable"
+  add_tmp "$new"
+  make_tmp step
+  # Services' block at their indent, which has to match the ones already there
+  text="$(printf '\n'; compose_block mailpit 0 | sed -e '/^$/d' -e "s/^  /$(printf "%${MS_SVC_INDENT}s" '')/")"
+  vol="$(printf "%${MS_VOL_INDENT}s" '')mailpit:"
+  [ "$MS_VOL" != 0 ] || vol="$(printf '\nvolumes:\n  mailpit:')"
+  # Bottom one first, so the other's line number still holds
+  if [ "$MS_VOL_HAS" = 1 ]; then
+    mail_insert_after "$file" "$MS_SVC_END" "$text" >"$new"
+  elif [ "$MS_VOL_END" -ge "$MS_SVC_END" ]; then
+    mail_insert_after "$file" "$MS_VOL_END" "$vol" >"$step"
+    mail_insert_after "$step" "$MS_SVC_END" "$text" >"$new"
+  else
+    mail_insert_after "$file" "$MS_SVC_END" "$text" >"$step"
+    mail_insert_after "$step" "$MS_VOL_END" "$vol" >"$new"
+  fi
+
+  # Compose has to read the result as the same project, plus Mailpit
+  # Only docker is needed to parse it. Not grep -q: it'd leave compose writing to a
+  # closed pipe, which pipefail reports as a failure
+  if command -v docker >/dev/null 2>&1; then
+    docker compose --project-directory "$dir" -f "$new" config --services 2>/dev/null | grep -x mailpit >/dev/null \
+      || mail_refuse "$file" "docker compose couldn't read the file with Mailpit added"
+  fi
+  if [ -n "$check" ]; then
+    [ "$(mail_config_rest "$dir" "$file")" = "$(mail_config_rest "$dir" "$new")" ] \
+      || mail_refuse "$file" "adding Mailpit would have changed something else in it"
+  else
+    warn "docker compose isn't here to check the result (needs docker and jq). When it is, run: vhosty services edit"
+  fi
+
+  bak="$file.before-mailpit-$(date +%Y%m%d-%H%M%S)"
+  cp -p "$file" "$bak" || mail_refuse "$file" "couldn't save a copy of it first"
+  # In place, which keeps its permissions, and a symlink a symlink
+  cat "$new" >"$file" || die "Couldn't write $file. The file as it was is in $bak"
+  ok "added Mailpit to $file, and changed nothing else"
+  info "the file as it was: $bak"
+
+  for p in 1025 8025; do
+    [ -z "$(port_owner "$p")" ] || busy="$busy $p"
+  done
+  if [ -n "$busy" ]; then
+    warn "not starting it: already in use:$busy. Stop what's using those ports (or change them in $file), then: vhosty services up mailpit"
+  elif ( need_docker ) 2>/dev/null && confirm "Start Mailpit now?" Y; then
+    dc up -d mailpit || warn "Mailpit didn't start. Check: vhosty services logs mailpit"
+  else
+    info "Start it with: vhosty services up mailpit"
+  fi
+  echo
+  mail_status
+}
+
+# For doctor, as information only: the sites whose .env sends mail to Mailpit.
+# Names only, and it reads just the two keys: .env values never get printed.
+mail_doctor_info() {
+  local row="" svc="" smtp="" web="" name dir names=""
+  row="$(mail_service || true)"
+  IFS='|' read -r svc smtp web <<EOF
+$row
+EOF
+  [ -n "$smtp" ] || return 0
+  while IFS='|' read -r name dir; do
+    if [ -n "$name" ] && [ -f "$dir/.env" ] && [ -r "$dir/.env" ] && awk -F= -v port="$smtp" -v q="'" '
+      function val(s) { sub(/[ \t]#.*/, "", s); gsub(/["\r \t]/, "", s); gsub(q, "", s); return s }
+      /^MAIL_HOST=/ { h = val($2) } /^MAIL_PORT=/ { p = val($2) }
+      END { exit !((h == "127.0.0.1" || h == "localhost") && p == port) }' "$dir/.env"; then
+      names="$names $name"
+    fi
+  done <<EOF
+$(all_php_sites)
+EOF
+  [ -z "$names" ] || info "sites sending mail to Mailpit:$names"
+}
+
+# ---------------------------------------------------------------------------
 # Commands: logs
 # ---------------------------------------------------------------------------
 # Rotates every log bigger than VHOSTY_LOG_MAX_MB (or all, with --force):
@@ -4369,9 +4699,155 @@ EOF
   tail "$@" "${files[@]}"
 }
 
-cmd_logs() { tail_logs "${1:-all}" -n "${2:-100}"; }
+cmd_logs() {
+  if log_arg_is_site "${1:-all}"; then site_logs "$1" "${2:-100}"; return 0; fi
+  tail_logs "${1:-all}" -n "${2:-100}"
+}
 
-cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
+cmd_tail() {
+  if log_arg_is_site "${1:-all}"; then site_tail "$1"; return 0; fi
+  tail_logs "${1:-all}" -n 30 -f
+}
+
+# ---------------------------------------------------------------------------
+# Site logs (vhosty logs <site>, vhosty tail <site>): the app's own log, from
+# its storage/logs. Nothing here needs a service, only the files.
+# ---------------------------------------------------------------------------
+
+# log_arg_is_site ARG: does this argument of logs or tail mean a site? Whatever
+# svc_resolve accepts is a service, so a service wins. A name it turns down is
+# a site's, if a site has it. Failing that, a name it has never heard of gets a
+# list of what's valid, and any other refusal (PHP 9.9 isn't installed) is left
+# for tail_logs to say, as it always has.
+log_arg_is_site() {
+  local err
+  if err="$(svc_resolve "$1" 2>&1 >/dev/null)"; then return 1; fi
+  if site_log_known "$1"; then return 0; fi
+  case "$err" in *"Unknown service"*) site_log_unknown "$1" ;; esac
+  return 1
+}
+
+# A site in vhosty's sense: it has a config, or a folder in a parked folder.
+# valid_name also keeps a name with a slash away from site_load's path.
+site_log_known() {
+  local name
+  # Herd keeps its own list of sites, so only services here
+  if herd_mode; then return 1; fi
+  name="$(lower "$1")"
+  valid_name "$name" || return 1
+  [ -f "$(site_file "$name")" ] || parked_dir_for "$name" >/dev/null
+}
+
+site_log_unknown() {
+  local services sites
+  services="$(svc_all 2>/dev/null | tr '\n' ' ')" || true
+  sites="$(site_log_names | tr '\n' ' ')" || true
+  die "No service or site '$1'.
+  Services: ${services}(or all)
+  Sites: ${sites:-none}"
+}
+
+site_log_names() { # every site with a folder, one per line
+  local name p f
+  {
+    for name in $(site_names); do
+      site_folder "$name" >/dev/null || continue
+      echo "$name"
+    done
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      for f in "$p"/*/; do
+        [ -d "$f" ] || continue
+        f="${f%/}"; name="$(lower "${f##*/}")"
+        if valid_name "$name"; then echo "$name"; fi
+      done
+    done <<EOF
+$(parked_list)
+EOF
+  } | sort -u
+}
+
+# site_log_file SITE: the newest *.log in its storage/logs, the last in name
+# order if two are as new (bash 3.2 compares whole seconds), or why there's none
+site_log_file() {
+  local name dir f newest=""
+  name="$(lower "$1")"
+  dir="$(site_dir "$name")" || die "No folder for '$name'. Run: vhosty sites"
+  [ -d "$dir" ] || die "The folder for '$name' is gone ($dir). Remove its config: vhosty prune"
+  if [ -e "$dir/storage" ] && { [ ! -r "$dir/storage" ] || [ ! -x "$dir/storage" ]; }; then
+    die "Can't read $dir/storage: permission denied"
+  fi
+  [ -d "$dir/storage/logs" ] || die "'$name' has no storage/logs ($dir). Site logs are for Laravel apps; is it one?"
+  { [ -r "$dir/storage/logs" ] && [ -x "$dir/storage/logs" ]; } || die "Can't read $dir/storage/logs: permission denied"
+  for f in "$dir/storage/logs"/*.log; do
+    [ -f "$f" ] || continue
+    if [ -z "$newest" ] || [ ! "$newest" -nt "$f" ]; then newest="$f"; fi
+  done
+  [ -n "$newest" ] || die "No log files yet in $dir/storage/logs"
+  echo "$newest"
+}
+
+# The file goes to stderr, so a pipe gets only the log. A reader that stops
+# early (| head) ends tail with SIGPIPE, which isn't a failure.
+site_logs() { # site_logs SITE N
+  local file rc=0
+  case "$2" in ""|*[!0-9]*) die "Usage: vhosty logs <site> [N] (N is a number of lines, not '$2')" ;; esac
+  file="$(site_log_file "$1")" || exit 1
+  info "$file" >&2 || true   # with stderr closed, the log's still wanted
+  tail -n "$2" "$file" || rc=$?
+  if [ "$rc" = 141 ]; then return 0; fi
+  return "$rc"
+}
+
+# site_log_after FILE: the file after a daily log (name-YYYY-MM-DD.log) in the
+# same series, if it's there yet. A log with no date has no next file, and
+# another series (worker-...) in the folder isn't this one's next file. It has to
+# have been written since, or a stray file with a later date would take over.
+site_log_after() {
+  local file="$1" day='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' f
+  case "$file" in *-$day.log) ;; *) return 0 ;; esac
+  for f in "${file%-$day.log}"-$day.log; do
+    if [ -f "$f" ] && [[ "$f" > "$file" ]] && [ ! "$file" -nt "$f" ]; then echo "$f"; return 0; fi
+  done
+}
+
+SITE_LOG_TAIL=""   # the tail site_tail is running
+site_log_stop() {
+  [ -n "$SITE_LOG_TAIL" ] || return 0
+  { kill "$SITE_LOG_TAIL"; wait "$SITE_LOG_TAIL"; } 2>/dev/null || true
+  SITE_LOG_TAIL=""
+}
+
+# The daily driver starts a new file on the first write of each day, and no
+# tail can be told about a file that wasn't there when it started. So tail runs
+# in the background, and when the next day's file appears, a new tail reads it
+# from its first line. -F works on macOS and Linux, and keeps following a file
+# that's cleared or replaced under the same name. A background job ignores
+# Ctrl-C and Ctrl-\ in a script, so the traps have to stop it.
+site_tail() {
+  local file next rc=0
+  file="$(site_log_file "$1")" || exit 1
+  info "$file" >&2 || true
+  trap 'site_log_stop; exit 130' INT TERM HUP QUIT
+  trap 'site_log_stop; cleanup_tmp' EXIT
+  tail -n 30 -F "$file" &
+  SITE_LOG_TAIL=$!
+  while kill -0 "$SITE_LOG_TAIL" 2>/dev/null; do
+    sleep 2
+    next="$(site_log_after "$file")"
+    [ -n "$next" ] || continue
+    sleep 1   # time for tail to print the old file's last lines
+    site_log_stop
+    file="$next"
+    info "$file" >&2 || true
+    tail -n +1 -F "$file" &
+    SITE_LOG_TAIL=$!
+  done
+  wait "$SITE_LOG_TAIL" 2>/dev/null || rc=$?
+  SITE_LOG_TAIL=""
+  if [ "$rc" = 141 ]; then return 0; fi   # the reader of a pipe went away
+  return "$rc"
+}
 
 # ---------------------------------------------------------------------------
 # Commands: sites
@@ -4379,10 +4855,12 @@ cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
 cmd_sites() {
   need_config
   if herd_mode; then herd_list_sites; return 0; fi
-  local dir p name lname note linked
+  local dir p name lname note linked proxied
   linked="$(cmd_links 2>/dev/null | grep https || true)"
-  [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
+  proxied="$(proxy_rows)"
+  [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || [ -n "$proxied" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
   if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
+  if [ -n "$proxied" ]; then head_ "Proxies"; printf '%s\n' "$proxied"; fi
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
     head_ "$dir"
@@ -4399,6 +4877,8 @@ cmd_sites() {
         info "$name (not a valid hostname: letters, numbers and dashes, no dash at either end)"
       elif printf '%s' "$lname" | grep -qE '^[0-9]+$'; then
         info "$name (a number: https://$lname.$VHOSTY_DOMAIN is the port route, not this folder)"
+      elif [ -f "$(proxy_file "$lname")" ]; then
+        info "$name (not served: https://$lname.$VHOSTY_DOMAIN is a proxy)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
         site_load "$lname"
         printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")$([ -n "$SITE_OCTANE" ] && echo ", Octane")" "$note" "$N"
@@ -4434,6 +4914,228 @@ cmd_url() {
   u="$(site_url "${1:-}")"
   echo "$u"
   if copy_text "$u" 2>/dev/null; then info "(copied to clipboard)"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: named proxies (app.domain → a port on this machine), for what isn't
+# a PHP site: a Node app, Grafana, anything that speaks HTTP. A proxy has no
+# folder, so it isn't a site: each is a file in ~/.vhosty/proxies, and what walks
+# site_names (prune, the shim, the FPM pools, doctor's folder check) never sees one.
+# ---------------------------------------------------------------------------
+PROXIES_DIR="$VHOSTY_DIR/proxies"
+
+proxy_file() { echo "$PROXIES_DIR/$1.conf"; }
+
+# One DNS label (the wildcard certificate covers one level), and not a number:
+# <port>.domain is the port route. Spelled out, as [a-z] depends on the locale,
+# and valid_name's grep would pass a name with a newline in it.
+proxy_name_ok() {
+  case "$1" in
+    ''|-*|*-|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) return 1 ;;
+    *[!0123456789]*) [ ${#1} -le 63 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+proxy_port_ok() {
+  case "$1" in ''|0*|*[!0123456789]*) return 1 ;; esac
+  [ ${#1} -le 5 ] && [ "$1" -le 65535 ]
+}
+
+# Caddy's own ports: a proxy to them would only come back to Caddy
+proxy_port_is_caddy() {
+  if [ "$1" = "$VHOSTY_SERVE_PORT" ] || [ "$1" = "$VHOSTY_SERVE_HTTP_PORT" ]; then return 0; fi
+  serve_fallback && { [ "$1" = 443 ] || [ "$1" = 80 ]; }
+}
+
+proxy_names() {
+  local f
+  for f in "$PROXIES_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    f="${f##*/}"; f="${f%.conf}"
+    if proxy_name_ok "$f"; then echo "$f"; fi
+  done
+}
+
+# A proxy's port, or nothing if its file doesn't hold a valid one. Read, not
+# sourced, and checked: it goes into the Caddyfile, and the file can be edited.
+proxy_port() {
+  local p
+  p="$(sed -n 's/^PROXY_PORT=//p' "$(proxy_file "$1")" 2>/dev/null | tail -1 || true)"
+  if proxy_port_ok "$p"; then echo "$p"; fi
+}
+
+# Says how NAME is a site already; fails if it isn't. A parked folder with
+# nothing to serve isn't one: that's what a Node app in ~/Sites looks like, and
+# what it runs on a port can have the folder's name.
+proxy_site_clash() {
+  local p f base
+  if [ -f "$(site_file "$1")" ]; then
+    site_load "$1"
+    if [ "$SITE_LINKED" = "yes" ]; then echo "linked to $SITE_PATH"
+    elif [ -n "$SITE_OCTANE" ]; then echo "on Octane, port $SITE_OCTANE"
+    else echo "with settings in $(site_file "$1"); if its folder is gone, vhosty prune removes them"; fi
+    return 0
+  fi
+  # Every parked folder, not only the first with this name: Caddy tries them all
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    for f in "$p"/*/; do
+      f="${f%/}"; base="${f##*/}"
+      { [ -d "$f" ] && [ ${#base} -eq ${#1} ]; } || continue
+      { [ "$base" = "$1" ] || [ "$(lower "$base")" = "$1" ]; } || continue
+      if proxy_folder_serves "$f"; then echo "parked in $p"; return 0; fi
+    done
+  done <<EOF
+$(parked_list)
+EOF
+  return 1
+}
+
+# Does vhosty serve this folder as a site? A Node app's index.html doesn't count:
+# Vite's is the entry page for its dev server, and useless served as a plain file.
+proxy_folder_serves() {
+  if php_enabled && [ -f "$1/public/index.php" ]; then return 0; fi
+  [ -f "$1/index.html" ] && [ ! -f "$1/package.json" ]
+}
+
+# Before the sites' rules, so a folder parked later doesn't take over the name
+# without a word: doctor and vhosty sites say when one is hidden. localhost, not
+# 127.0.0.1: a dev server told to listen on localhost can end up on ::1 alone
+# (Node on macOS), and Caddy tries every address localhost has on this machine.
+# Websockets need nothing here: reverse_proxy passes the upgrade on by itself.
+# Caddy overwrites X-Forwarded-*, and the others are removed because a client could
+# send them: an app used to being private on localhost may believe who they name.
+caddy_proxies() {
+  local name port
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      printf '\n\t# Proxy: %s (skipped: no valid port in its file)\n' "$name"
+      continue
+    fi
+    cat <<EOF
+
+	# Proxy: $name → localhost:$port
+	@proxy_$name host $name.$VHOSTY_DOMAIN
+	handle @proxy_$name {
+		vars {
+			vhosty_kind proxy
+			vhosty_proxy_port $port
+		}
+		reverse_proxy localhost:$port {
+			header_up -Forwarded
+			header_up -X-Real-IP
+			header_up -Tailscale-*
+			header_up -X-Webauth-*
+		}
+	}
+EOF
+  done
+}
+
+# For vhosty status and doctor. A stopped dev server is normal, so that's a
+# warning; a file that can't be routed is a failure.
+proxy_checks() {
+  local name port owner why
+  if herd_mode; then return 0; fi
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      bad "proxy $name: no valid port in $(proxy_file "$name"), so it isn't routed. Set one: vhosty proxy $name <port>"
+      continue
+    fi
+    owner="$(proxy_owner "$port")"
+    if [ -n "$owner" ]; then ok "proxy $name → localhost:$port ($owner)"
+    else warn "proxy $name: nothing is listening on port $port. It works once something does."; fi
+    if why="$(proxy_site_clash "$name")"; then
+      warn "proxy $name hides a site of the same name ($why). Rename one, or remove the proxy: vhosty unproxy $name"
+    fi
+  done
+}
+
+# What's on a proxy's port, for people. ss can't name another user's process
+proxy_owner() {
+  local o
+  o="$(port_owner "$1")"
+  if [ "$o" = "?" ]; then o="another user's process"; fi
+  printf '%s' "$o"
+}
+
+# One line per proxy, for vhosty proxies and vhosty sites
+proxy_rows() {
+  local name port note
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      printf "  https://%s.%s  %s(no valid port: vhosty proxy %s <port>)%s\n" "$name" "$VHOSTY_DOMAIN" "$R" "$name" "$N"
+      continue
+    fi
+    note=""; [ -n "$(port_owner "$port")" ] || note="  ${Y}(nothing listening)${N}"
+    printf "  https://%s.%s  %s→ localhost:%s%s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$port" "$N" "$note"
+  done
+}
+
+# vhosty site, for a proxy
+proxy_show() {
+  local port owner
+  port="$(proxy_port "$1")"
+  printf "%s%s%s  https://%s.%s\n" "$B" "$1" "$N" "$1" "$VHOSTY_DOMAIN"
+  if [ -n "$port" ]; then
+    owner="$(proxy_owner "$port")"
+    printf "  %-10s %s\n" "Proxy" "localhost:$port" "Listening" "${owner:-${Y}nothing${N}}"
+  else
+    printf "  %-10s %s\n" "Proxy" "${R}no valid port${N} (vhosty proxy $1 <port>)"
+  fi
+  printf "  %-10s %s\n" "Config" "$(proxy_file "$1")"
+}
+
+cmd_proxy() {
+  need_config
+  [ $# -eq 2 ] || die "Usage: vhosty proxy <name> <port>"
+  local name port why
+  name="$(lower "$1")"; port="$2"
+  case "$name" in
+    ''|*[!0123456789]*) ;;
+    *) die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick a name that isn't only numbers" ;;
+  esac
+  proxy_name_ok "$name" || die "'$name' isn't a valid proxy name: letters, numbers and dashes, no dash at either end, up to 63 characters"
+  proxy_port_ok "$port" || die "'$port' isn't a port (1 to 65535)"
+  if proxy_port_is_caddy "$port"; then die "Port $port is Caddy's own, so a proxy to it would only come back to Caddy"; fi
+  # An existing proxy can always be moved or repaired, whatever appeared since
+  if [ ! -f "$(proxy_file "$name")" ] && why="$(proxy_site_clash "$name")"; then
+    die "'$name' is already a site ($why). Pick another name for the proxy"
+  fi
+  mkdir -p "$PROXIES_DIR"
+  {
+    echo "# vhosty proxy: https://$name.$VHOSTY_DOMAIN. Change with vhosty proxy, or edit and run: vhosty rebuild"
+    printf 'PROXY_PORT=%s\n' "$port"
+  } >"$(proxy_file "$name")"
+  ok "https://$name.$VHOSTY_DOMAIN → localhost:$port"
+  info "every device on your tailnet can now reach it, and vhosty adds no login"
+  [ -n "$(port_owner "$port")" ] || warn "nothing is listening on port $port yet"
+  cmd_rebuild
+}
+
+cmd_unproxy() {
+  need_config
+  [ -n "${1:-}" ] || die "Usage: vhosty unproxy <name>"
+  local name why
+  name="$(lower "$1")"
+  # Checked first: the name becomes a path, and rm follows it
+  { proxy_name_ok "$name" && [ -f "$(proxy_file "$name")" ]; } || die "'$name' isn't a proxy. Run: vhosty proxies"
+  rm -f "$(proxy_file "$name")"
+  ok "removed proxy $name"
+  if why="$(proxy_site_clash "$name")"; then info "https://$name.$VHOSTY_DOMAIN goes back to the site it was hiding ($why)"; fi
+  cmd_rebuild
+}
+
+cmd_proxies() {
+  need_config
+  local rows
+  rows="$(proxy_rows)"
+  if [ -n "$rows" ]; then printf '%s\n' "$rows"
+  else info "No proxies. Send a name to a port with: vhosty proxy <name> <port>"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -5001,6 +5703,7 @@ worktree_name_free() { # dies if the name is taken
     site_load "$name"
     die "There's already a site called $name${SITE_PATH:+ ($SITE_PATH)}. Remove it first, or use another branch name."
   fi
+  [ ! -f "$(proxy_file "$name")" ] || die "$name is a proxy. Remove it first (vhosty unproxy $name), or use another branch name."
   other="$(parked_dir_for "$name" || true)"
   [ -z "$other" ] || die "$other (parked) already answers to $name. Rename it first, or use another branch name."
 }
@@ -6637,6 +7340,11 @@ doctor_checks() {
     octane_checks
   fi
 
+  if ! herd_mode && [ -n "$(proxy_names)" ]; then
+    head_ "Proxies"
+    proxy_checks
+  fi
+
   head_ "Services"
   if is_linux; then
     if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
@@ -6668,6 +7376,7 @@ doctor_checks() {
     if ( need_services ) 2>/dev/null; then
       services_status --no-header
       backup_status
+      mail_doctor_info || true
     else
       bad "$( ( need_services ) 2>&1 | sed 's/^error: //')"
     fi
@@ -6751,10 +7460,13 @@ ${B}Sites${N}
   vhosty link [dir] [--name N]       Serve one folder, anywhere, as N.domain (default: current)
   vhosty unlink [name]               Remove a link
   vhosty links                       List links
+  vhosty proxy <name> <port>         Send name.domain to a port on this machine (a Node app, Grafana, anything)
+  vhosty unproxy <name>              Remove a proxy
+  vhosty proxies                     List proxies
   vhosty sites                       List sites and their URLs
   vhosty site [name]                 Everything about one site (default: current folder)
-  vhosty open [site|port]            Open in the browser (default: current folder)
-  vhosty url  [site|port]            Print the URL and copy it
+  vhosty open [site|proxy|port]      Open in the browser (default: current folder)
+  vhosty url  [site|proxy|port]      Print the URL and copy it
 
 ${B}Git worktrees${N} ${D}(each its own <branch>--<site>.domain, .env and database)${N}
   vhosty worktree [list]             List worktree sites
@@ -6805,11 +7517,15 @@ ${B}Docker services${N} ${D}(docker compose in VHOSTY_SERVICES_DIR)${N}
   vhosty services pull [svc..]       Update images and recreate
   vhosty services exec <svc> [cmd]   Run a command in a service (e.g. mysql)
   vhosty services edit | dir [path]  Edit compose.yaml, or show/set the folder
-  vhosty services init [dir] [--only mysql,valkey,..]  Write a compose.yaml for MySQL, Postgres,
-                                     Valkey, Meilisearch, Typesense and RustFS, sized for this machine
+  vhosty services init [dir] [--only mysql,valkey,..]  Write a compose.yaml for MySQL, Postgres, Valkey,
+                                     Meilisearch, Typesense, RustFS and Mailpit, sized for this machine
   vhosty services backup [--to DIR]  Dump the databases, archive the other volumes, copy the config
   vhosty services restore <backup> [--into DIR] [--replace-config] [--yes]
                                      Put a backup back: config, volumes, then databases
+
+${B}Mail${N} ${D}(Mailpit, one of the Docker services)${N}
+  vhosty mail [status]               Is it running, its web page, and the lines for an app's .env
+  vhosty mail add                    Add it to an existing compose.yaml, changing nothing else
 
 ${B}Caddy and PHP-FPM${N}
   vhosty start   [caddy|php|php-8.x|octane-<site>] Start services (default: all)
@@ -6819,6 +7535,9 @@ ${B}Caddy and PHP-FPM${N}
   vhosty logs [service] [N]          Show the last N log lines (default 100)
   vhosty logs rotate [--force]       Rotate logs over VHOSTY_LOG_MAX_MB (runs daily on its own)
   vhosty tail [service]              Follow logs live
+  vhosty logs <site> [N]             A site's own log: the newest *.log in its storage/logs
+  vhosty tail <site>                 Follow it, on to the next file when a daily log rolls over
+  ${D}A service wins when a site has the same name.${N}
 
 ${B}Config${N}
   vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply
@@ -6850,6 +7569,9 @@ main() {
     link)               cmd_link "$@" ;;
     unlink)             cmd_unlink "${1:-}" ;;
     links)              cmd_links ;;
+    proxy)              cmd_proxy "$@" ;;
+    unproxy)            cmd_unproxy "${1:-}" ;;
+    proxies)            cmd_proxies ;;
     site|info)          cmd_site "${1:-}" ;;
     parked)             cmd_parked ;;
     worktree)           cmd_worktree "$@" ;;
@@ -6861,6 +7583,7 @@ main() {
     ini)                cmd_ini "$@" ;;
     ext|exts|extension|extensions) cmd_ext "$@" ;;
     services|svc|db)    cmd_services "$@" ;;
+    mail)               cmd_mail "$@" ;;
     sites|ls)           cmd_sites ;;
     open)               cmd_open "${1:-}" ;;
     url)                cmd_url "${1:-}" ;;

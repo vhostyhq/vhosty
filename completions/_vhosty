@@ -35,6 +35,12 @@ _vhosty_worktrees() {
   (( ${#names} )) && _values 'worktree site' $names
 }
 
+_vhosty_proxies() {
+  local -a proxies
+  proxies=( "$(_vhosty_dir)"/proxies/*.conf(N:t:r) )
+  (( ${#proxies} )) && _values 'proxy' $proxies
+}
+
 _vhosty_links() {
   local f
   local -a links
@@ -83,6 +89,9 @@ _vhosty() {
     'link:Serve one folder as a site'
     'unlink:Remove a link'
     'links:List links'
+    'proxy:Send a name to a port on this machine'
+    'unproxy:Remove a proxy'
+    'proxies:List proxies'
     'sites:List sites and their URLs'
     'site:Everything about one site'
     'worktree:A git worktree as a site (list, add, link, remove)'
@@ -96,12 +105,13 @@ _vhosty() {
     'ini:PHP settings, global or per site'
     'ext:PHP extensions a site needs'
     'services:Docker services (databases, caches, search, S3)'
+    'mail:Catch outgoing mail with Mailpit (status, add)'
     'start:Start Caddy and PHP-FPM'
     'stop:Stop Caddy and PHP-FPM'
     'restart:Validate config and restart'
     'status:Service state and sockets'
-    'logs:Show recent logs'
-    'tail:Follow logs live'
+    'logs:Show recent logs of a service or site'
+    'tail:Follow the logs of a service or site'
     'edit:Edit settings, PHP settings, or the token'
     'rebuild:Regenerate config and reload'
     'dns:Point *.domain at this machine'
@@ -124,9 +134,11 @@ _vhosty() {
   fi
 
   case "${words[2]}" in
-    start|stop|restart|tail) _vhosty_services ;;
+    start|stop|restart) _vhosty_services ;;
+    tail)
+      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'sites:site:_vhosty_sites'; fi ;;
     logs|log)
-      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'actions:action:(rotate)'
+      if (( CURRENT == 3 )); then _alternative 'services:service:_vhosty_services' 'sites:site:_vhosty_sites' 'actions:action:(rotate)'
       elif [ "${words[3]}" = "rotate" ]; then _values 'option' --force; fi ;;
     edit)          _values 'file' config php env ;;
     validate)      _values 'config' caddy php ;;
@@ -154,7 +166,12 @@ _vhosty() {
           remove|rm) _vhosty_worktrees ;;
         esac
       fi ;;
-    open|url|site|unisolate) _vhosty_sites ;;
+    proxy)
+      if (( CURRENT == 3 )); then _vhosty_proxies
+      elif (( CURRENT == 4 )); then _message 'port'; fi ;;
+    unproxy)       _vhosty_proxies ;;
+    open|url|site) _alternative 'sites:site:_vhosty_sites' 'proxies:proxy:_vhosty_proxies' ;;
+    unisolate)     _vhosty_sites ;;
     isolate)
       if (( CURRENT == 3 )); then _vhosty_php_versions; else _vhosty_sites; fi ;;
     php)
@@ -200,7 +217,7 @@ _vhosty() {
       elif [ "${words[3]}" = "dir" ]; then
         _files -/
       elif [ "${words[3]}" = "init" ]; then
-        _arguments '1:folder:_files -/' '--only[Services, comma-separated]:services:_sequence compadd - mysql postgres valkey meilisearch typesense rustfs' '--force[Replace compose.yaml]'
+        _arguments '1:folder:_files -/' '--only[Services, comma-separated]:services:_sequence compadd - mysql postgres valkey meilisearch typesense rustfs mailpit' '--force[Replace compose.yaml]'
       elif [ "${words[3]}" = "backup" ]; then
         _arguments '--to[Folder to save in]:folder:_files -/'
       elif [ "${words[3]}" = "restore" ]; then
@@ -208,6 +225,8 @@ _vhosty() {
       else
         _vhosty_docker_services
       fi ;;
+    mail)
+      if (( CURRENT == 3 )); then _values 'action' status add; fi ;;
     doctor|dr)     _values 'option' --fix --yes ;;
     prune)         _values 'option' --yes ;;
     setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token (CF_API_TOKEN is safer)]:token:' '--dns[DNS provider]:provider:(cloudflare digitalocean porkbun route53 custom)' '--park[Folder to park]:folder:_files -/' '--no-php[Skip PHP-FPM]' '--herd[Keep Laravel Herd serving the sites (macOS)]' '--no-herd[Serve the folders with vhosty, not Herd]' '--yes[Accept defaults]' '--overwrite-dns[Replace a *.domain record that is not vhosty'"'"'s]' ;;

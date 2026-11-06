@@ -4071,3 +4071,15 @@ SCOUT_DRIVER=meilisearch"
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   refute_contains "$output" ".env.testing"
 }
+
+@test "a worktree can't take a proxy's name" {
+  repo_site ledger "DB_CONNECTION=sqlite"
+  run vhosty proxy f--ledger 3000
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  cd "$PARKED/ledger"
+  run vhosty worktree add f --no-install
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "is a proxy"
+  [ ! -e "$VHOSTY_DIR/worktrees/ledger/f" ]
+}
+

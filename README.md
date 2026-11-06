@@ -336,7 +336,7 @@ vhosty logs myapp | grep ERROR
   vhosty prints the file's path on stderr, so a pipe only gets the log.
 - **`vhosty tail` follows a daily log across midnight.** It checks every couple of
   seconds for the next day's file in the same series, and carries on from that file's
-  first line. It stays on the file it started with otherwise, so a busy `worker.log`
+  first line. It stays on the file it started with otherwise, even if a later-dated file sits unwritten, so a busy `worker.log`
   won't take over from `laravel.log`.
 - **A service wins when a site has the same name**: `caddy`, `php`, `all`, an installed
   PHP version, and so on, and `rotate` for `vhosty logs`. To read such a site's log, use

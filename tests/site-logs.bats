@@ -56,6 +56,16 @@ wait_gone() {
   return 1
 }
 
+# plain_signals CMD...: CMD with SIGINT, SIGQUIT and SIGPIPE as in a terminal. A
+# background job starts with the first two ignored, CI can start with the third
+# ignored, and a shell can't undo what it started with. It replaces the shell, so
+# with & then $! is CMD's process.
+plain_signals() {
+  exec python3 -I -c 'import os, signal, sys
+for s in (signal.SIGINT, signal.SIGQUIT, signal.SIGPIPE): signal.signal(s, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
+
 # tails_running: the tails left reading this test's folder
 tails_running() { pgrep -f "^tail .*$HOME/" || true; }
 
@@ -319,6 +329,20 @@ EOF
   [ "$(vh main logs caddy)" = "from-caddy" ]
 }
 
+@test "with the Herd backend, a parked folder in the config doesn't make a site" {
+  laravel_site escrow
+  echo the-log >"$PARKED/escrow/storage/logs/laravel.log"
+  cat >"$VHOSTY_DIR/config" <<EOF
+VHOSTY_DOMAIN="test.example"
+VHOSTY_BACKEND="herd"
+VHOSTY_PARKED="$PARKED"
+VHOSTY_PHP="off"
+EOF
+  run vh main logs escrow
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "No service or site 'escrow'"
+}
+
 @test "a name with a slash isn't a path out of the sites folder" {
   mkdir -p "$HOME/outside"
   echo 'touch "$HOME/sourced"' >"$HOME/outside/evil.conf"
@@ -366,13 +390,47 @@ SITE_LINKED=yes"
   assert_contains "$output" "No folder for 'old'"
 }
 
+@test "folders it can't read are reported as that" {
+  [ "$(id -u)" != 0 ] || skip "root reads everything"
+  laravel_site app
+  chmod 000 "$PARKED/app/storage/logs"
+  run vh main logs app
+  chmod 700 "$PARKED/app/storage/logs"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Can't read $PARKED/app/storage/logs"
+  chmod 000 "$PARKED/app/storage"
+  run vh main logs app
+  chmod 700 "$PARKED/app/storage"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "Can't read $PARKED/app/storage"
+}
+
+@test "a failing tail's exit code comes through, for logs and follow" {
+  laravel_site app
+  echo x >"$PARKED/app/storage/logs/laravel.log"
+  stub tail 'exit 3'
+  run vh main logs app
+  [ "$status" -eq 3 ]
+  run vh main tail app
+  [ "$status" -eq 3 ]
+}
+
+@test "with stderr closed, logs still prints the log" {
+  laravel_site app
+  echo the-line >"$PARKED/app/storage/logs/laravel.log"
+  run bash -c '"${1:-bash}" "$2" logs app 2 2>&-' _ "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "the-line"
+}
+
 # --- pipes --------------------------------------------------------------------
 
 @test "logs into a reader that stops early: quiet, and no failure" {
+  command -v python3 >/dev/null || skip "needs python3"
   laravel_site app
   write_lines "$PARKED/app/storage/logs/laravel.log" 200000
-  script="\"\${VHOSTY_TEST_BASH:-bash}\" \"$ROOT/bin/vhosty\" logs app 200000 2>\"$HOME/err\" | { read -r _; }; echo \"\${PIPESTATUS[0]}\""
-  [ "$(bash -c "$script")" = "0" ]
+  rc="$(plain_signals bash -c 'bash_="$1"; shift; "$bash_" "$@" 2>"$HOME/err" | { read -r _; }; echo "${PIPESTATUS[0]}"' _ "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" logs app 200000)"
+  [ "$rc" = "0" ]
   err="$(cat "$HOME/err")"
   refute_contains "$err" "Broken pipe"
   refute_contains "$err" "write error"
@@ -380,10 +438,11 @@ SITE_LINKED=yes"
 }
 
 @test "tail into a reader that stops early ends quietly, and leaves no tail" {
+  command -v python3 >/dev/null || skip "needs python3"
   laravel_site app
   log="$PARKED/app/storage/logs/laravel.log"
   write_lines "$log" 3
-  ( "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" tail app 2>"$HOME/err" 3>&-; echo $? >"$HOME/rc" ) | { read -r _; } &
+  ( rc=0; ( plain_signals "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" tail app 2>"$HOME/err" 3>&- ) || rc=$?; echo "$rc" >"$HOME/rc" ) | { read -r _; } &
   TAIL_PID=$!
   # A write after the reader has gone is what ends tail
   for _ in $(seq 1 100); do
@@ -432,9 +491,35 @@ SITE_LINKED=yes"
   # On the new file, and the old tail has been stopped
   echo day-two-c >>"$logs/laravel-2026-11-06.log"
   wait_for "$HOME/out" "day-two-c"
-  running="$(pgrep -f "^tail .*laravel-2026-11-05" || true)"
+  running="$(pgrep -f "^tail .*$HOME/.*laravel-2026-11-05" || true)"
   [ -z "$running" ]
   refute_contains "$(cat "$HOME/err")" "Terminated"
+}
+
+@test "tail reads the next day's file from its first line" {
+  laravel_site app
+  logs="$PARKED/app/storage/logs"
+  echo day-one >"$logs/laravel-2026-11-05.log"
+  start_tail app
+  wait_for "$HOME/out" "day-one"
+  write_lines "$logs/laravel-2026-11-06.log" 40 next
+  wait_for "$HOME/out" "next 40"
+  assert_contains "$(cat "$HOME/out")" "next 1"$'\n'
+}
+
+@test "a later-dated file nothing has written since doesn't take over" {
+  laravel_site app
+  logs="$PARKED/app/storage/logs"
+  echo stray >"$logs/laravel-2099-01-01.log"
+  touch -t 202001010000 "$logs/laravel-2099-01-01.log"
+  echo today >"$logs/laravel-2026-11-05.log"
+  [ -z "$(vh site_log_after "$logs/laravel-2026-11-05.log")" ]
+  start_tail app
+  wait_for "$HOME/out" "today"
+  sleep 3
+  echo still-today >>"$logs/laravel-2026-11-05.log"
+  wait_for "$HOME/out" "still-today"
+  refute_contains "$(cat "$HOME/out")" "stray"
 }
 
 @test "tail stays on its file when another log in the folder is written" {
@@ -468,16 +553,31 @@ SITE_LINKED=yes"
   command -v python3 >/dev/null || skip "needs python3"
   laravel_site app
   echo hello >"$PARKED/app/storage/logs/laravel.log"
-  # A background job starts with SIGINT ignored, and a shell can't trap what it
-  # started with ignored, so this puts SIGINT back first, as in a terminal
-  python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' \
-    "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" tail app >"$HOME/out" 2>"$HOME/err" 3>&- &
+  plain_signals "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" tail app >"$HOME/out" 2>"$HOME/err" 3>&- &
   TAIL_PID=$!
   wait_for "$HOME/out" "hello"
   [ -n "$(tails_running)" ]
   kill -INT "$TAIL_PID"
   wait_gone "$TAIL_PID"
+  rc=0; wait "$TAIL_PID" || rc=$?
+  [ "$rc" = 130 ]
   [ -z "$(tails_running)" ]
+}
+
+@test "tail: Ctrl-\\ and a hangup end its tail too" {
+  command -v python3 >/dev/null || skip "needs python3"
+  laravel_site app
+  echo hello >"$PARKED/app/storage/logs/laravel.log"
+  for sig in QUIT HUP; do
+    : >"$HOME/out"
+    plain_signals "${VHOSTY_TEST_BASH:-bash}" "$ROOT/bin/vhosty" tail app >"$HOME/out" 2>"$HOME/err" 3>&- &
+    TAIL_PID=$!
+    wait_for "$HOME/out" "hello"
+    [ -n "$(tails_running)" ]
+    kill -"$sig" "$TAIL_PID"
+    wait_gone "$TAIL_PID"
+    [ -z "$(tails_running)" ]
+  done
 }
 
 # --- the next file -------------------------------------------------------------

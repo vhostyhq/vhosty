@@ -4357,6 +4357,8 @@ log_arg_is_site() {
 # valid_name also keeps a name with a slash away from site_load's path.
 site_log_known() {
   local name
+  # Herd keeps its own list of sites, so only services here
+  if herd_mode; then return 1; fi
   name="$(lower "$1")"
   valid_name "$name" || return 1
   [ -f "$(site_file "$name")" ] || parked_dir_for "$name" >/dev/null
@@ -4398,7 +4400,11 @@ site_log_file() {
   name="$(lower "$1")"
   dir="$(site_dir "$name")" || die "No folder for '$name'. Run: vhosty sites"
   [ -d "$dir" ] || die "The folder for '$name' is gone ($dir). Remove its config: vhosty prune"
+  if [ -e "$dir/storage" ] && { [ ! -r "$dir/storage" ] || [ ! -x "$dir/storage" ]; }; then
+    die "Can't read $dir/storage: permission denied"
+  fi
   [ -d "$dir/storage/logs" ] || die "'$name' has no storage/logs ($dir). Site logs are for Laravel apps; is it one?"
+  { [ -r "$dir/storage/logs" ] && [ -x "$dir/storage/logs" ]; } || die "Can't read $dir/storage/logs: permission denied"
   for f in "$dir/storage/logs"/*.log; do
     [ -f "$f" ] || continue
     if [ -z "$newest" ] || [ ! "$newest" -nt "$f" ]; then newest="$f"; fi
@@ -4413,7 +4419,7 @@ site_logs() { # site_logs SITE N
   local file rc=0
   case "$2" in ""|*[!0-9]*) die "Usage: vhosty logs <site> [N] (N is a number of lines, not '$2')" ;; esac
   file="$(site_log_file "$1")" || exit 1
-  info "$file" >&2
+  info "$file" >&2 || true   # with stderr closed, the log's still wanted
   tail -n "$2" "$file" || rc=$?
   if [ "$rc" = 141 ]; then return 0; fi
   return "$rc"
@@ -4421,12 +4427,13 @@ site_logs() { # site_logs SITE N
 
 # site_log_after FILE: the file after a daily log (name-YYYY-MM-DD.log) in the
 # same series, if it's there yet. A log with no date has no next file, and
-# another series (worker-...) in the folder isn't this one's next file.
+# another series (worker-...) in the folder isn't this one's next file. It has to
+# have been written since, or a stray file with a later date would take over.
 site_log_after() {
   local file="$1" day='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' f
   case "$file" in *-$day.log) ;; *) return 0 ;; esac
   for f in "${file%-$day.log}"-$day.log; do
-    if [ -f "$f" ] && [[ "$f" > "$file" ]]; then echo "$f"; return 0; fi
+    if [ -f "$f" ] && [[ "$f" > "$file" ]] && [ ! "$file" -nt "$f" ]; then echo "$f"; return 0; fi
   done
 }
 
@@ -4442,12 +4449,13 @@ site_log_stop() {
 # in the background, and when the next day's file appears, a new tail reads it
 # from its first line. -F works on macOS and Linux, and keeps following a file
 # that's cleared or replaced under the same name. A background job ignores
-# Ctrl-C in a script, so the trap has to stop it.
+# Ctrl-C and Ctrl-\ in a script, so the traps have to stop it.
 site_tail() {
   local file next rc=0
   file="$(site_log_file "$1")" || exit 1
-  info "$file" >&2
-  trap 'site_log_stop; exit 130' INT TERM HUP
+  info "$file" >&2 || true
+  trap 'site_log_stop; exit 130' INT TERM HUP QUIT
+  trap 'site_log_stop; cleanup_tmp' EXIT
   tail -n 30 -F "$file" &
   SITE_LOG_TAIL=$!
   while kill -0 "$SITE_LOG_TAIL" 2>/dev/null; do
@@ -4457,7 +4465,7 @@ site_tail() {
     sleep 1   # time for tail to print the old file's last lines
     site_log_stop
     file="$next"
-    info "$file" >&2
+    info "$file" >&2 || true
     tail -n +1 -F "$file" &
     SITE_LOG_TAIL=$!
   done

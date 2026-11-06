@@ -4325,9 +4325,155 @@ EOF
   tail "$@" "${files[@]}"
 }
 
-cmd_logs() { tail_logs "${1:-all}" -n "${2:-100}"; }
+cmd_logs() {
+  if log_arg_is_site "${1:-all}"; then site_logs "$1" "${2:-100}"; return 0; fi
+  tail_logs "${1:-all}" -n "${2:-100}"
+}
 
-cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
+cmd_tail() {
+  if log_arg_is_site "${1:-all}"; then site_tail "$1"; return 0; fi
+  tail_logs "${1:-all}" -n 30 -f
+}
+
+# ---------------------------------------------------------------------------
+# Site logs (vhosty logs <site>, vhosty tail <site>): the app's own log, from
+# its storage/logs. Nothing here needs a service, only the files.
+# ---------------------------------------------------------------------------
+
+# log_arg_is_site ARG: does this argument of logs or tail mean a site? Whatever
+# svc_resolve accepts is a service, so a service wins. A name it turns down is
+# a site's, if a site has it. Failing that, a name it has never heard of gets a
+# list of what's valid, and any other refusal (PHP 9.9 isn't installed) is left
+# for tail_logs to say, as it always has.
+log_arg_is_site() {
+  local err
+  if err="$(svc_resolve "$1" 2>&1 >/dev/null)"; then return 1; fi
+  if site_log_known "$1"; then return 0; fi
+  case "$err" in *"Unknown service"*) site_log_unknown "$1" ;; esac
+  return 1
+}
+
+# A site in vhosty's sense: it has a config, or a folder in a parked folder.
+# valid_name also keeps a name with a slash away from site_load's path.
+site_log_known() {
+  local name
+  # Herd keeps its own list of sites, so only services here
+  if herd_mode; then return 1; fi
+  name="$(lower "$1")"
+  valid_name "$name" || return 1
+  [ -f "$(site_file "$name")" ] || parked_dir_for "$name" >/dev/null
+}
+
+site_log_unknown() {
+  local services sites
+  services="$(svc_all 2>/dev/null | tr '\n' ' ')" || true
+  sites="$(site_log_names | tr '\n' ' ')" || true
+  die "No service or site '$1'.
+  Services: ${services}(or all)
+  Sites: ${sites:-none}"
+}
+
+site_log_names() { # every site with a folder, one per line
+  local name p f
+  {
+    for name in $(site_names); do
+      site_folder "$name" >/dev/null || continue
+      echo "$name"
+    done
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      for f in "$p"/*/; do
+        [ -d "$f" ] || continue
+        f="${f%/}"; name="$(lower "${f##*/}")"
+        if valid_name "$name"; then echo "$name"; fi
+      done
+    done <<EOF
+$(parked_list)
+EOF
+  } | sort -u
+}
+
+# site_log_file SITE: the newest *.log in its storage/logs, the last in name
+# order if two are as new (bash 3.2 compares whole seconds), or why there's none
+site_log_file() {
+  local name dir f newest=""
+  name="$(lower "$1")"
+  dir="$(site_dir "$name")" || die "No folder for '$name'. Run: vhosty sites"
+  [ -d "$dir" ] || die "The folder for '$name' is gone ($dir). Remove its config: vhosty prune"
+  if [ -e "$dir/storage" ] && { [ ! -r "$dir/storage" ] || [ ! -x "$dir/storage" ]; }; then
+    die "Can't read $dir/storage: permission denied"
+  fi
+  [ -d "$dir/storage/logs" ] || die "'$name' has no storage/logs ($dir). Site logs are for Laravel apps; is it one?"
+  { [ -r "$dir/storage/logs" ] && [ -x "$dir/storage/logs" ]; } || die "Can't read $dir/storage/logs: permission denied"
+  for f in "$dir/storage/logs"/*.log; do
+    [ -f "$f" ] || continue
+    if [ -z "$newest" ] || [ ! "$newest" -nt "$f" ]; then newest="$f"; fi
+  done
+  [ -n "$newest" ] || die "No log files yet in $dir/storage/logs"
+  echo "$newest"
+}
+
+# The file goes to stderr, so a pipe gets only the log. A reader that stops
+# early (| head) ends tail with SIGPIPE, which isn't a failure.
+site_logs() { # site_logs SITE N
+  local file rc=0
+  case "$2" in ""|*[!0-9]*) die "Usage: vhosty logs <site> [N] (N is a number of lines, not '$2')" ;; esac
+  file="$(site_log_file "$1")" || exit 1
+  info "$file" >&2 || true   # with stderr closed, the log's still wanted
+  tail -n "$2" "$file" || rc=$?
+  if [ "$rc" = 141 ]; then return 0; fi
+  return "$rc"
+}
+
+# site_log_after FILE: the file after a daily log (name-YYYY-MM-DD.log) in the
+# same series, if it's there yet. A log with no date has no next file, and
+# another series (worker-...) in the folder isn't this one's next file. It has to
+# have been written since, or a stray file with a later date would take over.
+site_log_after() {
+  local file="$1" day='[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' f
+  case "$file" in *-$day.log) ;; *) return 0 ;; esac
+  for f in "${file%-$day.log}"-$day.log; do
+    if [ -f "$f" ] && [[ "$f" > "$file" ]] && [ ! "$file" -nt "$f" ]; then echo "$f"; return 0; fi
+  done
+}
+
+SITE_LOG_TAIL=""   # the tail site_tail is running
+site_log_stop() {
+  [ -n "$SITE_LOG_TAIL" ] || return 0
+  { kill "$SITE_LOG_TAIL"; wait "$SITE_LOG_TAIL"; } 2>/dev/null || true
+  SITE_LOG_TAIL=""
+}
+
+# The daily driver starts a new file on the first write of each day, and no
+# tail can be told about a file that wasn't there when it started. So tail runs
+# in the background, and when the next day's file appears, a new tail reads it
+# from its first line. -F works on macOS and Linux, and keeps following a file
+# that's cleared or replaced under the same name. A background job ignores
+# Ctrl-C and Ctrl-\ in a script, so the traps have to stop it.
+site_tail() {
+  local file next rc=0
+  file="$(site_log_file "$1")" || exit 1
+  info "$file" >&2 || true
+  trap 'site_log_stop; exit 130' INT TERM HUP QUIT
+  trap 'site_log_stop; cleanup_tmp' EXIT
+  tail -n 30 -F "$file" &
+  SITE_LOG_TAIL=$!
+  while kill -0 "$SITE_LOG_TAIL" 2>/dev/null; do
+    sleep 2
+    next="$(site_log_after "$file")"
+    [ -n "$next" ] || continue
+    sleep 1   # time for tail to print the old file's last lines
+    site_log_stop
+    file="$next"
+    info "$file" >&2 || true
+    tail -n +1 -F "$file" &
+    SITE_LOG_TAIL=$!
+  done
+  wait "$SITE_LOG_TAIL" 2>/dev/null || rc=$?
+  SITE_LOG_TAIL=""
+  if [ "$rc" = 141 ]; then return 0; fi   # the reader of a pipe went away
+  return "$rc"
+}
 
 # ---------------------------------------------------------------------------
 # Commands: sites
@@ -5083,6 +5229,9 @@ ${B}Caddy and PHP-FPM${N}
   vhosty logs [service] [N]          Show the last N log lines (default 100)
   vhosty logs rotate [--force]       Rotate logs over VHOSTY_LOG_MAX_MB (runs daily on its own)
   vhosty tail [service]              Follow logs live
+  vhosty logs <site> [N]             A site's own log: the newest *.log in its storage/logs
+  vhosty tail <site>                 Follow it, on to the next file when a daily log rolls over
+  ${D}A service wins when a site has the same name.${N}
 
 ${B}Config${N}
   vhosty edit [config|php|env]       Edit settings, PHP settings, or the token, then apply

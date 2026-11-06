@@ -5871,6 +5871,12 @@ worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
   wt_db="$(worktree_env_get "$env" DB_DATABASE)"
   [ "$wt_db" != ":memory:" ] || return 0
   if [ -n "$existing" ] && [ -n "$wt_db" ]; then
+    case "$wt_db" in
+      *'$'*)
+        WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $wt_db"
+        WT_DB_WHY="its DB_DATABASE is built from a variable, so vhosty can't tell which file that is"
+        return 0 ;;
+    esac
     file="$(worktree_sqlite_path "$env" "$WT_DIR")"
     if worktree_same_file "$file" "$parent_file"; then
       WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $parent_file"; WT_DB_SHARE_FILE="$parent_file"
@@ -5878,6 +5884,12 @@ worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
       return 0
     fi
     if ! worktree_same_file "$file" "$default"; then
+      if key="$(worktree_db_still_used "$file" "$WT_NAME" "$WT_DIR" "$WT_PARENT" "$WT_REPO")"; then
+        WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $file"
+        WT_DB_WHY="that file may belong to something else: $key"
+        return 0
+      fi
+      # Named in no file, but it can still be someone's default
       while IFS="$(printf '\t')" read -r key d; do
         [ -n "$d" ] && [ "$d" != "$WT_DIR" ] || continue
         worktree_same_file "$file" "$(worktree_sqlite_path "$d/.env" "$d")" || continue
@@ -6007,7 +6019,7 @@ worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
   case "$st" in
     0)
       if [ -n "$own" ]; then WT_DB_PLAN="own"; WT_DB_OWN="$name"; return 0; fi
-      worktree_plan_stop "A database called $name is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. To drop it: $(worktree_db_drop_hint "$engine" "$WT_DB_SERVICE" "$name")" ;;
+      worktree_plan_stop "A database called $name is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. Use another branch name, or, once you're sure nothing needs it, drop it: $(worktree_db_drop_hint "$engine" "$WT_DB_SERVICE" "$name")" ;;
     1) ;;
     *) worktree_plan_stop "Couldn't reach the database on $WT_DB_SERVICE. Check: vhosty services logs $WT_DB_SERVICE." ;;
   esac
@@ -6043,10 +6055,11 @@ worktree_parent_names_db() { # worktree_parent_names_db WORKTREE_ENV PARENT_ENV 
   hit="$(worktree_text_names word "$3" "$2")" || return 2
   [ -z "$hit" ] || return 0
   # Nothing naming it, but no name at all on a server is Laravel's default. A URL
-  # was searched just now, and sqlite's default is a file.
-  if [ "$(worktree_env_get "$2" DB_CONNECTION)" != "sqlite" ] \
-    && [ -z "$(worktree_env_get "$2" DB_URL)$(worktree_env_get "$2" DATABASE_URL)" ]; then
-    worktree_env_has "$2" DB_DATABASE || return 2
+  # with a path was searched just now, and sqlite's default is a file.
+  if [ "$(worktree_env_get "$2" DB_CONNECTION)" != "sqlite" ] && ! worktree_env_has "$2" DB_DATABASE; then
+    v="$(worktree_env_get "$2" DB_URL)"
+    [ -n "$v" ] || v="$(worktree_env_get "$2" DATABASE_URL)"
+    case "${v#*://}" in */[!?]*) ;; *) return 2 ;; esac
   fi
   return 1
 }
@@ -6066,7 +6079,7 @@ worktree_plan_stop() { # worktree_plan_stop MESSAGE [what to do about it]
       tail="$tail The branch $WT_UNDO_BRANCH, which this command created, stays. To delete it: git -C $(printf '%q' "$WT_UNDO_REPO") branch -d $(printf '%q' "$WT_UNDO_BRANCH")"
     fi
   fi
-  die "$1 $tail${2:+ $2}"
+  die "$1${2:+ $2} $tail"
 }
 
 # Reads WT_DIR, WT_PARENT, WT_PARENT_DIR, WT_NAME, WT_COPY, WT_SHARE. Dies before
@@ -6075,10 +6088,10 @@ worktree_plan_stop() { # worktree_plan_stop MESSAGE [what to do about it]
 worktree_db_plan() {
   local parent_env="$WT_PARENT_DIR/.env" wt_env="$WT_DIR/.env" env existing="" conn url
   WT_DB_PLAN="none"; WT_DB_ENGINE=""; WT_DB_SERVICE=""; WT_DB_NAME=""; WT_DB_SRC=""; WT_DB_WHY=""; WT_DB_USER=""
-  WT_DB_WHERE=""; WT_DB_SHARE_FILE=""; WT_DB_OWN=""; WT_DB_MISSING=""; WT_DB_PARENT_DB=""
+  WT_DB_WHERE=""; WT_DB_SHARE_FILE=""; WT_DB_OWN=""; WT_DB_MISSING=""; WT_DB_PARENT_DB=""; WT_DB_FROM_OWN_ENV=""
   # Laravel reads a cached config instead of .env, so nothing below would hold
   if [ "$WT_SHARE" != "1" ] && [ -f "$WT_DIR/bootstrap/cache/config.php" ]; then
-    worktree_plan_stop "$WT_DIR/bootstrap/cache/config.php is a cached config. Laravel reads it instead of .env, so migrations here would use whatever database it names, whatever vhosty sets." "Run php artisan config:clear in that folder, then this again."
+    worktree_plan_stop "$WT_DIR/bootstrap/cache/config.php is a cached config. Laravel reads it instead of .env, so migrations here would use whatever database it names, whatever vhosty sets." "Clear it first (php artisan config:clear, or remove it from the branch if it's committed), then run this again."
   fi
   for env in "$parent_env" "$wt_env"; do
     if [ -e "$env" ] && [ ! -r "$env" ]; then
@@ -6115,10 +6128,11 @@ worktree_db_plan() {
     esac
   fi
   [ "$WT_DB_PLAN" = "shared" ] || return 0
+  WT_DB_FROM_OWN_ENV="$existing"
   [ "$WT_COPY" != "1" ] || worktree_plan_stop "--copy-db can't copy that database ($WT_DB_WHERE): $WT_DB_WHY."
   [ "$WT_SHARE" = "1" ] && return 0
   if [ -n "$existing" ] && [ -z "$WT_DB_SHARE_FILE" ]; then
-    worktree_plan_stop "This worktree's own .env uses a database vhosty doesn't manage ($WT_DB_WHERE): $WT_DB_WHY. Its migrations would change whatever is there, so vhosty stopped." "If using it is what you want: --share-db"
+    worktree_plan_stop "This worktree's own .env uses a database vhosty doesn't manage ($WT_DB_WHERE): $WT_DB_WHY. Its migrations would change whatever is there, so vhosty stopped." "To give it a database of its own, delete DB_DATABASE from that .env and run this again. If using that one is what you want: --share-db."
   fi
   worktree_plan_stop "This worktree would share $WT_PARENT's database ($WT_DB_WHERE): $WT_DB_WHY. Its migrations would change $WT_PARENT's data, so vhosty stopped." "If sharing it is what you want: --share-db"
 }
@@ -6192,6 +6206,12 @@ worktree_db_setup() {
       site_load "$WT_NAME"
       SITE_WT_DB_SHARED="$WT_DB_WHERE"
       site_save "$WT_NAME"
+      # Its own .env naming somewhere else isn't the parent's, or not that vhosty knows
+      if [ -n "$WT_DB_FROM_OWN_ENV" ] && [ "$WT_DB_WHY" != "you asked for that" ] && [ -z "$WT_DB_SHARE_FILE" ]; then
+        warn "${B}This worktree uses a database vhosty doesn't manage${N} ($WT_DB_WHERE), as --share-db asks."
+        warn "Its migrations change whatever is there."
+        return 0
+      fi
       warn "${B}This worktree SHARES $WT_PARENT's database${N} ($WT_DB_WHERE), as --share-db asks."
       warn "Its migrations change $WT_PARENT's data."
       return 0 ;;
@@ -6336,7 +6356,8 @@ worktree_env_warnings() {
   [ -f "$wt_env" ] || return 0
   # vhosty only sets up .env. A server's test database here is the parent's too.
   testing="$(worktree_env_get "$WT_DIR/.env.testing" DB_DATABASE 2>/dev/null || true)"
-  if [ -n "$testing" ] && [ "$(worktree_env_get "$WT_DIR/.env.testing" DB_CONNECTION)" != "sqlite" ]; then
+  if [ -n "$testing" ] && [ "$(worktree_env_get "$WT_DIR/.env.testing" DB_CONNECTION)" != "sqlite" ] \
+    && [ "$testing" = "$(worktree_env_get "$WT_PARENT_DIR/.env.testing" DB_DATABASE)" ]; then
     warn ".env.testing names the database $testing, which $WT_PARENT's tests use too. Tests that reset it here reset it for both."
   fi
   # Not the worktree's own address, which ends in the parent's name and domain
@@ -6715,6 +6736,8 @@ worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO
       return 0
     fi
     for f in "$d"/.env*; do
+      # Templates: nothing loads them, and .env.example names laravel in every app
+      case "$f" in */.env.example|*/.env.sample|*/.env.dist|*/.env.template) continue ;; esac
       [ -e "$f" ] || [ -L "$f" ] || continue
       if [ ! -r "$f" ]; then
         echo "$f can't be read, so vhosty can't tell whether that uses it"
@@ -6722,9 +6745,13 @@ worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO
       fi
       [ -f "$f" ] || continue
       set -- "$@" "$f"
-      [ "$kind" = "P" ] || continue
       for key in $(worktree_env_db_vars "$f"); do
         if ! v="$(worktree_env_resolved "$f" "$key")"; then
+          # Only the parent's own .env files: not a sibling's, nor a shell's .envrc
+          case "$kind:$f" in
+            P:*/.env|P:*/.env.*) ;;
+            *) continue ;;
+          esac
           echo "$f builds $key from a variable, so vhosty can't tell whether that's this one"
           return 0
         fi

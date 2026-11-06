@@ -525,6 +525,7 @@ it. npm is never run; it's printed as a next step if there's a lockfile.
   the site kept so you can run it again.
 - Nothing is dropped if its whole name appears anywhere in a `.env*` file of the parent or
   any other site or worktree, comments included, in any case, and after decoding `%XX`.
+  Templates such as `.env.example` don't count, as nothing loads them.
   A longer name is another database, so a sibling's `wt_x__ledger2` doesn't stop the drop
   of `wt_x__ledger`. vhosty says which file named it. If one of those files or
   folders can't be read, or the parent's database keys use a `${VAR}` that doesn't

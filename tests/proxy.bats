@@ -167,6 +167,87 @@ proxy_conf() { printf 'PROXY_PORT=%s\n' "$2" >"$HOME/p.conf"; mkdir -p "$VHOSTY_
   assert_contains "$output" "already a site"
 }
 
+@test "proxy: a Vite app can take its own folder's name" {
+  mkdir -p "$PARKED/shop"
+  echo '<script type=module src=/src/main.tsx></script>' >"$PARKED/shop/index.html"
+  echo '{}' >"$PARKED/shop/package.json"
+  run linux main proxy shop 5173
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux proxy_checks
+  refute_contains "$output" "hides a site"
+}
+
+@test "proxy: a site in a second parked folder is seen" {
+  mkdir -p "$HOME/Other/shop" "$PARKED/shop"
+  echo hi >"$HOME/Other/shop/index.html"
+  write_config "VHOSTY_PARKED=\"$PARKED:$HOME/Other\""
+  run linux main proxy shop 3001
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "already a site (parked in $HOME/Other)"
+}
+
+@test "proxy: an existing proxy can be moved after its folder becomes a site" {
+  mkdir -p "$PARKED/shop"
+  linux main proxy shop 3000
+  echo hi >"$PARKED/shop/index.html"
+  run linux main proxy shop 3001
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^PROXY_PORT=3001$' "$VHOSTY_DIR/proxies/shop.conf"
+}
+
+@test "proxy: a broken one can be repaired, as doctor says, whatever its folder holds" {
+  static_site shop
+  proxy_conf shop abc
+  run linux main proxy shop 3001
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^PROXY_PORT=3001$' "$VHOSTY_DIR/proxies/shop.conf"
+}
+
+@test "proxy: says the tailnet can reach it" {
+  run linux main proxy db 2375
+  assert_contains "$output" "every device on your tailnet can now reach it"
+}
+
+@test "octane on: a proxy's name is refused, and nothing's written" {
+  php_site app
+  mkdir -p "$PARKED/app/vendor/laravel/octane"
+  echo '{}' >"$PARKED/app/vendor/laravel/octane/composer.json"
+  proxy_conf app 3001
+  run linux main octane on app
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "'app' is a proxy"
+  [ ! -f "$VHOSTY_DIR/sites/app.conf" ]
+}
+
+@test "ini set --site: a proxy's name is refused, and nothing's written" {
+  mkdir -p "$PARKED/shop"
+  proxy_conf shop 3001
+  run linux main ini set memory_limit 1G --site shop
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "'shop' is a proxy"
+  [ ! -f "$VHOSTY_DIR/sites/shop.conf" ]
+}
+
+@test "a listener another user owns isn't called Caddy" {
+  proxy_conf grafana 3001
+  stub ss "echo 'LISTEN 0 0 127.0.0.1:3001 0.0.0.0:*'"
+  mkdir -p "$XDG_CONFIG_HOME/systemd/user"
+  touch "$XDG_CONFIG_HOME/systemd/user/vhosty-caddy.service"
+  stub systemctl 'exit 0'
+  run linux proxy_checks
+  assert_contains "$output" "(another user's process)"
+  refute_contains "$output" "(caddy)"
+}
+
+@test "a proxy with a bad port isn't offered on the no-site page" {
+  proxy_conf broken abc
+  proxy_conf fine 3001
+  vh write_configs
+  grep -q 'vhosty_sites.*fine' "$VHOSTY_DIR/Caddyfile"
+  run grep -c 'vhosty_sites.*broken' "$VHOSTY_DIR/Caddyfile"
+  [ "$output" = 0 ]
+}
+
 @test "proxy: a parked folder with capitals is the same name" {
   static_site MyApp
   run linux main proxy myapp 3001
@@ -366,7 +447,9 @@ SITE_PHP=8.4"
   [ "$(vh svc_all | tr '\n' ' ')" = "php-8.4 caddy " ]
   run vh site_from_dir "$HOME"
   [ "$status" -ne 0 ]
-  refute_contains "$(cat "$VHOSTY_DIR/Caddyfile" 2>/dev/null || true)" "Site: grafana"
+  vh write_configs
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "@proxy_grafana"
+  refute_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "Site: grafana"
 }
 
 @test "prune leaves proxies alone, and says there's nothing to do" {
@@ -551,7 +634,8 @@ class H(http.server.BaseHTTPRequestHandler):
             time.sleep(10)
             self.close_connection = True
             return
-        code, body = 200, "host=%s xfh=%s xfp=%s\n" % (self.headers.get("Host"), self.headers.get("X-Forwarded-Host"), self.headers.get("X-Forwarded-Proto"))
+        code, body = 200, "host=%s xfh=%s xfp=%s xff=%s\n" % (self.headers.get("Host"), self.headers.get("X-Forwarded-Host"), self.headers.get("X-Forwarded-Proto"), self.headers.get("X-Forwarded-For"))
+        body += "".join("%s: %s\n" % kv for kv in self.headers.items())
         if self.path == "/down":
             code, body = 503, "the app's own 503\n"
         self.send_response(code)
@@ -659,6 +743,39 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   [ "$(echo "$output" | tail -1)" = 200 ]
   assert_contains "$output" "host=grafana.test.example"
   assert_contains "$output" "xfh=grafana.test.example"
+  assert_contains "$output" "xfp=http "
+  assert_contains "$output" "xff=127.0.0.1"
+}
+
+@test "what a client claims in forwarding and identity headers doesn't reach the app" {
+  need_caddy; need_python
+  proxy_conf grafana "$APP_PORT"
+  start_app
+  start_caddy
+  run curl -s -H "Host: grafana.test.example" -H 'X-Forwarded-For: 6.6.6.6' -H 'X-Forwarded-Proto: ftp' \
+    -H 'X-Forwarded-Host: evil.example' -H 'X-Real-IP: 9.9.9.9' -H 'Forwarded: for=8.8.8.8' \
+    -H 'Tailscale-User-Login: admin@corp' -H 'X-Webauth-User: admin' "http://127.0.0.1:$PORT/"
+  assert_contains "$output" "host=grafana.test.example"
+  assert_contains "$output" "xfp=http "
+  assert_contains "$output" "xff=127.0.0.1"
+  refute_contains "$output" "6.6.6.6"
+  refute_contains "$output" "ftp"
+  refute_contains "$output" "evil.example"
+  refute_contains "$output" "9.9.9.9"
+  refute_contains "$output" "8.8.8.8"
+  refute_contains "$output" "admin"
+}
+
+@test "a proxy from before wins over an Octane site made by hand, through Caddy" {
+  need_caddy; need_python
+  php_site hello
+  site_conf hello "SITE_OCTANE=18999"
+  proxy_conf hello "$APP_PORT"
+  start_app
+  start_caddy
+  run get hello
+  [ "$(echo "$output" | tail -1)" = 200 ]
+  assert_contains "$output" "host=hello.test.example"
 }
 
 @test "an app listening only on ::1 is reached, where localhost includes it" {

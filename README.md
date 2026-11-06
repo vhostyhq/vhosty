@@ -351,16 +351,21 @@ vhosty proxies                  # vhosty sites lists them too
 vhosty unproxy grafana
 ```
 
-- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to your tailnet.
+- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to every device
+  on your tailnet, with no login from vhosty. Think twice about admin consoles.
 - Websockets and server-sent events work. A `vhosty rebuild` drops open websockets,
   so they have to reconnect. The app sees its real `Host`, plus
   `X-Forwarded-Host`, `-Proto` and `-For`, so one that checks the host (Vite's
   `server.allowedHosts`) or builds links from it may need telling.
-- A name that's already a site (parked, linked or on Octane) is refused, as is one
-  that's only numbers. A parked folder with nothing to serve doesn't count, so a Node
-  app in `~/Sites/shop` can run its server as `vhosty proxy shop 3000`. If a folder
-  there later becomes servable under the same name, the proxy keeps the name and
-  `vhosty sites` and `doctor` say so.
+- Caddy sets those `X-Forwarded-*` headers itself, and removes `Forwarded`, `X-Real-IP`,
+  `Tailscale-*` and `X-Webauth-*` from requests. Other headers pass through, so don't
+  point an app's login at a header a client could send.
+- A name that's already a site (parked with PHP or a plain `index.html`, linked or on
+  Octane) is refused, as is one that's only numbers. A folder with a `package.json`
+  doesn't count as a site, so a Node or Vite app in `~/Sites/shop` can run its server as
+  `vhosty proxy shop 3000`. If a parked folder later becomes a site under the same name,
+  the proxy keeps the name and `vhosty sites` and `doctor` say so. `octane on`, `isolate`
+  and `ini --site` refuse a proxy's name.
 - Nothing listening is normal for a dev server: `doctor` warns rather than fails, and
   the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
   stop the app.

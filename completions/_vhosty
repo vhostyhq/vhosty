@@ -144,8 +144,8 @@ _vhosty() {
         _files -/
       elif [[ "${words[CURRENT]}" == -* ]]; then
         case "${words[3]}" in
-          add)    _values 'option' --copy-db --no-install --site --path ;;
-          link)   _values 'option' --copy-db --no-install ;;
+          add)    _values 'option' --copy-db --share-db --no-install --site --path ;;
+          link)   _values 'option' --copy-db --share-db --no-install ;;
           remove|rm) _values 'option' --yes --keep-db ;;
         esac
       else

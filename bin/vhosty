@@ -1186,7 +1186,7 @@ site_names() {
 
 site_load() { # sets SITE_PATH SITE_LINKED SITE_PHP SITE_INI SITE_EXT SITE_OCTANE SITE_OCTANE_WORKERS, and SITE_WT_*
   SITE_PATH=""; SITE_LINKED="no"; SITE_PHP=""; SITE_INI=""; SITE_EXT=""; SITE_OCTANE=""; SITE_OCTANE_WORKERS=""
-  SITE_WT_KIND=""; SITE_WT_PARENT=""; SITE_WT_REPO=""; SITE_WT_BRANCH=""; SITE_WT_ALIAS=""; SITE_WT_DB_KIND=""; SITE_WT_DB_SERVICE=""; SITE_WT_DB_NAME=""
+  SITE_WT_KIND=""; SITE_WT_PARENT=""; SITE_WT_REPO=""; SITE_WT_BRANCH=""; SITE_WT_ALIAS=""; SITE_WT_DB_KIND=""; SITE_WT_DB_SERVICE=""; SITE_WT_DB_NAME=""; SITE_WT_DB_SHARED=""
   # shellcheck disable=SC1090
   if [ -f "$(site_file "$1")" ]; then . "$(site_file "$1")"; fi
 }
@@ -1219,6 +1219,7 @@ site_save() {
       printf 'SITE_WT_DB_KIND=%q\n' "$SITE_WT_DB_KIND"
       printf 'SITE_WT_DB_SERVICE=%q\n' "$SITE_WT_DB_SERVICE"
       printf 'SITE_WT_DB_NAME=%q\n' "$SITE_WT_DB_NAME"
+      printf 'SITE_WT_DB_SHARED=%q\n' "$SITE_WT_DB_SHARED"
     fi
   } >"$f"
 }
@@ -2873,7 +2874,7 @@ cmd_site() {
 
   printf "%s%s%s  https://%s.%s\n" "$B" "$name" "$N" "$name" "$VHOSTY_DOMAIN"
   printf "  %-10s %s\n" "Folder" "$dir" "Source" "$source" "Serves" "$kind"
-  [ -z "$SITE_WT_DB_KIND" ] || printf "  %-10s %s\n" "Database" "$(worktree_db_label)"
+  [ -z "$SITE_WT_DB_KIND$SITE_WT_DB_SHARED" ] || printf "  %-10s %s\n" "Database" "$(worktree_db_label)"
   worktrees="$(worktree_children "$name" | tr '\n' ' ' | sed 's/ $//')"
   [ -z "$worktrees" ] || printf "  %-10s %s\n" "Worktrees" "$worktrees"
   if php_enabled; then
@@ -3748,7 +3749,8 @@ EOF
 # ---------------------------------------------------------------------------
 SERVICES_CATALOG="mysql postgres valkey meilisearch typesense rustfs"
 HELPER_IMAGE="alpine:3"   # archives volumes; anything with sh, tar and gzip works
-BACKUP_SKIP_DBS='^test$|_test(ing)?(_[0-9]+)?$'   # test databases: the test suites recreate them
+# Test databases, which the test suites recreate, and worktree sites', which are throwaway
+BACKUP_SKIP_DBS='^test$|_test(ing)?(_[0-9]+)?$|^wt_'
 
 # Memory the services can use, in MB: the Docker VM's on macOS, the machine's on Linux
 services_mem_mb() {
@@ -4016,7 +4018,7 @@ backup_mysql() { # backup_mysql SERVICE OUT
     echo "mysql|$svc|$db|$svc/$db.sql.gz" >>"$out/MANIFEST"
     n=$((n + 1))
   done
-  ok "$svc: $n database(s) dumped${skipped:+ (skipped test databases:$skipped)}"
+  ok "$svc: $n database(s) dumped${skipped:+ (skipped test and worktree databases:$skipped)}"
 }
 
 backup_postgres() { # backup_postgres SERVICE OUT
@@ -4040,7 +4042,7 @@ backup_postgres() { # backup_postgres SERVICE OUT
     echo "postgres|$svc|$db|$svc/$db.sql.gz" >>"$out/MANIFEST"
     n=$((n + 1))
   done
-  ok "$svc: $n database(s) and the roles dumped${skipped:+ (skipped test databases:$skipped)}"
+  ok "$svc: $n database(s) and the roles dumped${skipped:+ (skipped test and worktree databases:$skipped)}"
 }
 
 backup_volumes() { # backup_volumes SERVICE CONTAINER OUT
@@ -4140,8 +4142,9 @@ cmd_services_backup() { # [--to DIR]
   # Keep the newest VHOSTY_BACKUP_KEEP backups in this folder
   keep="${VHOSTY_BACKUP_KEEP:-7}"
   [ "$keep" -ge 1 ] 2>/dev/null || keep=7
+  # Patterns in parentheses, as bash 3.2 can't parse a bare one in a command substitution
   old="$(for f in "$root"/services-[0-9]*; do
-    case "$f" in *.partial) ;; *) [ ! -d "$f" ] || printf '%s\n' "$f" ;; esac
+    case "$f" in (*.partial) ;; (*) [ ! -d "$f" ] || printf '%s\n' "$f" ;; esac
   done | sort -r | tail -n +$((keep + 1)))"
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f/MANIFEST" ] || continue
@@ -4700,10 +4703,37 @@ EOF
 #   SITE_WT_DB_KIND     mysql, postgres or sqlite: the database vhosty created
 #   SITE_WT_DB_SERVICE  that database's docker service
 #   SITE_WT_DB_NAME     its name, or the sqlite file: all that remove ever drops
+#   SITE_WT_DB_SHARED   where the parent's database is, if --share-db shares it
 # ---------------------------------------------------------------------------
 worktree_real() { ( cd "$1" 2>/dev/null && pwd -P ); }
 
 worktree_hash() { printf '%s' "$1" | hash_stdin | cut -c1-8; }
+
+# A file's real path: its folder may be reached through links, and it may be one
+worktree_real_file() {
+  local f="$1" t i=0 up rest="" real
+  case "$f" in /*) ;; *) f="$PWD/$f" ;; esac
+  while [ -L "$f" ] && [ "$i" -lt 40 ]; do
+    t="$(readlink "$f")" || break
+    case "$t" in /*) f="$t" ;; *) f="${f%/*}/$t" ;; esac
+    i=$((i + 1))
+  done
+  # Folders that aren't there yet: from the nearest one that is
+  up="${f%/*}"
+  until real="$(worktree_real "${up:-/}")"; do
+    rest="/${up##*/}$rest"; up="${up%/*}"
+  done
+  printf '%s%s/%s\n' "${real%/}" "$rest" "${f##*/}"
+}
+
+worktree_same_file() { [ "$1" -ef "$2" ] || [ "$(worktree_real_file "$1")" = "$(worktree_real_file "$2")" ]; }
+
+worktree_file_inside() { # worktree_file_inside FILE DIR: really, whatever links are on the way
+  local d
+  d="$(worktree_real "$2")" || return 1
+  case "$(worktree_real_file "$1")" in "$d"/*) return 0 ;; esac
+  return 1
+}
 
 # Any text → lowercase letters, numbers and single dashes, in bytes (so a
 # branch in another alphabet leaves nothing, rather than something invalid).
@@ -4744,13 +4774,23 @@ worktree_db_name() {
   echo "$n"
 }
 
-worktree_db_name_ok() { printf '%s' "$1" | grep -qE '^wt_[a-z0-9_]{1,60}$'; }
+worktree_db_name_ok() {
+  case "$1" in wt_?*) ;; *) return 1 ;; esac
+  case "$1" in *[!abcdefghijklmnopqrstuvwxyz0123456789_]*) return 1 ;; esac
+  [ ${#1} -le 63 ]
+}
 
 # Database names and users from a .env: they reach dump commands and SQL
-worktree_ident_ok() { printf '%s' "$1" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$'; }
+worktree_ident_ok() {
+  case "$1" in ""|[.-]*) return 1 ;; esac
+  case "$1" in *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-]*) return 1 ;; esac
+  [ ${#1} -le 63 ]
+}
 
 # ---- .env, read and written as text. Never sourced: it isn't vhosty's, and
 # ---- none of its values are printed, or passed on a command line, unasked.
+# The last value of a key that's there twice, as phpdotenv loads them in order
+# and Laravel's immutable repository only protects what came from outside.
 worktree_env_get() { # worktree_env_get FILE KEY → the value, without its quotes
   [ -f "$1" ] || return 0
   WT_KEY="$2" awk '
@@ -4762,8 +4802,26 @@ worktree_env_get() { # worktree_env_get FILE KEY → the value, without its quot
       if (q == "\"" || q == "\047") {
         v = substr(v, 2); i = index(v, q); if (i) v = substr(v, 1, i - 1)
       } else { sub(/[ \t]+#.*$/, "", v); sub(/[ \t]+$/, "", v) }
-      print v; exit
-    }' "$1"
+      last = v
+    }
+    END { if (last != "") print last }' "$1"
+}
+
+# The keys whose value names TOKEN, whole: in a URL, under any key, any occurrence
+worktree_env_keys_naming() { # worktree_env_keys_naming FILE TOKEN
+  WT_TOKEN="$2" awk -F= '
+    /^[ \t]*#/ { next }
+    {
+      s = $0; gsub(/%5[Ff]/, "_", s); gsub(/%2[Dd]/, "-", s)
+      t = ENVIRON["WT_TOKEN"]; n = length(t)
+      while ((i = index(s, t))) {
+        b = (i > 1) ? substr(s, i - 1, 1) : ""; a = substr(s, i + n, 1)
+        if (b !~ /[A-Za-z0-9_]/ && a !~ /[A-Za-z0-9_]/) {
+          k = $1; sub(/^[ \t]*(export[ \t]+)?/, "", k); sub(/[ \t]+$/, "", k); print k; break
+        }
+        s = substr(s, i + n)
+      }
+    }' "$1" | tr '\n' ' ' | sed -e 's/ $//'
 }
 
 worktree_env_quote() {
@@ -4870,7 +4928,8 @@ worktree_name_free() { # dies if the name is taken
 # Sets WT_DB_PLAN:
 #   none    nothing to set up (no .env)
 #   own     the worktree's .env already names a database other than the parent's
-#   shared  somewhere vhosty doesn't manage: left alone, with WT_DB_WHY saying why
+#   shared  somewhere vhosty doesn't manage, or the parent's file: stops the command
+#           unless --share-db, with WT_DB_WHERE and WT_DB_WHY saying where and why
 #   docker  a new database on vhosty's service WT_DB_SERVICE (engine WT_DB_ENGINE)
 #   sqlite  a new file, WT_DB_NAME
 # → the compose service publishing that port. Returns 1 for none, 2 if compose can't say.
@@ -4914,28 +4973,58 @@ worktree_db_create() { # worktree_db_create ENGINE SERVICE NAME [APP_USER]
   esac
 }
 
-# A copy that only reads the parent: one transaction's snapshot, no locks on
-# InnoDB tables, and no USE in the dump (no --databases) that could point the
-# load at the parent. Status files, as sh has no pipefail: a dump that dies
-# halfway must not pass as a copy.
+# A copy that only reads the parent: one transaction's snapshot, no global read
+# lock and none on InnoDB tables (tests/worktree-db.bats reads a server's general
+# log for that), and no USE in the dump (no --databases) that could point the load
+# at the parent. Status files, as sh has no pipefail: a dump that dies halfway
+# must not pass as a copy.
 worktree_db_copy() { # worktree_db_copy ENGINE SERVICE FROM TO [APP_USER]
   case "$1" in
     mysql) mysql_in "$2" 'st="$(mktemp)" || exit 1
-      { $DUMP --single-transaction --quick --routines --triggers --events --hex-blob "$1"; echo $? >"$st"; } | $C "$2"
+      # GTID servers: without this, mysqldump takes a global read lock, and the dump
+      # sets GTID_PURGED, which fails on load. Not an option mariadb-dump knows.
+      G=""; if $DUMP --help 2>/dev/null | grep -q -- "--set-gtid-purged"; then G="--set-gtid-purged=OFF"; fi
+      { $DUMP $G --single-transaction --quick --routines --triggers --events --hex-blob "$1"; echo $? >"$st"; } | $C "$2"
       rc=$?; d="$(cat "$st")"; rm -f "$st"; [ "$rc" = 0 ] && [ "$d" = 0 ]' "$3" "$4" </dev/null ;;
     postgres) pg_in "$2" 'st="$(mktemp)" || exit 1
-      # Extensions need the superuser; then SET ROLE, so the app owns the tables
-      for e in $(psql -U "$U" -d "$1" -Atc "select quote_ident(extname) from pg_extension where extname <> '"'"'plpgsql'"'"'"); do
-        psql -U "$U" -d "$2" -v ON_ERROR_STOP=1 -qc "CREATE EXTENSION IF NOT EXISTS $e" || exit 1
-      done
+      # SET ROLE, so the app owns the tables. Its extensions and their schemas are
+      # there already (worktree_pg_extensions), so CREATE SCHEMA has to allow that.
       role=""
       if [ -n "$3" ] && [ "$3" != "$U" ] && [ "$(psql -U "$U" -d postgres -Atc "select count(*) from pg_roles where rolname = '"'"'$3'"'"'")" = 1 ]; then role="$3"; fi
       { [ -z "$role" ] || printf "SET ROLE \"%s\";\n" "$role"
         pg_dump -U "$U" --no-owner --no-privileges --no-comments "$1"; echo $? >"$st"
-      } | psql -U "$U" -d "$2" -v ON_ERROR_STOP=1 -q >/dev/null
+      } | awk '"'"'!d && /^COPY / { d = 1 } !d && /^CREATE SCHEMA / { sub(/^CREATE SCHEMA /, "CREATE SCHEMA IF NOT EXISTS ") } { print }'"'"' \
+        | psql -U "$U" -d "$2" -v ON_ERROR_STOP=1 -q >/dev/null
       rc=$?; d="$(cat "$st")"; rm -f "$st"; [ "$rc" = 0 ] && [ "$d" = 0 ]' "$3" "$4" "${5:-}" </dev/null ;;
     *) return 1 ;;
   esac
+}
+
+# Triggers, routines and events that name the parent's database keep that name
+# in a copy, so writes to the copy would land in the parent. Read only. Views
+# aren't here: mysqldump writes them without their own database's name.
+worktree_mysql_copy_blockers() { # worktree_mysql_copy_blockers SERVICE DATABASE
+  mysql_in "$1" 'R="(^|[^a-z0-9_])$2\`?[[:space:]]*[.]"
+    $C -N -e "select concat('"'"'trigger '"'"', TRIGGER_NAME) from information_schema.TRIGGERS where TRIGGER_SCHEMA = '"'"'$1'"'"' and ACTION_STATEMENT regexp '"'"'$R'"'"'
+      union all select concat(lower(ROUTINE_TYPE), '"'"' '"'"', ROUTINE_NAME) from information_schema.ROUTINES where ROUTINE_SCHEMA = '"'"'$1'"'"' and ROUTINE_DEFINITION regexp '"'"'$R'"'"'
+      union all select concat('"'"'event '"'"', EVENT_NAME) from information_schema.EVENTS where EVENT_SCHEMA = '"'"'$1'"'"' and EVENT_DEFINITION regexp '"'"'$R'"'"'"' \
+    "$2" "$(printf '%s' "$2" | sed -e 's/[.]/[.]/g')" </dev/null
+}
+
+# The parent's extensions, each in its own schema, as a migration or a copy needs
+# them and the app's role usually can't create them
+worktree_pg_extensions() { # worktree_pg_extensions SERVICE FROM TO [APP_USER]
+  pg_in "$1" 'rows="$(psql -U "$U" -d "$1" -Atc "select quote_ident(e.extname) || chr(124) || quote_ident(n.nspname) from pg_extension e join pg_namespace n on n.oid = e.extnamespace where e.extname <> '"'"'plpgsql'"'"' order by e.oid")" || exit 1
+    a=""
+    if [ -n "$3" ] && [ "$3" != "$U" ] && [ "$(psql -U "$U" -d postgres -Atc "select count(*) from pg_roles where rolname = '"'"'$3'"'"'")" = 1 ]; then a=" AUTHORIZATION \"$3\""; fi
+    printf "%s\n" "$rows" | while IFS="|" read -r e s; do
+      [ -n "$e" ] || continue
+      case "$s" in
+        public|pg_*) ;;
+        *) psql -U "$U" -d "$2" -v ON_ERROR_STOP=1 -qc "CREATE SCHEMA IF NOT EXISTS $s$a" || exit 1 ;;
+      esac
+      psql -U "$U" -d "$2" -v ON_ERROR_STOP=1 -qc "CREATE EXTENSION IF NOT EXISTS $e WITH SCHEMA $s CASCADE" || exit 1
+    done' "$2" "$3" "${4:-}" </dev/null
 }
 
 worktree_db_drop() { # worktree_db_drop ENGINE SERVICE NAME
@@ -4955,64 +5044,95 @@ worktree_sqlite_path() { # the parent's file, from its DB_DATABASE (Laravel's de
 }
 
 # Reads WT_DIR, WT_PARENT, WT_PARENT_DIR, WT_NAME, WT_COPY. DIE before any change
-worktree_db_plan() {
-  local parent_env="$WT_PARENT_DIR/.env" wt_env="$WT_DIR/.env" env existing="" conn engine host port url
-  local parent_db wt_db st parent_conn
-  WT_DB_PLAN="none"; WT_DB_ENGINE=""; WT_DB_SERVICE=""; WT_DB_NAME=""; WT_DB_SRC=""; WT_DB_WHY=""; WT_DB_USER=""
-  # A link to the parent's .env gets replaced, so it doesn't count as the worktree's own
-  if [ -f "$wt_env" ] && [ ! -L "$wt_env" ]; then env="$wt_env"; existing=1
-  elif [ -f "$parent_env" ]; then env="$parent_env"
-  elif [ -f "$WT_DIR/.env.example" ]; then env="$WT_DIR/.env.example"
-  elif [ -f "$WT_PARENT_DIR/.env.example" ]; then env="$WT_PARENT_DIR/.env.example"
-  else return 0; fi
+# Where a .env's database is, in words: host and name, never a password
+worktree_db_where_url() {
+  local u="${1#*://}" host db
+  u="${u##*@}"
+  host="${u%%/*}"
+  db="${u#"$host"}"; db="${db#/}"; db="${db%%\?*}"
+  printf '%s, database %s' "$host" "${db:-(none named)}"
+}
 
-  conn="$(worktree_env_get "$env" DB_CONNECTION)"
-  parent_conn="$(worktree_env_get "$parent_env" DB_CONNECTION)"
-  url="$(worktree_env_get "$env" DB_URL)"
-  [ -n "$url" ] || url="$(worktree_env_get "$env" DATABASE_URL)"
-  if [ -n "$url" ]; then
-    WT_DB_PLAN="shared"; WT_DB_WHY="its .env connects with a database URL, which vhosty doesn't rewrite"
+worktree_db_where_env() {
+  local host db
+  host="$(worktree_env_get "$1" DB_HOST)"; db="$(worktree_env_get "$1" DB_DATABASE)"
+  printf '%s, database %s' "${host:-no host set}" "${db:-(not set)}"
+}
+
+# sqlite: what's the worktree's own, what's the parent's, what's outside
+worktree_db_plan_sqlite() { # worktree_db_plan_sqlite ENV EXISTING
+  local env="$1" existing="$2" wt_db parent_file file default
+  parent_file="$(worktree_sqlite_path "$WT_PARENT_DIR/.env" "$WT_PARENT_DIR")"
+  default="$WT_DIR/database/database.sqlite"
+  wt_db="$(worktree_env_get "$env" DB_DATABASE)"
+  [ "$wt_db" != ":memory:" ] || return 0
+  if [ -n "$existing" ] && [ -n "$wt_db" ]; then
+    file="$(worktree_sqlite_path "$env" "$WT_DIR")"
+    if worktree_same_file "$file" "$parent_file"; then
+      WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $parent_file"; WT_DB_SHARE_FILE="$parent_file"
+      WT_DB_WHY="the worktree's DB_DATABASE is that file"
+      return 0
+    fi
+    if ! worktree_same_file "$file" "$default"; then
+      WT_DB_PLAN="own"; WT_DB_OWN="$file"
+      [ -e "$file" ] || WT_DB_MISSING="$file"
+      return 0
+    fi
+  fi
+  if [ -d "$WT_DIR" ]; then
+    if [ -L "$WT_DIR/database" ] && [ ! -e "$WT_DIR/database" ]; then
+      WT_DB_PLAN="shared"; WT_DB_WHERE="the folder that database/ links to"; WT_DB_SHARE_FILE="$default"
+      WT_DB_WHY="the worktree's database/ is a broken link out of the worktree"
+      return 0
+    fi
+    if worktree_same_file "$default" "$parent_file"; then
+      WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $parent_file"; WT_DB_SHARE_FILE="$parent_file"
+      WT_DB_WHY="the worktree's database/ is a link to it"
+      return 0
+    fi
+    if ! worktree_file_inside "$default" "$WT_DIR"; then
+      WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $(worktree_real_file "$default")"; WT_DB_SHARE_FILE="$default"
+      WT_DB_WHY="the worktree's database/ is a link out of the worktree"
+      return 0
+    fi
+  fi
+  if [ "$WT_SHARE" = "1" ]; then
+    WT_DB_PLAN="shared"; WT_DB_WHERE="sqlite file $parent_file"; WT_DB_SHARE_FILE="$parent_file"
+    WT_DB_WHY="you asked for that"
     return 0
   fi
-  case "$conn" in
-    sqlite)
-      wt_db="$(worktree_env_get "$env" DB_DATABASE)"
-      if [ "$wt_db" = ":memory:" ]; then return 0; fi
-      if [ -n "$existing" ] && [ -n "$wt_db" ] && [ "$(worktree_sqlite_path "$wt_env" "$WT_DIR")" != "$(worktree_sqlite_path "$parent_env" "$WT_PARENT_DIR")" ]; then
-        WT_DB_PLAN="own"; return 0
-      fi
-      WT_DB_PLAN="sqlite"; WT_DB_NAME="$WT_DIR/database/database.sqlite"
-      if [ "$WT_COPY" = "1" ]; then
-        [ "$parent_conn" = "sqlite" ] || die "--copy-db: $WT_PARENT's .env doesn't use sqlite, so there's nothing to copy. Nothing changed."
-        WT_DB_SRC="$(worktree_sqlite_path "$parent_env" "$WT_PARENT_DIR")"
-        [ -f "$WT_DB_SRC" ] || die "--copy-db: $WT_PARENT's sqlite file isn't there: $WT_DB_SRC. Nothing changed."
-      fi
-      return 0 ;;
-    mysql|mariadb) engine="mysql"; port="3306" ;;
-    pgsql) engine="postgres"; port="5432" ;;
-    "")
-      WT_DB_PLAN="shared"; WT_DB_WHY="its .env doesn't name a DB_CONNECTION, so vhosty can't tell what it uses"
-      return 0 ;;
-    *)
-      WT_DB_PLAN="shared"; WT_DB_WHY="vhosty doesn't manage $conn databases"
-      return 0 ;;
-  esac
+  WT_DB_PLAN="sqlite"; WT_DB_NAME="$default"
+  if [ "$WT_COPY" = "1" ]; then
+    [ "$(worktree_env_get "$WT_PARENT_DIR/.env" DB_CONNECTION)" = "sqlite" ] || die "--copy-db: $WT_PARENT's .env doesn't use sqlite, so there's nothing to copy. Nothing changed."
+    WT_DB_SRC="$parent_file"
+    [ -f "$WT_DB_SRC" ] || die "--copy-db: $WT_PARENT's sqlite file isn't there: $WT_DB_SRC. Nothing changed."
+  fi
+}
+
+# mysql, mariadb, pgsql: on a vhosty service, or somewhere else
+worktree_db_plan_server() { # worktree_db_plan_server ENV EXISTING ENGINE PORT
+  local env="$1" existing="$2" engine="$3" port="$4" parent_env="$WT_PARENT_DIR/.env"
+  local host parent_db wt_db parent_conn st name own=""
   parent_db="$(worktree_env_get "$parent_env" DB_DATABASE)"
   wt_db="$(worktree_env_get "$env" DB_DATABASE)"
-  if [ -n "$existing" ] && [ -n "$wt_db" ] && [ "$wt_db" != "$parent_db" ]; then
-    WT_DB_PLAN="own"; return 0
-  fi
   host="$(worktree_env_get "$env" DB_HOST)"
   st="$(worktree_env_get "$env" DB_PORT)"
   [ -z "$st" ] || port="$st"
+  WT_DB_WHERE="${host:-127.0.0.1}:$port, database ${wt_db:-(not set)}"
+  if [ -n "$existing" ] && [ -n "$wt_db" ] && [ "$wt_db" != "$parent_db" ]; then own=1; fi
   if [ -n "$(worktree_env_get "$env" DB_SOCKET)" ]; then
     WT_DB_PLAN="shared"; WT_DB_WHY="it connects through a socket, not vhosty's docker services"
     return 0
   fi
   case "$host" in
     ""|127.0.0.1|localhost|::1|"[::1]") ;;
-    *) WT_DB_PLAN="shared"; WT_DB_WHY="DB_HOST is $host, not vhosty's docker services"; return 0 ;;
+    *) WT_DB_PLAN="shared"; WT_DB_WHY="that isn't one of vhosty's docker services"; return 0 ;;
   esac
+  if [ "$WT_SHARE" = "1" ]; then
+    if [ -n "$own" ]; then WT_DB_PLAN="own"; WT_DB_OWN="$wt_db"
+    else WT_DB_PLAN="shared"; WT_DB_WHY="you asked for that"; fi
+    return 0
+  fi
   if [ -z "$VHOSTY_SERVICES_DIR" ]; then
     WT_DB_PLAN="shared"; WT_DB_WHY="this machine has no vhosty docker services"
     return 0
@@ -5030,10 +5150,36 @@ worktree_db_plan() {
   esac
   st="$(services_rows | awk -F'|' -v s="$WT_DB_SERVICE" '$1 == s {print $2}' || true)"
   [ "$st" = "running" ] || die "$WT_DB_SERVICE isn't running, and $WT_PARENT's database is on it. Start it: vhosty services up $WT_DB_SERVICE. Nothing changed."
-  WT_DB_PLAN="docker"; WT_DB_ENGINE="$engine"
-  WT_DB_NAME="$(worktree_db_name "$WT_NAME")"
+  WT_DB_ENGINE="$engine"
   WT_DB_USER="$(worktree_env_get "$env" DB_USERNAME)"
+  worktree_ident_ok "$parent_db" && WT_DB_PARENT_DB="$parent_db"
+  if [ -n "$own" ]; then
+    name="$wt_db"
+  else
+    name="$(worktree_db_name "$WT_NAME")"
+  fi
+  if ! worktree_ident_ok "$name"; then
+    [ -n "$own" ] || die "Couldn't make a database name for $WT_NAME. Nothing changed."
+    WT_DB_PLAN="own"; WT_DB_OWN="$name"
+    return 0
+  fi
+  st=0
+  worktree_db_exists "$engine" "$WT_DB_SERVICE" "$name" || st=$?
+  case "$st" in
+    0)
+      if [ -n "$own" ]; then WT_DB_PLAN="own"; WT_DB_OWN="$name"; return 0; fi
+      die "A database called $name is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. Drop or rename it first. Nothing changed." ;;
+    1) ;;
+    *) die "Couldn't reach the database on $WT_DB_SERVICE. Check: vhosty services logs $WT_DB_SERVICE. Nothing changed." ;;
+  esac
+  # Missing. vhosty's own name (a failed create, or a link after a remove): make it.
+  if [ -n "$own" ] && ! worktree_db_name_ok "$name"; then
+    WT_DB_PLAN="own"; WT_DB_OWN="$name"; WT_DB_MISSING="$name"
+    return 0
+  fi
+  WT_DB_PLAN="docker"; WT_DB_NAME="$name"
   if [ "$WT_COPY" = "1" ]; then
+    parent_conn="$(worktree_env_get "$parent_env" DB_CONNECTION)"
     case "$parent_conn" in
       mysql|mariadb) [ "$engine" = "mysql" ] || die "--copy-db: $WT_PARENT's .env doesn't use $engine. Nothing changed." ;;
       pgsql) [ "$engine" = "postgres" ] || die "--copy-db: $WT_PARENT's .env doesn't use $engine. Nothing changed." ;;
@@ -5043,13 +5189,48 @@ worktree_db_plan() {
     worktree_ident_ok "$parent_db" || die "--copy-db: $WT_PARENT's DB_DATABASE isn't a plain database name, so vhosty won't pass it on. Nothing changed."
     WT_DB_SRC="$parent_db"
   fi
-  st=0
-  worktree_db_exists "$engine" "$WT_DB_SERVICE" "$WT_DB_NAME" || st=$?
-  case "$st" in
-    0) die "A database called $WT_DB_NAME is already on $WT_DB_SERVICE. vhosty didn't record creating it, so it won't reuse it. Drop or rename it first. Nothing changed." ;;
-    1) ;;
-    *) die "Couldn't reach the database on $WT_DB_SERVICE. Check: vhosty services logs $WT_DB_SERVICE. Nothing changed." ;;
-  esac
+}
+
+# Reads WT_DIR, WT_PARENT, WT_PARENT_DIR, WT_NAME, WT_COPY, WT_SHARE. Dies before
+# any change. Anything the worktree would share with the parent stops here, unless
+# it's --share-db: a migration there changes the parent's data.
+worktree_db_plan() {
+  local parent_env="$WT_PARENT_DIR/.env" wt_env="$WT_DIR/.env" env existing="" conn url
+  WT_DB_PLAN="none"; WT_DB_ENGINE=""; WT_DB_SERVICE=""; WT_DB_NAME=""; WT_DB_SRC=""; WT_DB_WHY=""; WT_DB_USER=""
+  WT_DB_WHERE=""; WT_DB_SHARE_FILE=""; WT_DB_OWN=""; WT_DB_MISSING=""; WT_DB_PARENT_DB=""
+  # A link to the parent's .env gets replaced, so it doesn't count as the worktree's own
+  if [ -f "$wt_env" ] && [ ! -L "$wt_env" ]; then env="$wt_env"; existing=1
+  elif [ -f "$parent_env" ]; then env="$parent_env"
+  elif [ -f "$WT_DIR/.env.example" ]; then env="$WT_DIR/.env.example"
+  elif [ -f "$WT_PARENT_DIR/.env.example" ]; then env="$WT_PARENT_DIR/.env.example"
+  else return 0; fi
+
+  conn="$(worktree_env_get "$env" DB_CONNECTION)"
+  url="$(worktree_env_get "$env" DB_URL)"
+  [ -n "$url" ] || url="$(worktree_env_get "$env" DATABASE_URL)"
+  if [ -n "$url" ]; then
+    WT_DB_PLAN="shared"; WT_DB_WHERE="$(worktree_db_where_url "$url")"
+    WT_DB_WHY="its .env connects with a database URL, which vhosty doesn't rewrite"
+  else
+    case "$conn" in
+      sqlite) worktree_db_plan_sqlite "$env" "$existing" ;;
+      mysql|mariadb) worktree_db_plan_server "$env" "$existing" mysql 3306 ;;
+      pgsql) worktree_db_plan_server "$env" "$existing" postgres 5432 ;;
+      "")
+        # No database settings at all is nothing to share
+        if grep -qE '^[[:space:]]*(export[[:space:]]+)?DB_[A-Z_]*[[:space:]]*=' "$env"; then
+          WT_DB_PLAN="shared"; WT_DB_WHERE="$(worktree_db_where_env "$env")"
+          WT_DB_WHY="its .env doesn't name a DB_CONNECTION, so vhosty can't tell what it uses"
+        fi ;;
+      *)
+        WT_DB_PLAN="shared"; WT_DB_WHERE="$(worktree_db_where_env "$env")"
+        WT_DB_WHY="vhosty doesn't manage $conn databases" ;;
+    esac
+  fi
+  [ "$WT_DB_PLAN" = "shared" ] || return 0
+  [ "$WT_COPY" != "1" ] || die "--copy-db can't copy that database ($WT_DB_WHERE): $WT_DB_WHY. Nothing changed."
+  [ "$WT_SHARE" = "1" ] && return 0
+  die "This worktree would share $WT_PARENT's database ($WT_DB_WHERE): $WT_DB_WHY. Its migrations would change $WT_PARENT's data, so vhosty stopped. Nothing changed. If sharing it is what you want: --share-db"
 }
 
 worktree_record_db() { # worktree_record_db KIND SERVICE NAME: in the site's config, at once
@@ -5058,17 +5239,30 @@ worktree_record_db() { # worktree_record_db KIND SERVICE NAME: in the site's con
   site_save "$WT_NAME"
 }
 
+# A new database, with the parent's extensions if it's Postgres
+worktree_db_new() {
+  worktree_db_create "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_NAME" "$WT_DB_USER" || return 1
+  [ "$WT_DB_ENGINE" = "postgres" ] && [ -n "$WT_DB_PARENT_DB" ] || return 0
+  worktree_pg_extensions "$WT_DB_SERVICE" "$WT_DB_PARENT_DB" "$WT_DB_NAME" "$WT_DB_USER" \
+    || warn "couldn't create $WT_DB_PARENT_DB's extensions in $WT_DB_NAME. A migration that needs one will fail; ask for it as the database's superuser."
+  return 0
+}
+
 worktree_db_label() { # "mysql database wt_x on the mysql service", from the loaded site
+  if [ -n "$SITE_WT_DB_SHARED" ]; then
+    printf "shares %s's database (--share-db): %s" "$SITE_WT_PARENT" "$SITE_WT_DB_SHARED"
+    return 0
+  fi
   case "$SITE_WT_DB_KIND" in
     sqlite) printf 'sqlite file %s' "$SITE_WT_DB_NAME" ;;
     mysql|postgres) printf '%s database %s on the %s service' "$SITE_WT_DB_KIND" "$SITE_WT_DB_NAME" "$SITE_WT_DB_SERVICE" ;;
   esac
 }
 
-worktree_db_drop_hint() { # the command that drops a kept database, by hand
+worktree_db_drop_hint() { # the command that drops a kept database, by hand. The password stays in the container.
   case "$1" in
-    mysql) printf "vhosty services exec %s mysql -uroot -e 'DROP DATABASE \`%s\`'" "$2" "$3" ;;
-    postgres) printf "vhosty services exec %s psql -U postgres -c 'DROP DATABASE \"%s\"'" "$2" "$3" ;;
+    mysql) printf "vhosty services exec -T %s sh -c 'MYSQL_PWD=\"\${MYSQL_ROOT_PASSWORD:-\${MARIADB_ROOT_PASSWORD:-}}\" \$(command -v mysql || echo mariadb) -uroot -h127.0.0.1 -e \"DROP DATABASE \\\`%s\\\`\"'" "$2" "$3" ;;
+    postgres) printf "vhosty services exec -T %s sh -c 'PGPASSWORD=\"\$POSTGRES_PASSWORD\" psql -U \"\${POSTGRES_USER:-postgres}\" -h127.0.0.1 -d postgres -c \"DROP DATABASE \\\\\"%s\\\\\"\"'" "$2" "$3" ;;
     sqlite) printf "rm -f %q" "$3" ;;
   esac
 }
@@ -5087,22 +5281,38 @@ worktree_sqlite_copy() { # worktree_sqlite_copy FROM TO
 # Sets DB_DATABASE first: whatever else fails, the new .env never names the
 # parent's database. Failures are reported and counted, the site stays.
 worktree_db_setup() {
-  local wt_env="$WT_DIR/.env" file
+  local wt_env="$WT_DIR/.env" file blockers
   case "$WT_DB_PLAN" in
     none)
       [ "$WT_COPY" != "1" ] || warn "--copy-db did nothing: there's no database setting to copy from"
+      [ "$WT_SHARE" != "1" ] || warn "--share-db did nothing: there's no database setting to share"
       return 0 ;;
     own)
-      ok "database: kept what its .env names ($(worktree_env_get "$wt_env" DB_DATABASE))"
+      if [ -n "$WT_DB_MISSING" ]; then
+        warn "its .env names $WT_DB_MISSING, which isn't there. vhosty didn't create it, and left it. The app won't connect until it exists."
+      else
+        ok "database: kept what its .env names ($WT_DB_OWN)"
+      fi
       [ "$WT_COPY" != "1" ] || warn "--copy-db did nothing: the worktree already has a database of its own"
+      [ "$WT_SHARE" != "1" ] || warn "--share-db did nothing: the worktree already has a database of its own"
       return 0 ;;
     shared)
-      warn "${B}This worktree SHARES $WT_PARENT's database${N}: $WT_DB_WHY."
-      warn "Its .env keeps $WT_PARENT's settings, so migrations here change $WT_PARENT's data."
-      [ "$WT_COPY" != "1" ] || warn "--copy-db did nothing: there's no separate database to copy into."
+      # sqlite's default path is inside each checkout, so sharing has to name the file
+      [ -z "$WT_DB_SHARE_FILE" ] || worktree_env_set "$wt_env" DB_DATABASE "$WT_DB_SHARE_FILE"
+      site_load "$WT_NAME"
+      SITE_WT_DB_SHARED="$WT_DB_WHERE"
+      site_save "$WT_NAME"
+      warn "${B}This worktree SHARES $WT_PARENT's database${N} ($WT_DB_WHERE), as --share-db asks."
+      warn "Its migrations change $WT_PARENT's data."
       return 0 ;;
     sqlite)
       file="$WT_DB_NAME"
+      # The checkout itself could have made database/ a link
+      if [ -d "${file%/*}" ] && ! worktree_file_inside "$file" "$WT_DIR"; then
+        bad "database/ in the worktree is a link out of it, so vhosty won't put a database there, or run composer against its .env. To share that database on purpose: vhosty worktree link $(printf '%q' "$WT_DIR") --share-db"
+        WT_FAILED=1; WT_INSTALL=0
+        return 0
+      fi
       mkdir -p "${file%/*}"
       worktree_env_set "$wt_env" DB_DATABASE "$file"
       if [ -e "$file" ]; then
@@ -5133,9 +5343,9 @@ worktree_db_setup() {
     warn "DB_USERNAME isn't a plain name, so vhosty didn't give it access to $WT_DB_NAME: do that yourself"
     WT_DB_USER=""
   fi
-  if ! worktree_db_create "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_NAME" "$WT_DB_USER"; then
+  if ! worktree_db_new; then
     bad "couldn't create $WT_DB_NAME on $WT_DB_SERVICE. The worktree's .env names it, so the app won't connect until it exists."
-    info "Check: vhosty services logs $WT_DB_SERVICE. Then: vhosty worktree remove $WT_NAME, and try again."
+    info "Check: vhosty services logs $WT_DB_SERVICE. Then run again: vhosty worktree link $(printf '%q' "$WT_DIR")"
     WT_FAILED=1
     return 0
   fi
@@ -5145,13 +5355,26 @@ worktree_db_setup() {
     WT_DB_EMPTY=1
     return 0
   fi
+  if [ "$WT_DB_ENGINE" = "mysql" ]; then
+    if ! blockers="$(worktree_mysql_copy_blockers "$WT_DB_SERVICE" "$WT_DB_SRC")"; then
+      bad "couldn't check $WT_DB_SRC's triggers, routines and events, so vhosty didn't copy it. $WT_DB_NAME stays empty."
+      WT_FAILED=1; WT_DB_EMPTY=1
+      return 0
+    fi
+    if [ -n "$blockers" ]; then
+      bad "not copying $WT_DB_SRC: these name it directly, so in a copy they'd still write to $WT_DB_SRC: $(printf '%s' "$blockers" | tr '\n' ',' | sed -e 's/,/, /g'). $WT_DB_NAME stays empty."
+      info "Drop the database name from them, and try again."
+      WT_FAILED=1; WT_DB_EMPTY=1
+      return 0
+    fi
+  fi
   info "copying $WT_DB_SRC to $WT_DB_NAME (read only on $WT_DB_SRC)"
   if worktree_db_copy "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_SRC" "$WT_DB_NAME" "$WT_DB_USER"; then
     ok "database: $WT_DB_NAME, a copy of $WT_DB_SRC"
     return 0
   fi
   WT_FAILED=1
-  if worktree_db_drop "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_NAME" && worktree_db_create "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_NAME" "$WT_DB_USER"; then
+  if worktree_db_drop "$WT_DB_ENGINE" "$WT_DB_SERVICE" "$WT_DB_NAME" && worktree_db_new; then
     bad "copying $WT_DB_SRC failed, and $WT_DB_SRC wasn't changed. $WT_DB_NAME starts empty instead."
     WT_DB_EMPTY=1
   else
@@ -5180,11 +5403,36 @@ worktree_env_setup() {
   fi
   worktree_env_set "$wt_env" APP_URL "$url"
   ok ".env from $WT_ENV_FROM, APP_URL=$url"
+  worktree_env_isolate
+}
+
+# Redis keys, the cache and queue jobs would otherwise be the parent's: Laravel
+# takes both prefixes from APP_NAME, which the copy shares. A value that isn't
+# the parent's is the worktree's own already, and stays. A prefix can't stop one
+# thing, which worktree_env_warnings says: cache:clear flushes the whole Redis
+# database, whatever the prefix.
+worktree_env_isolate() {
+  local wt_env="$WT_DIR/.env" parent_env="$WT_PARENT_DIR/.env" kv key suffix cur set_any=""
+  for kv in REDIS_PREFIX:-database- CACHE_PREFIX:-cache-; do
+    key="${kv%%:*}"; suffix="${kv#*:}"
+    cur="$(worktree_env_get "$wt_env" "$key")"
+    if [ -z "$cur" ] || [ "$cur" = "$(worktree_env_get "$parent_env" "$key")" ]; then
+      worktree_env_set "$wt_env" "$key" "$WT_NAME$suffix"
+      set_any=1
+    fi
+  done
+  [ -z "$set_any" ] || ok "REDIS_PREFIX and CACHE_PREFIX are its own, so it can't overwrite $WT_PARENT's keys, or take its queue jobs"
+  # A cookie for the parent's domain would be sent across the parent's sites
+  cur="$(worktree_env_get "$wt_env" SESSION_DOMAIN)"
+  if [ -n "$cur" ] && [ "$cur" != "null" ] && [ "$cur" = "$(worktree_env_get "$parent_env" SESSION_DOMAIN)" ]; then
+    worktree_env_set "$wt_env" SESSION_DOMAIN null
+    ok "SESSION_DOMAIN cleared, so its cookies aren't shared across $WT_PARENT's sites"
+  fi
 }
 
 # What a copied .env still shares with the parent. Names only: values can be secrets.
 worktree_env_warnings() {
-  local wt_env="$WT_DIR/.env" keys k rp
+  local wt_env="$WT_DIR/.env" keys shared
   [ -f "$wt_env" ] || return 0
   # Not the worktree's own address, which ends in the parent's name and domain
   keys="$(WT_HOST="$WT_PARENT.$VHOSTY_DOMAIN" awk -F= '
@@ -5196,14 +5444,26 @@ worktree_env_warnings() {
       }
     }' "$wt_env")"
   [ -z "$keys" ] || warn "these .env settings still name $WT_PARENT's address: ${keys% }"
-  for k in CACHE_STORE CACHE_DRIVER SESSION_DRIVER QUEUE_CONNECTION; do
-    [ "$(worktree_env_get "$wt_env" "$k")" = "redis" ] || continue
-    rp="$(worktree_env_get "$wt_env" REDIS_PREFIX)"
-    if [ -z "$rp" ] || [ "$rp" = "$(worktree_env_get "$WT_PARENT_DIR/.env" REDIS_PREFIX)" ]; then
-      warn "$k is redis, on the same keys as $WT_PARENT unless you set REDIS_PREFIX in the worktree's .env"
-    fi
-    break
-  done
+  # The riskier things a copied .env still shares, once, by name
+  shared="$(awk '
+    function add(x) { if (!(x in seen)) { seen[x] = 1; out = out (out == "" ? "" : ", ") x } }
+    /^[ \t]*#/ { next }
+    {
+      l = $0; sub(/^[ \t]*(export[ \t]+)?/, "", l); i = index(l, "="); if (!i) next
+      k = substr(l, 1, i - 1); sub(/[ \t]+$/, "", k)
+      v = substr(l, i + 1); gsub(/^[ \t"\047]+|[ \t"\047\r]+$/, "", v)
+      if (v == "" || v == "null") next
+      if (k == "APP_ENV") { if (v == "production") add("APP_ENV (production)") }
+      else if (k == "FILESYSTEM_DISK") { if (v == "s3") add("FILESYSTEM_DISK (s3)") }
+      else if (k == "AWS_BUCKET") add(k)
+      else if (k ~ /^(STRIPE|PLAID|PADDLE|BRAINTREE|TWILIO|POSTMARK|MAILGUN|RESEND|OPENAI|ANTHROPIC)_/) { sub(/_.*/, "_*", k); add(k) }
+      else if (k ~ /^DB_.+_DATABASE$/) add(k)
+    }
+    END { print out }' "$wt_env")"
+  [ -z "$shared" ] || warn "still shared with $WT_PARENT, as its .env has them: $shared"
+  if [ "$(worktree_env_get "$wt_env" CACHE_STORE)" = redis ] || [ "$(worktree_env_get "$wt_env" CACHE_DRIVER)" = redis ]; then
+    warn "php artisan cache:clear here empties all of that Redis cache database, $WT_PARENT's cache too: prefixes don't cover that. A REDIS_CACHE_DB of its own does."
+  fi
 }
 
 # ---- Everything `add` and `link` share. Reads the WT_* globals.
@@ -5307,18 +5567,19 @@ cmd_worktree_list() {
     printf "    %s%s, worktree of %s%s, %s%s\n" "$D" "${SITE_WT_BRANCH:-detached}" "$parent_note" "" "$SITE_WT_KIND" "$N"
     if [ -d "$SITE_PATH" ]; then printf "    %s%s%s\n" "$D" "$SITE_PATH" "$N"
     else printf "    %s%s is gone. Run: vhosty worktree remove %s%s\n" "$R" "$SITE_PATH" "$name" "$N"; fi
-    if [ -n "$SITE_WT_DB_KIND" ]; then printf "    %s%s%s\n" "$D" "$(worktree_db_label)" "$N"; fi
+    if [ -n "$SITE_WT_DB_KIND$SITE_WT_DB_SHARED" ]; then printf "    %s%s%s\n" "$D" "$(worktree_db_label)" "$N"; fi
   done
   [ "$any" = "1" ] || info "No worktree sites. Make one with: vhosty worktree add <branch>, or: vhosty worktree link [dir]"
 }
 
 cmd_worktree_add() {
-  local usage="Usage: vhosty worktree add <branch> [--copy-db] [--no-install] [--site S] [--path DIR]"
+  local usage="Usage: vhosty worktree add <branch> [--copy-db | --share-db] [--no-install] [--site S] [--path DIR]"
   local branch="" site="" path="" name repo top out remote_ref count
-  WT_COPY=0; WT_INSTALL=1; WT_KIND="created"; WT_NEED_INSTALL=""
+  WT_COPY=0; WT_SHARE=0; WT_INSTALL=1; WT_KIND="created"; WT_NEED_INSTALL=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --copy-db) WT_COPY=1; shift ;;
+      --share-db) WT_SHARE=1; shift ;;
       --no-install) WT_INSTALL=0; shift ;;
       --site) [ -n "${2:-}" ] || die "--site needs a site name"; site="$2"; shift 2 ;;
       --path) [ -n "${2:-}" ] || die "--path needs a folder"; path="$2"; shift 2 ;;
@@ -5328,6 +5589,7 @@ cmd_worktree_add() {
     esac
   done
   [ -n "$branch" ] || die "$usage"
+  [ "$WT_COPY$WT_SHARE" != "11" ] || die "--copy-db and --share-db ask for opposite things. Pick one."
   command -v git >/dev/null 2>&1 || die "This needs git"
   # Branch names are untrusted from here on: git's rules still allow quotes, ; and $()
   case "$branch" in -*|*@\{*) die "'$branch' isn't a valid git branch name" ;; esac
@@ -5380,7 +5642,7 @@ cmd_worktree_add() {
   # An existing local or remote branch is checked out; a new name starts at HEAD.
   mkdir -p "${path%/*}"
   if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
-    out="$(git -C "$repo" worktree add -- "$path" "$branch" 2>&1)" || worktree_add_failed "$branch" "$path" "$out"
+    out="$(LC_ALL=C git -C "$repo" worktree add -- "$path" "$branch" 2>&1)" || worktree_add_failed "$repo" "$path" "$out"
     info "checked out the existing branch $branch"
   else
     remote_ref="$(git -C "$repo" for-each-ref --format='%(refname:short)' "refs/remotes/*/$branch")"
@@ -5391,10 +5653,10 @@ cmd_worktree_add() {
       count=1
     fi
     if [ "$count" = "1" ]; then
-      out="$(git -C "$repo" worktree add --track -b "$branch" -- "$path" "$remote_ref" 2>&1)" || worktree_add_failed "$branch" "$path" "$out"
+      out="$(LC_ALL=C git -C "$repo" worktree add --track -b "$branch" -- "$path" "$remote_ref" 2>&1)" || worktree_add_failed "$repo" "$path" "$out"
       info "checked out $branch from $remote_ref"
     else
-      out="$(git -C "$repo" worktree add -b "$branch" -- "$path" HEAD 2>&1)" || worktree_add_failed "$branch" "$path" "$out"
+      out="$(LC_ALL=C git -C "$repo" worktree add -b "$branch" -- "$path" HEAD 2>&1)" || worktree_add_failed "$repo" "$path" "$out"
       info "new branch $branch, from the HEAD of $repo"
     fi
   fi
@@ -5407,26 +5669,32 @@ cmd_worktree_add() {
   worktree_setup
 }
 
-worktree_add_failed() { # worktree_add_failed BRANCH PATH GIT_OUTPUT
+worktree_add_failed() { # worktree_add_failed REPO PATH GIT_OUTPUT
   case "$2" in
     "$VHOSTY_DIR/worktrees/"*) rmdir "$2" "${2%/*}" 2>/dev/null || true ;;
+  esac
+  case "$3" in
+    *"missing but already registered"*)
+      die "git still lists a worktree at $2, whose folder is gone. Nothing was set up. To make git forget the missing folders in this repository, run: git -C $(printf '%q' "$1") worktree prune (vhosty doesn't, as it affects every worktree there). Then run this again." ;;
   esac
   die "git wouldn't make that worktree. Nothing was set up.
 $3"
 }
 
 cmd_worktree_link() {
-  local usage="Usage: vhosty worktree link [dir] [--copy-db] [--no-install]"
+  local usage="Usage: vhosty worktree link [dir] [--copy-db | --share-db] [--no-install]"
   local arg="" given top git_dir common main name
-  WT_COPY=0; WT_INSTALL=1; WT_KIND="adopted"; WT_NEED_INSTALL=""
+  WT_COPY=0; WT_SHARE=0; WT_INSTALL=1; WT_KIND="adopted"; WT_NEED_INSTALL=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --copy-db) WT_COPY=1; shift ;;
+      --share-db) WT_SHARE=1; shift ;;
       --no-install) WT_INSTALL=0; shift ;;
       -*) die "Unknown option '$1'. $usage" ;;
       *) [ -z "$arg" ] || die "$usage"; arg="$1"; shift ;;
     esac
   done
+  [ "$WT_COPY$WT_SHARE" != "11" ] || die "--copy-db and --share-db ask for opposite things. Pick one."
   command -v git >/dev/null 2>&1 || die "This needs git"
   arg="${arg:-$PWD}"
   [ -d "$arg" ] || die "No such folder: $arg"
@@ -5448,6 +5716,7 @@ cmd_worktree_link() {
     if [ "$SITE_PATH" = "$top" ] || { [ -n "$SITE_PATH" ] && [ "$(worktree_real "$SITE_PATH" || true)" = "$top" ]; }; then
       if [ -n "$SITE_WT_KIND" ]; then
         ok "$top is already the worktree site https://$name.$VHOSTY_DOMAIN"
+        worktree_relink_db "$name" "$top"
         return 0
       fi
       die "$top is already the site '$name'. Run: vhosty unlink $name, then this again."
@@ -5471,10 +5740,114 @@ cmd_worktree_link() {
   worktree_setup
 }
 
+# Linked again: a site with no database on record may be missing one it should
+# have (a create that failed). One with a record has what it needs.
+worktree_relink_db() { # worktree_relink_db NAME DIR
+  [ -z "$SITE_WT_DB_KIND$SITE_WT_DB_SHARED" ] || return 0
+  WT_NAME="$1"; WT_DIR="$2"; WT_FAILED=0; WT_DB_EMPTY=""
+  worktree_db_plan
+  case "$WT_DB_PLAN" in
+    docker|sqlite|shared) worktree_db_setup ;;
+    own) [ -z "$WT_DB_MISSING" ] || worktree_db_setup ;;
+  esac
+  [ "$WT_FAILED" = "0" ] || die "$WT_NAME still has the failures above."
+  [ -z "$WT_DB_EMPTY" ] || info "Next, in $(printf '%q' "$WT_DIR"): php artisan migrate --seed"
+}
+
+# What still uses a database about to be dropped: the parent's .env under any
+# key and value, every other site's and worktree's .env, and other sites' records.
+# The parent's has to be readable: not being able to tell isn't the same as no.
+worktree_parent_envs() { # worktree_parent_envs PARENT REPO → its .env files; fails if it can't tell
+  local d seen=0 parent_dir=""
+  parent_dir="$(site_dir "$1" || true)"
+  for d in "$2" "$parent_dir"; do
+    [ -n "$d" ] && [ -d "$d" ] || continue
+    seen=1
+    if [ -e "$d/.env" ] || [ -L "$d/.env" ]; then
+      [ -r "$d/.env" ] || return 1
+      printf '%s\n' "$d/.env"
+    fi
+  done
+  [ "$seen" = "1" ]
+}
+
+worktree_other_envs() { # worktree_other_envs SELF REPO: the .env of everything else that could use it
+  local name d p
+  {
+    for name in $(site_names); do
+      [ "$name" != "$1" ] || continue
+      d="$(site_dir "$name" || true)"
+      [ -z "$d" ] || printf '%s\n' "$d/.env"
+    done
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      for d in "$p"/*/; do printf '%s\n' "${d%/}/.env"; done
+    done <<EOF
+$(parked_list)
+EOF
+    [ ! -d "$2" ] || git -C "$2" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree \(.*\)$/\1\/.env/p' || true
+  } | sort -u
+}
+
+worktree_db_still_used() { # worktree_db_still_used TOKEN SELF DIR PARENT REPO: says why, and returns 0
+  local token="$1" self="$2" dir="$3" envs f keys name own
+  own="$(worktree_real "$dir" || true)"
+  if ! envs="$(worktree_parent_envs "$4" "$5")"; then
+    echo "$4's .env can't be read (is its folder moved?), so vhosty can't tell whether it still uses it"
+    return 0
+  fi
+  envs="$envs
+$(worktree_other_envs "$self" "$5")"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    # Only the folder itself is its own: a .env can be a link to the parent's
+    [ -z "$own" ] || [ "$(worktree_real "${f%/*}" || true)" != "$own" ] || continue
+    if [ ! -r "$f" ]; then
+      echo "$f can't be read, so vhosty can't tell whether that uses it"
+      return 0
+    fi
+    keys="$(worktree_env_keys_naming "$f" "$token")"
+    if [ -n "$keys" ]; then
+      echo "$f still names it ($keys)"
+      return 0
+    fi
+    # ${VAR} in the settings that pick a database could come to anything
+    if grep -qE '^[[:space:]]*(export[[:space:]]+)?(DB_DATABASE|DB_URL|DATABASE_URL)[[:space:]]*=.*[$]' "$f"; then
+      echo "$f builds its database name from a variable, so vhosty can't tell whether that's this one"
+      return 0
+    fi
+  done <<EOF
+$envs
+EOF
+  for name in $(site_names); do
+    [ "$name" != "$self" ] || continue
+    site_load "$name"
+    if [ "$SITE_WT_DB_NAME" = "$token" ]; then
+      echo "the site $name records it too"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Git's reason, and what to do about it. Never --force from here.
+worktree_remove_refused() { # worktree_remove_refused REPO DIR GIT_OUTPUT NAME
+  printf '%s\n' "$3" >&2
+  git -C "$2" status --short 2>/dev/null | sed -e 's/^/  /' >&2 || true
+  case "$3" in
+    *"containing submodules"*)
+      die "$2 has submodules, and git only removes those with --force, which vhosty never uses. Nothing was removed: not the site, the database or the branch. If there's nothing to keep there, run: git -C $(printf '%q' "$1") worktree remove --force $(printf '%q' "$2"), then: vhosty worktree remove $4" ;;
+    *"locked working tree"*)
+      die "$2 is locked. Nothing was removed: not the site, the database or the branch. If that's out of date, run: git -C $(printf '%q' "$1") worktree unlock $(printf '%q' "$2"), then: vhosty worktree remove $4" ;;
+  esac
+  die "git wouldn't remove $2: it has uncommitted or untracked files. Nothing was removed: not the site, the database or the branch. Commit or clean up what's there, then run this again."
+}
+
 cmd_worktree_remove() {
   local usage="Usage: vhosty worktree remove <name> [--yes] [--keep-db]"
   local name="" yes=0 keep=0 kind parent repo dir db_kind db_service db_name label=""
-  local octane out st drop=0 kept_copy="" parent_db
+  local octane out st drop=0 hint="" why kept_tmp="" kept_final="" i
   while [ $# -gt 0 ]; do
     case "$1" in
       -y|--yes) yes=1; shift ;;
@@ -5492,6 +5865,10 @@ cmd_worktree_remove() {
   kind="$SITE_WT_KIND"; parent="$SITE_WT_PARENT"; repo="$SITE_WT_REPO"; dir="$SITE_PATH"; octane="$SITE_OCTANE"
   db_kind="$SITE_WT_DB_KIND"; db_service="$SITE_WT_DB_SERVICE"; db_name="$SITE_WT_DB_NAME"
   [ -z "$db_kind" ] || label="$(worktree_db_label)"
+  [ -z "$db_kind" ] || hint="$(worktree_db_drop_hint "$db_kind" "$db_service" "$db_name")"
+  # You may be standing in the folder that's about to go, and docker compose
+  # won't run from a folder that's gone
+  cd "$VHOSTY_DIR" 2>/dev/null || cd /
 
   # What's recorded has to look like what vhosty creates, whatever the file says now
   if [ -n "$db_kind" ] && [ "$keep" != "1" ]; then
@@ -5499,9 +5876,9 @@ cmd_worktree_remove() {
       mysql|postgres)
         worktree_db_name_ok "$db_name" && [ -n "$db_service" ] \
           || die "The site's config records database '$db_name', which isn't a name vhosty gives its own. Not dropping it, and nothing removed. To remove the site without it: --keep-db"
-        parent_db="$(worktree_env_get "$repo/.env" DB_DATABASE)"
-        [ "$parent_db" != "$db_name" ] \
-          || die "$db_name is the database $parent's .env uses. Not dropping it, and nothing removed. To remove the site without it: --keep-db"
+        if why="$(worktree_db_still_used "$db_name" "$name" "$dir" "$parent" "$repo")"; then
+          die "Not dropping $db_name: $why. Nothing removed. To remove the site and leave the database: --keep-db. To drop it by hand once you're sure: $hint"
+        fi
         st="$( ( need_services ) 2>&1 | sed 's/^error: //' || true )"
         [ -z "$st" ] || die "Can't reach $db_service to drop $db_name: $st. Nothing removed. To remove the site and leave the database: --keep-db"
         st=0
@@ -5517,7 +5894,19 @@ cmd_worktree_remove() {
           "$dir"/*) ;;
           *) die "The site's config records the sqlite file '$db_name', outside its folder. Not deleting it, and nothing removed. To remove the site without it: --keep-db" ;;
         esac
-        if [ -f "$db_name" ] && [ ! -L "$db_name" ]; then drop=1; fi ;;
+        if [ -e "$db_name" ] || [ -L "$db_name" ]; then
+          # database/ or the file could have become a link since: to the parent's, say
+          if [ -L "$db_name" ] || ! worktree_file_inside "$db_name" "$dir"; then
+            die "$db_name is a link, or reached through one, to $(worktree_real_file "$db_name"), so it isn't the file vhosty made. Not deleting it, and nothing removed. To remove the site without it: --keep-db"
+          fi
+          if worktree_same_file "$db_name" "$(worktree_sqlite_path "$repo/.env" "$repo")"; then
+            die "$db_name is the file $parent's .env uses. Not deleting it, and nothing removed. To remove the site without it: --keep-db"
+          fi
+          if why="$(worktree_db_still_used "$db_name" "$name" "$dir" "$parent" "$repo")"; then
+            die "Not deleting $db_name: $why. Nothing removed. To remove the site and leave the file: --keep-db. To delete it by hand once you're sure: $hint"
+          fi
+          drop=1
+        fi ;;
       *) die "The site's config records a database of kind '$db_kind', which vhosty doesn't create. Nothing removed. To remove the site without it: --keep-db" ;;
     esac
   fi
@@ -5529,18 +5918,16 @@ cmd_worktree_remove() {
   # The folder. No --force: uncommitted work stops everything right here
   if [ "$kind" = "created" ] && [ -d "$dir" ]; then
     [ -d "$repo" ] || die "$repo, the repository $dir belongs to, is gone, so git can't remove it. vhosty won't delete it by hand. Nothing removed. Move what you need out and delete the folder, then run this again."
-    # --keep-db, on a file that's about to go with the folder
-    if [ "$keep" = "1" ] && [ "$db_kind" = "sqlite" ] && [ -f "$db_name" ]; then
-      kept_copy="$VHOSTY_DIR/worktrees/$name.sqlite"
-      cp -p "$db_name" "$kept_copy"
-      [ ! -f "$db_name-wal" ] || cp -p "$db_name-wal" "$kept_copy-wal"
+    # --keep-db on a file that goes with the folder: a private copy until git has
+    # said yes, only then a name of its own. Nothing that's already there is touched.
+    if [ "$keep" = "1" ] && [ "$db_kind" = "sqlite" ] && [ -f "$db_name" ] && [ ! -L "$db_name" ] && worktree_file_inside "$db_name" "$dir"; then
+      mkdir -p "$VHOSTY_DIR/worktrees"
+      kept_tmp="$(mktemp "$VHOSTY_DIR/worktrees/.$name.XXXXXX")"
+      add_tmp "$kept_tmp"; add_tmp "$kept_tmp-wal"
+      cp -p "$db_name" "$kept_tmp"
+      [ ! -f "$db_name-wal" ] || cp -p "$db_name-wal" "$kept_tmp-wal"
     fi
-    if ! out="$(git -C "$repo" worktree remove -- "$dir" 2>&1)"; then
-      [ -z "$kept_copy" ] || rm -f "$kept_copy" "$kept_copy-wal"
-      printf '%s\n' "$out" >&2
-      git -C "$dir" status --short 2>/dev/null | sed -e 's/^/  /' >&2 || true
-      die "git wouldn't remove $dir (uncommitted or untracked files, or it's locked). Nothing was removed: not the site, the database or the branch. Commit or clean up what's there, then run this again."
-    fi
+    out="$(LC_ALL=C git -C "$repo" worktree remove -- "$dir" 2>&1)" || worktree_remove_refused "$repo" "$dir" "$out" "$name"
     ok "removed the worktree $dir (the branch stays)"
     rmdir "$VHOSTY_DIR/worktrees/$parent" 2>/dev/null || true
   elif [ "$kind" = "created" ]; then
@@ -5556,16 +5943,21 @@ cmd_worktree_remove() {
   # Octane holds database connections, and Postgres won't drop a database in use
   if [ -n "$octane" ] && svc_installed; then svc_stop "octane-$name" || true; fi
 
-  if [ "$keep" = "1" ] && [ "$db_kind" = "sqlite" ] && [ -z "$kept_copy" ] && [ ! -f "$db_name" ]; then
+  if [ -n "$kept_tmp" ]; then
+    kept_final="$VHOSTY_DIR/worktrees/$name.sqlite"; i=1
+    while [ -e "$kept_final" ] || [ -L "$kept_final" ] || [ -e "$kept_final-wal" ]; do
+      i=$((i + 1))
+      kept_final="$VHOSTY_DIR/worktrees/$name.$i.sqlite"
+    done
+    mv "$kept_tmp" "$kept_final"
+    [ ! -f "$kept_tmp-wal" ] || mv "$kept_tmp-wal" "$kept_final-wal"
+    ok "kept the sqlite file, now at $kept_final"
+    info "vhosty forgets about it now. To delete it: rm -f $(printf '%q' "$kept_final")"
+  elif [ "$keep" = "1" ] && [ "$db_kind" = "sqlite" ] && [ ! -f "$db_name" ]; then
     info "the sqlite file went with the folder"
   elif [ "$keep" = "1" ] && [ -n "$db_kind" ]; then
-    if [ -n "$kept_copy" ]; then
-      ok "kept the sqlite file, now at $kept_copy"
-      info "vhosty forgets about it now. To delete it: rm -f $(printf '%q' "$kept_copy")"
-    else
-      ok "kept the $label"
-      info "vhosty forgets about it now. To drop it: $(worktree_db_drop_hint "$db_kind" "$db_service" "$db_name")"
-    fi
+    ok "kept the $label"
+    info "vhosty forgets about it now. To drop it: $hint"
   elif [ "$drop" = "1" ]; then
     case "$db_kind" in
       sqlite)
@@ -5578,7 +5970,7 @@ cmd_worktree_remove() {
           # The record stays, so running this again can still drop it
           cmd_rebuild
           bad "couldn't drop the $label. It's still there, and the site's config still records it."
-          die "Check: vhosty services logs $db_service. Then run again: vhosty worktree remove $name (or --keep-db, and it's yours to drop: $(worktree_db_drop_hint "$db_kind" "$db_service" "$db_name"))"
+          die "Check: vhosty services logs $db_service. Then run again: vhosty worktree remove $name (or --keep-db, and it's yours to drop: $hint)"
         fi ;;
     esac
   fi
@@ -5889,6 +6281,7 @@ doctor_checks() {
     elif [ -z "$dir" ] || [ ! -d "$dir" ]; then
       bad "site $name: folder ${dir:-?} is gone. Remove its config: vhosty prune"
     fi
+    [ -z "$SITE_WT_DB_SHARED" ] || warn "worktree site $name $(worktree_db_label)"
     if [ -n "$SITE_PHP" ] && ! php_is_installed "$SITE_PHP"; then
       bad "site $name is pinned to PHP $SITE_PHP, which isn't installed (using $(php_default)). Run: vhosty php install $SITE_PHP"
     fi
@@ -6025,10 +6418,11 @@ ${B}Sites${N}
 
 ${B}Git worktrees${N} ${D}(each its own <branch>--<site>.domain, .env and database)${N}
   vhosty worktree [list]             List worktree sites
-  vhosty worktree add <branch> [--copy-db] [--no-install] [--site S] [--path DIR]
+  vhosty worktree add <branch> [--copy-db | --share-db] [--no-install] [--site S] [--path DIR]
                                      Make a git worktree and its site, from the site you're in. Its database
-                                     starts empty; --copy-db clones the parent's (docker services and sqlite)
-  vhosty worktree link [dir] [--copy-db] [--no-install]
+                                     starts empty; --copy-db clones the parent's (docker services and sqlite).
+                                     A database elsewhere stops it, unless --share-db says to share that
+  vhosty worktree link [dir] [--copy-db | --share-db] [--no-install]
                                      Give an existing worktree the same setup (default: current folder)
   vhosty worktree remove <name> [--yes] [--keep-db]
                                      Remove the site and the database vhosty made; git removes the folder

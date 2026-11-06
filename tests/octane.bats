@@ -244,7 +244,7 @@ error_reporting=E_ALL & ~E_NOTICE'"
   site_conf escrow "SITE_OCTANE=21000"
   vh write_configs
   [ "$(grep -c '^memory_limit = -1$' "$VHOSTY_DIR/octane/escrow/vhosty.ini")" = 1 ]
-  ! grep -q '^ *=' "$VHOSTY_DIR/octane/escrow/vhosty.ini"
+  refute grep -q '^ *=' "$VHOSTY_DIR/octane/escrow/vhosty.ini"
 }
 
 @test "the settings of a site no longer on Octane are removed" {

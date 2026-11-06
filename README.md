@@ -12,6 +12,7 @@ domain, reachable from your phone, laptop, or any device on your
 ~/Sites/myspace    →  https://myspace.yourdomain.dev
 ~/Sites/geocities  →  https://geocities.yourdomain.dev
 localhost:5173     →  https://5173.yourdomain.dev
+localhost:3001     →  https://grafana.yourdomain.dev
 ```
 
 - Real HTTPS: a trusted Let's Encrypt wildcard certificate, with no browser warnings and no local CA to install.
@@ -28,6 +29,7 @@ Runs on **Linux** (systemd) and **macOS** (launchd).
 your phone ──tailnet──▶ dev box (100.x.y.z)
                          └─ Tailscale Serve :443 ─▶ Caddy 127.0.0.1:48443   *.yourdomain.dev, wildcard cert
                               ├─ <port>.yourdomain.dev  → localhost:<port>
+                              ├─ <name>.yourdomain.dev  → localhost:<port> (vhosty proxy)
                               ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
                               ├─ <site>.yourdomain.dev  → Laravel Octane on a local port (vhosty octane on)
                               └─ <site>.yourdomain.dev  → static (site/index.html)
@@ -299,9 +301,10 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 |---|---|
 | `vhosty park [dir]` / `unpark [dir]` | Serve, or stop serving, every folder inside `dir`. Park as many as you like |
 | `vhosty link [dir] [--name N]` / `unlink [name]` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
+| `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
 | `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
 | `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
-| `vhosty open [site\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
+| `vhosty open [site\|proxy\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
 | `vhosty php [list\|install\|default\|which]` | PHP versions |
 | `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
 | `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
@@ -339,9 +342,34 @@ localhost, like an admin console or a search engine, stay private to it. To open
 another, add it in `~/.vhosty/config` (`VHOSTY_PORTS="3000-5999 6006 8000-8099 8888 9001"`)
 and run `vhosty rebuild`.
 
+For an address that stays the same, give a port a name. It's for what isn't a PHP
+site: a Node app, Grafana, anything that speaks plain HTTP on this machine.
+
+```bash
+vhosty proxy grafana 3001       # https://grafana.yourdomain.dev → localhost:3001
+vhosty proxies                  # vhosty sites lists them too
+vhosty unproxy grafana
+```
+
+- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to your tailnet.
+- Websockets and server-sent events work. A `vhosty rebuild` drops open websockets,
+  so they have to reconnect. The app sees its real `Host`, plus
+  `X-Forwarded-Host`, `-Proto` and `-For`, so one that checks the host (Vite's
+  `server.allowedHosts`) or builds links from it may need telling.
+- A name that's already a site (parked, linked or on Octane) is refused, as is one
+  that's only numbers. A parked folder with nothing to serve doesn't count, so a Node
+  app in `~/Sites/shop` can run its server as `vhosty proxy shop 3000`. If a folder
+  there later becomes servable under the same name, the proxy keeps the name and
+  `vhosty sites` and `doctor` say so.
+- Nothing listening is normal for a dev server: `doctor` warns rather than fails, and
+  the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
+  stop the app.
+- Run it again with another port to move it. With [Herd](#with-laravel-herd-macos),
+  use the port route instead.
+
 When something isn't there, vhosty says what and why instead of showing a blank
 page: a name with no site lists the paths it checked and links to your sites; a
-port with nothing listening, or a PHP version that's down, shows what to run and
+port or proxy with nothing listening, or a PHP version that's down, shows what to run and
 reloads every 2 seconds until it comes up. Errors from your app itself (Laravel's
 500s, missing assets) pass through untouched.
 
@@ -479,6 +507,7 @@ For nightly backups, run it from cron or a systemd timer:
 ├── config                 domain, parked folders, default PHP, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
+├── proxies/<name>.conf    one per named proxy (vhosty proxy): its port
 ├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
 ├── error.html             generated: the page for "no site", and PHP or a dev server down
@@ -531,7 +560,7 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 | Works on one network but not another | Some routers and DNS filters (Pi-hole, NextDNS) block public names that resolve to private IPs. Allowlist your domain there. |
 | "No site called …" (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
 | 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
-| 502 on a port site | Nothing is listening on that port, or it only listens on another interface. |
+| 502 on a port site or a proxy | Nothing is listening on that port, or it only listens on another interface. |
 | A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |
 | Sites stopped working after pairing an app over Tailscale (T3 Code, say) | It published itself on Tailscale Serve's port 443, vhosty's. `vhosty doctor` says what it is and how to move it to another port (`tailscale serve --bg --https=8443 …`); then `vhosty rebuild`. |
 | Site can't be reached from other devices | Tailscale Serve isn't forwarding to Caddy. `vhosty doctor` checks it; `vhosty rebuild` sets it up again. |

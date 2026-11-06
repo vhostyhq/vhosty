@@ -415,6 +415,7 @@ herd_refuse() {
     php) alt="herd use, or Herd's PHP settings" ;;
     ini|ext|exts|extension|extensions) alt="Herd's PHP settings" ;;
     octane) alt="php artisan octane:start, reached at https://<port>.<domain>" ;;
+    proxy|unproxy|proxies) alt="the port route, https://<port>.<domain>" ;;
     *) return 0 ;;
   esac
   die "Herd serves the sites on this machine (VHOSTY_BACKEND=herd), so this is Herd's job. Use: $alt"
@@ -1334,7 +1335,7 @@ octane_watches() {
 octane_free_port() {
   local p="$OCTANE_FIRST_PORT" used
   # With the settings `vhosty link` set aside: unlink brings their port back
-  used=" $(cat "$SITES_DIR"/*.conf "$SITES_DIR"/*.conf.parked 2>/dev/null | sed -n 's/^SITE_OCTANE=//p' | tr '\n' ' ' || true) "
+  used=" $(cat "$SITES_DIR"/*.conf "$SITES_DIR"/*.conf.parked "$PROXIES_DIR"/*.conf 2>/dev/null | sed -n -e 's/^SITE_OCTANE=//p' -e 's/^PROXY_PORT=//p' | tr '\n' ' ' || true) "
   while :; do
     case "$used" in
       *" $p "*) ;;
@@ -1634,6 +1635,7 @@ write_caddyfile() {
       dir="$(site_dir "$name" || true)"
       [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
     done
+    for name in $(proxy_names); do sites="$sites $name"; done
   fi
   {
     cat <<EOF
@@ -1721,6 +1723,7 @@ EOF
     if herd_mode; then
       herd_routes "$depth"
     else
+      caddy_proxies
       caddy_sites "$cased"
       caddy_parked "$v" "$depth"
     fi
@@ -1922,6 +1925,12 @@ summary { cursor: pointer; }
 <pre>vhosty status
 vhosty restart octane-{{html $label}}
 vhosty logs octane-{{html $label}}</pre>
+{{- else if and (eq $kind "proxy") (ne $status "504")}}
+{{- $port := placeholder "http.vars.vhosty_proxy_port"}}
+<h1>Nothing is answering on port {{html $port}}</h1>
+<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $port}}</code>, but nothing answered there.</p>
+<p>Start what runs on port {{html $port}}. It has to listen on <code>localhost</code> and speak plain HTTP. If it moved to another port:</p>
+<pre>vhosty proxy {{html $label}} &lt;port&gt;</pre>
 {{- else if and (eq $kind "php") (ne $status "504")}}
 <h1>PHP {{html $php}} isn't answering</h1>
 <p class="muted">Caddy couldn't reach PHP-FPM for <strong>{{html .Host}}</strong>.</p>
@@ -2764,6 +2773,7 @@ cmd_link() {
   name="$(lower "$name")"
   valid_name "$name" || die "'$name' isn't a valid site name (letters, numbers, dashes). Pick one with --name"
   printf '%s' "$name" | grep -qE '^[0-9]+$' && die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick one with --name"
+  if [ -f "$(proxy_file "$name")" ]; then die "'$name' is a proxy. Remove it first (vhosty unproxy $name), or pick another name with --name"; fi
   site_load "$name"
   if [ "$SITE_LINKED" = "yes" ] && [ "$SITE_PATH" != "$dir" ]; then
     die "'$name' is already linked to $SITE_PATH. Unlink it first, or pick another name with --name"
@@ -2835,6 +2845,7 @@ cmd_site() {
   need_config
   local name dir kind v source settings sock missing blocker kv
   name="$(resolve_site "${1:-}")"
+  if [ -f "$(proxy_file "$name")" ]; then proxy_show "$name"; return 0; fi
   site_load "$name"
   dir="$(site_dir "$name" || true)"
   [ -n "$dir" ] || die "No site '$name'. Run: vhosty sites"
@@ -2951,6 +2962,7 @@ cmd_status() {
     if [ -n "$(port_owner "$SITE_OCTANE")" ]; then ok "Octane $s → 127.0.0.1:$SITE_OCTANE"
     else bad "nothing listening on $SITE_OCTANE for $s (see: vhosty logs octane-$s)"; fi
   done
+  proxy_checks
   echo
 }
 
@@ -4335,10 +4347,12 @@ cmd_tail() { tail_logs "${1:-all}" -n 30 -f; }
 cmd_sites() {
   need_config
   if herd_mode; then herd_list_sites; return 0; fi
-  local dir p name lname note linked
+  local dir p name lname note linked proxied
   linked="$(cmd_links 2>/dev/null | grep https || true)"
-  [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
+  proxied="$(proxy_rows)"
+  [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || [ -n "$proxied" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
   if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
+  if [ -n "$proxied" ]; then head_ "Proxies"; printf '%s\n' "$proxied"; fi
   while IFS= read -r dir; do
     [ -n "$dir" ] || continue
     head_ "$dir"
@@ -4355,6 +4369,8 @@ cmd_sites() {
         info "$name (not a valid hostname: letters, numbers and dashes, no dash at either end)"
       elif printf '%s' "$lname" | grep -qE '^[0-9]+$'; then
         info "$name (a number: https://$lname.$VHOSTY_DOMAIN is the port route, not this folder)"
+      elif [ -f "$(proxy_file "$lname")" ]; then
+        info "$name (not served: https://$lname.$VHOSTY_DOMAIN is a proxy)"
       elif php_enabled && [ -f "$p/public/index.php" ]; then
         site_load "$lname"
         printf "  https://%s.%s  %s(PHP %s%s%s)%s\n" "$lname" "$VHOSTY_DOMAIN" "$D" "$(site_php)" "$([ -n "$SITE_PHP" ] && echo ", pinned")$([ -n "$SITE_OCTANE" ] && echo ", Octane")" "$note" "$N"
@@ -4390,6 +4406,193 @@ cmd_url() {
   u="$(site_url "${1:-}")"
   echo "$u"
   if copy_text "$u" 2>/dev/null; then info "(copied to clipboard)"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: named proxies (app.domain → a port on this machine), for what isn't
+# a PHP site: a Node app, Grafana, anything that speaks HTTP. A proxy has no
+# folder, so it isn't a site: each is a file in ~/.vhosty/proxies, and what walks
+# site_names (prune, the shim, the FPM pools, doctor's folder check) never sees one.
+# ---------------------------------------------------------------------------
+PROXIES_DIR="$VHOSTY_DIR/proxies"
+
+proxy_file() { echo "$PROXIES_DIR/$1.conf"; }
+
+# One DNS label (the wildcard certificate covers one level), and not a number:
+# <port>.domain is the port route. Spelled out, as [a-z] depends on the locale,
+# and valid_name's grep would pass a name with a newline in it.
+proxy_name_ok() {
+  case "$1" in
+    ''|-*|*-|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) return 1 ;;
+    *[!0123456789]*) [ ${#1} -le 63 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+proxy_port_ok() {
+  case "$1" in ''|0*|*[!0123456789]*) return 1 ;; esac
+  [ ${#1} -le 5 ] && [ "$1" -le 65535 ]
+}
+
+# Caddy's own ports: a proxy to them would only come back to Caddy
+proxy_port_is_caddy() {
+  if [ "$1" = "$VHOSTY_SERVE_PORT" ] || [ "$1" = "$VHOSTY_SERVE_HTTP_PORT" ]; then return 0; fi
+  serve_fallback && { [ "$1" = 443 ] || [ "$1" = 80 ]; }
+}
+
+proxy_names() {
+  local f
+  for f in "$PROXIES_DIR"/*.conf; do
+    [ -f "$f" ] || continue
+    f="${f##*/}"; f="${f%.conf}"
+    if proxy_name_ok "$f"; then echo "$f"; fi
+  done
+}
+
+# A proxy's port, or nothing if its file doesn't hold a valid one. Read, not
+# sourced, and checked: it goes into the Caddyfile, and the file can be edited.
+proxy_port() {
+  local p
+  p="$(sed -n 's/^PROXY_PORT=//p' "$(proxy_file "$1")" 2>/dev/null | tail -1 || true)"
+  if proxy_port_ok "$p"; then echo "$p"; fi
+}
+
+# Says how NAME is a site already; fails if it isn't. A parked folder with
+# nothing to serve isn't one: that's what a Node app in ~/Sites looks like, and
+# what it runs on a port can have the folder's name.
+proxy_site_clash() {
+  local dir
+  if [ -f "$(site_file "$1")" ]; then
+    site_load "$1"
+    if [ "$SITE_LINKED" = "yes" ]; then echo "linked to $SITE_PATH"
+    elif [ -n "$SITE_OCTANE" ]; then echo "on Octane, port $SITE_OCTANE"
+    else echo "with settings in $(site_file "$1"); if its folder is gone, vhosty prune removes them"; fi
+    return 0
+  fi
+  dir="$(parked_dir_for "$1" || true)"
+  [ -n "$dir" ] || return 1
+  { php_enabled && [ -f "$dir/public/index.php" ]; } || [ -f "$dir/index.html" ] || return 1
+  echo "parked in ${dir%/*}"
+}
+
+# Before the sites' rules, so a folder parked later doesn't take over the name
+# without a word: doctor and vhosty sites say when one is hidden. localhost, not
+# 127.0.0.1: a dev server told to listen on localhost can end up on ::1 alone
+# (Node on macOS), and Caddy tries every address localhost has on this machine.
+# Websockets need nothing here: reverse_proxy passes the upgrade on by itself.
+caddy_proxies() {
+  local name port
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      printf '\n\t# Proxy: %s (skipped: no valid port in its file)\n' "$name"
+      continue
+    fi
+    cat <<EOF
+
+	# Proxy: $name → localhost:$port
+	@proxy_$name host $name.$VHOSTY_DOMAIN
+	handle @proxy_$name {
+		vars {
+			vhosty_kind proxy
+			vhosty_proxy_port $port
+		}
+		reverse_proxy localhost:$port
+	}
+EOF
+  done
+}
+
+# For vhosty status and doctor. A stopped dev server is normal, so that's a
+# warning; a file that can't be routed is a failure.
+proxy_checks() {
+  local name port owner why
+  if herd_mode; then return 0; fi
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      bad "proxy $name: no valid port in $(proxy_file "$name"), so it isn't routed. Set one: vhosty proxy $name <port>"
+      continue
+    fi
+    owner="$(port_owner "$port")"
+    if [ -n "$owner" ]; then ok "proxy $name → localhost:$port ($owner)"
+    else warn "proxy $name: nothing is listening on port $port. It works once something does."; fi
+    if why="$(proxy_site_clash "$name")"; then
+      warn "proxy $name hides a site of the same name ($why). Rename one, or remove the proxy: vhosty unproxy $name"
+    fi
+  done
+}
+
+# One line per proxy, for vhosty proxies and vhosty sites
+proxy_rows() {
+  local name port note
+  for name in $(proxy_names); do
+    port="$(proxy_port "$name")"
+    if [ -z "$port" ]; then
+      printf "  https://%s.%s  %s(no valid port: vhosty proxy %s <port>)%s\n" "$name" "$VHOSTY_DOMAIN" "$R" "$name" "$N"
+      continue
+    fi
+    note=""; [ -n "$(port_owner "$port")" ] || note="  ${Y}(nothing listening)${N}"
+    printf "  https://%s.%s  %s→ localhost:%s%s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$port" "$N" "$note"
+  done
+}
+
+# vhosty site, for a proxy
+proxy_show() {
+  local port owner
+  port="$(proxy_port "$1")"
+  printf "%s%s%s  https://%s.%s\n" "$B" "$1" "$N" "$1" "$VHOSTY_DOMAIN"
+  if [ -n "$port" ]; then
+    owner="$(port_owner "$port")"
+    printf "  %-10s %s\n" "Proxy" "localhost:$port" "Listening" "${owner:-${Y}nothing${N}}"
+  else
+    printf "  %-10s %s\n" "Proxy" "${R}no valid port${N} (vhosty proxy $1 <port>)"
+  fi
+  printf "  %-10s %s\n" "Config" "$(proxy_file "$1")"
+}
+
+cmd_proxy() {
+  need_config
+  [ $# -eq 2 ] || die "Usage: vhosty proxy <name> <port>"
+  local name port why
+  name="$(lower "$1")"; port="$2"
+  case "$name" in
+    ''|*[!0123456789]*) ;;
+    *) die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick a name that isn't only numbers" ;;
+  esac
+  proxy_name_ok "$name" || die "'$name' isn't a valid proxy name: letters, numbers and dashes, no dash at either end, up to 63 characters"
+  proxy_port_ok "$port" || die "'$port' isn't a port (1 to 65535)"
+  if proxy_port_is_caddy "$port"; then die "Port $port is Caddy's own, so a proxy to it would only come back to Caddy"; fi
+  if why="$(proxy_site_clash "$name")"; then die "'$name' is already a site ($why). Pick another name for the proxy"; fi
+  mkdir -p "$PROXIES_DIR"
+  {
+    echo "# vhosty proxy: https://$name.$VHOSTY_DOMAIN. Change with vhosty proxy, or edit and run: vhosty rebuild"
+    printf 'PROXY_PORT=%s\n' "$port"
+  } >"$(proxy_file "$name")"
+  ok "https://$name.$VHOSTY_DOMAIN → localhost:$port"
+  [ -n "$(port_owner "$port")" ] || warn "nothing is listening on port $port yet"
+  cmd_rebuild
+}
+
+cmd_unproxy() {
+  need_config
+  [ -n "${1:-}" ] || die "Usage: vhosty unproxy <name>"
+  local name why
+  name="$(lower "$1")"
+  # Checked first: the name becomes a path, and rm follows it
+  { proxy_name_ok "$name" && [ -f "$(proxy_file "$name")" ]; } || die "'$name' isn't a proxy. Run: vhosty proxies"
+  rm -f "$(proxy_file "$name")"
+  ok "removed proxy $name"
+  if why="$(proxy_site_clash "$name")"; then info "https://$name.$VHOSTY_DOMAIN goes back to the site it was hiding ($why)"; fi
+  cmd_rebuild
+}
+
+cmd_proxies() {
+  need_config
+  local rows
+  rows="$(proxy_rows)"
+  if [ -n "$rows" ]; then printf '%s\n' "$rows"
+  else info "No proxies. Send a name to a port with: vhosty proxy <name> <port>"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -4917,6 +5120,11 @@ doctor_checks() {
     octane_checks
   fi
 
+  if ! herd_mode && [ -n "$(proxy_names)" ]; then
+    head_ "Proxies"
+    proxy_checks
+  fi
+
   head_ "Services"
   if is_linux; then
     if [ "$(loginctl show-user "$VHOSTY_USER" -p Linger --value 2>/dev/null)" = "yes" ]; then ok "start at boot (linger on)"
@@ -5028,10 +5236,13 @@ ${B}Sites${N}
   vhosty link [dir] [--name N]       Serve one folder, anywhere, as N.domain (default: current)
   vhosty unlink [name]               Remove a link
   vhosty links                       List links
+  vhosty proxy <name> <port>         Send name.domain to a port on this machine (a Node app, Grafana, anything)
+  vhosty unproxy <name>              Remove a proxy
+  vhosty proxies                     List proxies
   vhosty sites                       List sites and their URLs
   vhosty site [name]                 Everything about one site (default: current folder)
-  vhosty open [site|port]            Open in the browser (default: current folder)
-  vhosty url  [site|port]            Print the URL and copy it
+  vhosty open [site|proxy|port]      Open in the browser (default: current folder)
+  vhosty url  [site|proxy|port]      Print the URL and copy it
 
 ${B}PHP${N}
   vhosty php [list]                  Installed versions, the default, and pins
@@ -5114,6 +5325,9 @@ main() {
     link)               cmd_link "$@" ;;
     unlink)             cmd_unlink "${1:-}" ;;
     links)              cmd_links ;;
+    proxy)              cmd_proxy "$@" ;;
+    unproxy)            cmd_unproxy "${1:-}" ;;
+    proxies)            cmd_proxies ;;
     site|info)          cmd_site "${1:-}" ;;
     parked)             cmd_parked ;;
     php)                cmd_php "$@" ;;

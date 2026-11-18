@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 #
-# vhosty: Herd for your tailnet.
-# Every folder becomes a private HTTPS site on your own domain,
-# reachable from any device on your Tailscale network.
+# vhosty: private HTTPS names for everything on this machine, over Tailscale.
 #
-#   vhosty setup      first-time setup (domain, DNS, Caddy, PHP-FPM, services)
+#   vhosty setup      first-time setup (domain, DNS, Caddy; sites, forward or neither; services)
 #   vhosty help       everything else
 #
 # https://github.com/vhostyhq/vhosty
@@ -65,10 +63,9 @@ else
   CADDY_CERTS="${XDG_DATA_HOME:-$VHOSTY_HOME_DIR/.local/share}/caddy/certificates"
 fi
 CF_API="https://api.cloudflare.com/client/v4"
-# Laravel Herd, for VHOSTY_BACKEND=herd (the overrides are for the tests)
+# Where the forward presets keep their config (the overrides are for the tests)
 HERD_DIR="${VHOSTY_HERD_DIR:-$VHOSTY_HOME_DIR/Library/Application Support/Herd}"
-HERD_HTTP="${VHOSTY_HERD_HTTP:-127.0.0.1:80}"     # Herd's nginx
-HERD_HTTPS="${VHOSTY_HERD_HTTPS:-127.0.0.1:443}"
+VALET_DIR="${VHOSTY_VALET_DIR:-}"
 # macOS: Homebrew, for PHP (the override is for the tests)
 BREW_PREFIX="${VHOSTY_BREW_PREFIX:-}"
 BREW_PHP_TAP="shivammathur/php"
@@ -79,7 +76,8 @@ BREW_PHP_EXTS="redis igbinary"
 # Defaults; ~/.vhosty/config overrides them
 VHOSTY_DOMAIN=""
 VHOSTY_PARKED=""          # colon-separated folders
-VHOSTY_PHP="on"           # on | off
+VHOSTY_SITES=""           # on | off: vhosty serves parked and linked folders itself. Empty: from older settings
+VHOSTY_PHP="on"           # on | off: with sites on, PHP through PHP-FPM; off serves static folders only
 VHOSTY_PHP_DEFAULT=""     # e.g. 8.5; empty = newest installed
 VHOSTY_SERVICES_DIR=""    # docker compose project for `vhosty services`
 VHOSTY_FPM_PORT=""        # old setting (TCP); FPM now uses sockets in ~/.vhosty/run
@@ -87,11 +85,20 @@ VHOSTY_LOG_MAX_MB="10"    # rotate a log once it's bigger than this
 VHOSTY_LOG_KEEP="5"       # rotated copies to keep (compressed)
 VHOSTY_BACKUP_DIR=""      # where `vhosty services backup` saves; empty = ~/.vhosty/backups
 VHOSTY_BACKUP_KEEP="7"    # backups to keep there
-VHOSTY_PORTS="3000-5999 6006 8000-8099 8888"   # ports <port>.domain reaches (dev servers)
+DEFAULT_PORTS="3000-5999 6006 8000-8099 8888"
+VHOSTY_PORTS="$DEFAULT_PORTS"   # ports <port>.domain reaches (dev servers)
 VHOSTY_DNS="cloudflare"   # DNS provider: cloudflare digitalocean porkbun route53, or custom
 VHOSTY_DNS_PLUGIN=""      # custom: the Caddy plugin, e.g. github.com/caddy-dns/gandi
 VHOSTY_DNS_TLS=""         # custom: its Caddyfile line, e.g. dns gandi {env.GANDI_BEARER_TOKEN}
-VHOSTY_BACKEND="vhosty"   # vhosty: serve folders with vhosty's PHP-FPM; herd: forward to Laravel Herd (macOS)
+# Forward: names nothing else claims go to <name>.<tld> on another web server on
+# this machine. A preset (herd, valet, lerd) or a TLD (test); the rest overrides it
+VHOSTY_FORWARD=""
+VHOSTY_FORWARD_TLD=""     # default: the preset's (Herd and Valet: from their config), else test
+VHOSTY_FORWARD_HTTP=""    # its address for http; default 127.0.0.1:80
+VHOSTY_FORWARD_HTTPS=""   # and for https; default 127.0.0.1:443
+VHOSTY_FORWARD_TLS=""     # auto (https for names with a certificate in VHOSTY_FORWARD_CERTS) | always | never
+VHOSTY_FORWARD_CERTS=""   # the folder of <name>.<tld>.crt files; default: the preset's
+VHOSTY_BACKEND=""         # old setting: herd became VHOSTY_FORWARD=herd
 # Caddy's ports on localhost; Tailscale Serve passes the tailnet's 443 and 80 to them
 VHOSTY_SERVE_PORT="${VHOSTY_SERVE_PORT:-${VHOSTY_HERD_PORT:-48443}}"
 VHOSTY_SERVE_HTTP_PORT="${VHOSTY_SERVE_HTTP_PORT:-48080}"
@@ -181,6 +188,15 @@ load_config() {
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
+  # Before VHOSTY_SITES: every machine served folders, unless Herd did
+  # (VHOSTY_BACKEND=herd). A new machine starts with neither.
+  if [ -z "$VHOSTY_SITES" ]; then
+    if [ "$VHOSTY_BACKEND" = "herd" ]; then
+      VHOSTY_SITES="off"; VHOSTY_FORWARD="${VHOSTY_FORWARD:-herd}"
+    elif [ -f "$CONFIG_FILE" ]; then VHOSTY_SITES="on"
+    else VHOSTY_SITES="off"; fi
+  fi
+  VHOSTY_BACKEND=""
 }
 
 need_config() {
@@ -194,9 +210,11 @@ save_config() {
   # folder name with $(...) or a quote must stay text
   {
     echo "# vhosty config. After editing, run: vhosty rebuild"
-    for k in VHOSTY_DOMAIN VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT VHOSTY_SERVICES_DIR \
+    for k in VHOSTY_DOMAIN VHOSTY_SITES VHOSTY_PARKED VHOSTY_PHP VHOSTY_PHP_DEFAULT \
+      VHOSTY_FORWARD VHOSTY_FORWARD_TLD VHOSTY_FORWARD_HTTP VHOSTY_FORWARD_HTTPS \
+      VHOSTY_FORWARD_TLS VHOSTY_FORWARD_CERTS VHOSTY_SERVICES_DIR \
       VHOSTY_LOG_MAX_MB VHOSTY_LOG_KEEP VHOSTY_BACKUP_DIR VHOSTY_BACKUP_KEEP VHOSTY_PORTS \
-      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_BACKEND VHOSTY_SERVE_PORT VHOSTY_SERVE_HTTP_PORT; do
+      VHOSTY_DNS VHOSTY_DNS_PLUGIN VHOSTY_DNS_TLS VHOSTY_SERVE_PORT VHOSTY_SERVE_HTTP_PORT; do
       printf '%s=%q\n' "$k" "${!k}"
     done
   } >"$CONFIG_FILE"
@@ -292,8 +310,29 @@ dns_provider() {
   DNS_MODULE="dns.providers.$name"
 }
 
-# With Herd, Herd runs PHP: vhosty has no PHP-FPM, shim or PHP commands
-php_enabled() { ! herd_mode && [ "$VHOSTY_PHP" = "on" ]; }
+# Who gets the names nothing else claims (a port route or a proxy wins first):
+#   sites    vhosty serves parked and linked folders itself (VHOSTY_SITES=on)
+#   forward  another web server on this machine does, as <name>.<tld>
+#   none     nobody: the "no site" page. vhosty is the gateway only.
+# Forward wins over sites, since both would claim every name.
+forward_mode() { [ -n "$VHOSTY_FORWARD" ]; }
+sites_on() { ! forward_mode && [ "$VHOSTY_SITES" = "on" ]; }
+fallback_mode() {
+  if forward_mode; then echo forward; elif sites_on; then echo sites; else echo none; fi
+}
+# What this machine does, in one line: "gateway · sites · ports · services"
+mode_line() {
+  local out="gateway"
+  case "$(fallback_mode)" in
+    sites) if php_enabled; then out="$out · sites (PHP)"; else out="$out · sites (static)"; fi ;;
+    forward) forward_load; out="$out · forward to $FWD_NAME (<name>.$FWD_TLD)" ;;
+  esac
+  [ -z "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ] || out="$out · ports"
+  [ -z "$VHOSTY_SERVICES_DIR" ] || out="$out · services"
+  printf '%s' "$out"
+}
+# PHP is part of sites: no PHP-FPM, shim or PHP commands without them
+php_enabled() { sites_on && [ "$VHOSTY_PHP" = "on" ]; }
 
 # Number of labels in the domain = which {labels.N} holds the site name.
 # vhosty.link → 2, box.example.com → 3
@@ -327,26 +366,167 @@ parked_list() { # one per line; in bash, as it runs often
 }
 
 # ---------------------------------------------------------------------------
-# Laravel Herd (VHOSTY_BACKEND=herd): Herd serves the sites on this Mac as
-# <name>.test, and vhosty's Caddy forwards https://<name>.domain to them.
-# Herd keeps PHP, its versions and extensions, and its own parked folders
-# and links; vhosty adds the tailnet, the certificate and the DNS record.
+# Forward (VHOSTY_FORWARD): another web server on this machine serves the
+# sites as <name>.<tld>, like Laravel Herd, Valet, Lerd, or nginx or Apache
+# with a vhost per name, and Caddy sends https://<name>.domain on to it. It
+# keeps PHP and its own sites; vhosty adds the tailnet, the certificate and
+# the DNS record. A preset is only defaults: where the server listens, its
+# TLD, and where it keeps the certificates of the sites it serves over https.
 # ---------------------------------------------------------------------------
-herd_mode() { [ "$VHOSTY_BACKEND" = "herd" ]; }
-herd_valet() { echo "$HERD_DIR/config/valet"; }
-herd_installed() { [ -f "$(herd_valet)/config.json" ]; }
+FORWARD_PRESETS="herd valet lerd"
 
-herd_tld() {
-  local t=""
-  if herd_installed; then t="$(json_get tld <"$(herd_valet)/config.json" 2>/dev/null || true)"; fi
-  printf '%s' "${t:-test}"
+# Valet's folder: ~/.config/valet since Valet 3, ~/.valet before (and on Linux)
+valet_dir() {
+  if [ -n "$VALET_DIR" ]; then echo "$VALET_DIR"
+  elif [ -d "$VHOSTY_HOME_DIR/.config/valet" ]; then echo "$VHOSTY_HOME_DIR/.config/valet"
+  else echo "$VHOSTY_HOME_DIR/.valet"; fi
 }
 
-# Herd's parked folders, one per line. jq ships with macOS 15 and later;
-# before that, a plain read of config.json's "paths" list.
-herd_paths() {
+# Lerd keeps its data and config in the XDG folders, its TLD under dns: in
+# config.yaml, and a secured site's certificate as certs/sites/<name>.<tld>.crt
+lerd_data() { echo "${XDG_DATA_HOME:-$VHOSTY_HOME_DIR/.local/share}/lerd"; }
+lerd_tld() {
+  local f="${XDG_CONFIG_HOME:-$VHOSTY_HOME_DIR/.config}/lerd/config.yaml"
+  [ -f "$f" ] || return 0
+  awk '/^dns:/ { d = 1; next } /^[^[:space:]#]/ { d = 0 }
+    d && $1 == "tld:" { gsub(/["'"'"']/, "", $2); print $2; exit }' "$f"
+}
+
+# forward_load sets FWD_NAME (what to call the server), FWD_CLI (its command,
+# for hints), FWD_VALET (a Valet-style config folder, as Herd and Valet keep:
+# config.json, Sites, Certificates), FWD_TLD, FWD_HTTP, FWD_HTTPS, FWD_TLS
+# and FWD_CERTS. The VHOSTY_FORWARD_* settings override the preset.
+forward_load() {
+  FWD_LOADED="$VHOSTY_FORWARD"
+  FWD_NAME=""; FWD_CLI=""; FWD_VALET=""; FWD_TLD=""; FWD_CERTS=""
+  case "$VHOSTY_FORWARD" in
+    herd)  FWD_NAME="Herd"; FWD_CLI="herd"; FWD_VALET="$HERD_DIR/config/valet" ;;
+    valet) FWD_NAME="Valet"; FWD_CLI="valet"; FWD_VALET="$(valet_dir)" ;;
+    lerd)  FWD_NAME="Lerd"; FWD_CLI="lerd"; FWD_CERTS="$(lerd_data)/certs/sites"; FWD_TLD="$(lerd_tld)" ;;
+    *)     FWD_NAME="the web server on this machine"; FWD_TLD="$VHOSTY_FORWARD" ;;
+  esac
+  if [ -n "$FWD_VALET" ]; then
+    FWD_CERTS="$FWD_VALET/Certificates"
+    if [ -f "$FWD_VALET/config.json" ]; then
+      # json_get dies without jq or plutil, which would end vhosty here
+      FWD_TLD="$(json_get tld <"$FWD_VALET/config.json" 2>/dev/null)" || FWD_TLD=""
+    fi
+  fi
+  FWD_TLD="${VHOSTY_FORWARD_TLD:-${FWD_TLD:-test}}"
+  FWD_HTTP="${VHOSTY_FORWARD_HTTP:-127.0.0.1:80}"
+  FWD_HTTPS="${VHOSTY_FORWARD_HTTPS:-127.0.0.1:443}"
+  [ -z "$VHOSTY_FORWARD_CERTS" ] || FWD_CERTS="$(expand_tilde "$VHOSTY_FORWARD_CERTS")"
+  FWD_TLS="$VHOSTY_FORWARD_TLS"
+  if [ -z "$FWD_TLS" ]; then
+    if [ -n "$FWD_CERTS" ]; then FWD_TLS="auto"; else FWD_TLS="never"; fi
+  fi
+}
+
+# Loads the settings once, for the functions below. forward_load reloads them.
+forward_ensure() { [ "${FWD_LOADED-unset}" = "$VHOSTY_FORWARD" ] || forward_load; }
+
+# The settings go into the Caddyfile, so they're checked first, in this shell
+forward_check() {
+  local a
+  forward_load
+  # grep matches line by line, so a value with a line break could pass with one good line
+  for a in "$VHOSTY_FORWARD" "$FWD_TLD" "$FWD_HTTP" "$FWD_HTTPS" "$FWD_CERTS"; do
+    case "$a" in *$'\n'*|*$'\r'*) die "The forward settings can't have line breaks: '$a'" ;; esac
+  done
+  case " $FORWARD_PRESETS " in
+    *" $VHOSTY_FORWARD "*) ;;
+    *) printf '%s' "$VHOSTY_FORWARD" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' \
+         || die "VHOSTY_FORWARD: '$VHOSTY_FORWARD' isn't a preset ($FORWARD_PRESETS) or a TLD like test" ;;
+  esac
+  printf '%s' "$FWD_TLD" | grep -qE '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' \
+    || die "VHOSTY_FORWARD_TLD: '$FWD_TLD' isn't a TLD like test"
+  for a in "$FWD_HTTP" "$FWD_HTTPS"; do
+    printf '%s' "$a" | grep -qE '^([a-z0-9.-]+|\[[0-9a-f:]+\]):[0-9]{1,5}$' \
+      || die "VHOSTY_FORWARD_HTTP and _HTTPS: '$a' isn't an address like 127.0.0.1:80"
+    proxy_port_ok "${a##*:}" || die "VHOSTY_FORWARD_HTTP and _HTTPS: '$a' doesn't end in a port from 1 to 65535"
+  done
+  case "$FWD_TLS" in
+    always|never) ;;
+    auto) [ -n "$FWD_CERTS" ] || die "VHOSTY_FORWARD_TLS=auto needs VHOSTY_FORWARD_CERTS: the folder with a <name>.$FWD_TLD.crt for each site served over https" ;;
+    *) die "VHOSTY_FORWARD_TLS: '$FWD_TLS' isn't auto, always or never" ;;
+  esac
+  [ -z "$FWD_CERTS" ] || check_folder "$FWD_CERTS"
+}
+
+# Is the forward server's site served over https? Then Caddy talks https to it:
+# Herd and Valet redirect a secured site's http to https://<name>.test, which
+# a device on the tailnet can't open.
+forward_secured() {
+  forward_ensure
+  case "$FWD_TLS" in
+    always) return 0 ;;
+    never) return 1 ;;
+  esac
+  [ -f "$FWD_CERTS/$1.$FWD_TLD.crt" ]
+}
+
+# Caddy: <name>.domain → <name>.<tld>. The https hop stays on this machine, so
+# the server's certificate (from its own CA) isn't checked. Caddy sends
+# X-Forwarded-Host and -Proto, which an app that trusts the proxy uses for
+# its URLs.
+forward_routes() { # forward_routes DEPTH
+  local l="{labels.$1}" vars
+  vars="		vars {
+			vhosty_kind forward
+			vhosty_forward_tld $FWD_TLD
+			vhosty_forward_name \"$FWD_NAME\"
+			vhosty_forward_cli \"$FWD_CLI\"
+		}"
+  printf '\n\t# Forward: <name>.%s → <name>.%s (%s, https: %s)\n' "$VHOSTY_DOMAIN" "$FWD_TLD" "$FWD_NAME" "$FWD_TLS"
+  if [ "$FWD_TLS" = "auto" ]; then
+    cat <<EOF
+	@forward_secured file {
+		root "$FWD_CERTS"
+		try_files $l.$FWD_TLD.crt
+	}
+	handle @forward_secured {
+$vars
+		reverse_proxy https://$FWD_HTTPS {
+			header_up Host $l.$FWD_TLD
+			transport http {
+				tls_server_name $l.$FWD_TLD
+				tls_insecure_skip_verify
+			}
+		}
+	}
+EOF
+  fi
+  if [ "$FWD_TLS" = "always" ]; then
+    cat <<EOF
+	handle {
+$vars
+		reverse_proxy https://$FWD_HTTPS {
+			header_up Host $l.$FWD_TLD
+			transport http {
+				tls_server_name $l.$FWD_TLD
+				tls_insecure_skip_verify
+			}
+		}
+	}
+EOF
+  else
+    cat <<EOF
+	handle {
+$vars
+		reverse_proxy http://$FWD_HTTP {
+			header_up Host $l.$FWD_TLD
+		}
+	}
+EOF
+  fi
+}
+
+# Parked folders in a Valet-style config.json, one per line. jq ships with
+# macOS 15 and later; before that, a plain read of the "paths" list.
+valet_paths() {
   local f
-  f="$(herd_valet)/config.json"
+  forward_ensure
+  f="$FWD_VALET/config.json"
   [ -f "$f" ] || return 0
   if command -v jq >/dev/null 2>&1; then
     jq -r '.paths[]? | strings' "$f" 2>/dev/null || true
@@ -356,12 +536,15 @@ herd_paths() {
   fi
 }
 
-# Herd's sites: "name|folder|linked or parked", one per line. A link wins
-# over a parked folder with the same name, as in Herd.
-herd_sites() {
+# The forward server's sites, when it keeps a Valet-style config (Herd, Valet):
+# "name|folder|linked or parked", one per line. A link wins over a parked
+# folder with the same name, as there. Other servers: nothing.
+forward_sites() {
   local p d
+  forward_ensure
+  [ -n "$FWD_VALET" ] || return 0
   {
-    for p in "$(herd_valet)/Sites"/*; do
+    for p in "$FWD_VALET/Sites"/*; do
       [ -e "$p" ] || continue
       printf '%s|%s|linked\n' "$(lower "${p##*/}")" "$(cd "$p" 2>/dev/null && pwd -P || echo "$p")"
     done
@@ -373,16 +556,13 @@ herd_sites() {
         printf '%s|%s|parked\n' "$(lower "${p##*/}")" "$p"
       done
     done <<EOF
-$(herd_paths)
+$(valet_paths)
 EOF
   } | awk -F'|' '!seen[$1]++'
 }
 
-# Secured in Herd (herd secure): it has a certificate from Herd's CA
-herd_secured() { [ -f "$(herd_valet)/Certificates/$1.$(herd_tld).crt" ]; }
-
-# The Herd site a folder is in: the deepest site folder that contains it
-herd_site_from_dir() {
+# The forward server's site a folder is in: the deepest site folder that contains it
+forward_site_from_dir() {
   local dir name path kind best="" len=0
   dir="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
   while IFS='|' read -r name path kind; do
@@ -392,81 +572,40 @@ herd_site_from_dir() {
       "$path/"*) if [ "${#path}" -gt "$len" ]; then best="$name"; len="${#path}"; fi ;;
     esac
   done <<EOF
-$(herd_sites)
+$(forward_sites)
 EOF
   [ -n "$best" ] || return 1
   echo "$best"
 }
 
-# Commands that are Herd's job with VHOSTY_BACKEND=herd
-herd_refuse() {
-  local alt
+# Commands for vhosty's own sites, which another server, or nobody, has here
+mode_refuse() {
+  local hint
   case "$1" in
-    park) alt="herd park" ;;
-    unpark) alt="herd forget" ;;
-    parked) alt="herd parked" ;;
-    link) alt="herd link" ;;
-    unlink) alt="herd unlink" ;;
-    links) alt="herd links" ;;
-    site|info) alt="vhosty sites, or herd links" ;;
-    isolate) alt="herd isolate" ;;
-    unisolate) alt="herd unisolate" ;;
-    isolated) alt="herd isolated" ;;
-    php) alt="herd use, or Herd's PHP settings" ;;
-    ini|ext|exts|extension|extensions) alt="Herd's PHP settings" ;;
-    octane) alt="php artisan octane:start, reached at https://<port>.<domain>" ;;
-    worktree) alt="git worktree add, then herd link" ;;
-    proxy|unproxy|proxies) alt="the port route, https://<port>.<domain>" ;;
+    park|unpark|parked|link|unlink|links|site|info|isolate|unisolate|isolated|php|ini|ext|exts|extension|extensions|octane|worktree) ;;
     *) return 0 ;;
   esac
-  die "Herd serves the sites on this machine (VHOSTY_BACKEND=herd), so this is Herd's job. Use: $alt"
+  if forward_mode; then
+    forward_load
+    case "$1" in
+      octane) hint=" To run Octane anyway: php artisan octane:start --port=8001, then https://8001.$VHOSTY_DOMAIN, or name it: vhosty proxy <name> 8001" ;;
+      worktree) hint="${FWD_CLI:+ For a worktree: git worktree add, then $FWD_CLI link inside it.}" ;;
+      *) hint="" ;;
+    esac
+    die "$FWD_NAME serves the sites on this machine (VHOSTY_FORWARD=$VHOSTY_FORWARD), so that's done there$([ -z "$FWD_CLI" ] || printf ' (%s)' "$FWD_CLI"). vhosty sends https://<name>.$VHOSTY_DOMAIN to it as <name>.$FWD_TLD.$hint"
+  fi
+  sites_on || die "vhosty isn't serving sites on this machine, only proxies and ports. To serve folders and PHP: vhosty enable sites"
 }
 
-# Herd: <name>.domain → <name>.test, served by Herd's nginx on localhost.
-# Herd redirects a secured site from http:// to https://, so those go to 443.
-# Their certificate is from Herd's own CA, which there's no need to check on
-# a hop that stays on this machine. Caddy sends X-Forwarded-Host and -Proto,
-# which an app that trusts the proxy uses for its URLs.
-herd_routes() { # herd_routes DEPTH
-  local l="{labels.$1}" tld
-  tld="$(herd_tld)"
-  cat <<EOF
-
-	# Herd ($HERD_DIR): <name>.$VHOSTY_DOMAIN → <name>.$tld
-	@herd_secured file {
-		root "$(herd_valet)/Certificates"
-		try_files $l.$tld.crt
-	}
-	handle @herd_secured {
-		vars {
-			vhosty_kind herd
-			vhosty_herd_tld $tld
-		}
-		reverse_proxy https://$HERD_HTTPS {
-			header_up Host $l.$tld
-			transport http {
-				tls_server_name $l.$tld
-				tls_insecure_skip_verify
-			}
-		}
-	}
-
-	handle {
-		vars {
-			vhosty_kind herd
-			vhosty_herd_tld $tld
-		}
-		reverse_proxy http://$HERD_HTTP {
-			header_up Host $l.$tld
-		}
-	}
-EOF
-}
-
-herd_list_sites() {
-  local name path kind tld note any=0
-  tld="$(herd_tld)"
-  head_ "Herd sites (<name>.$tld)"
+forward_list_sites() {
+  local name path kind note any=0
+  forward_load
+  head_ "Sites on $FWD_NAME (<name>.$FWD_TLD)"
+  if [ -z "$FWD_VALET" ]; then
+    info "Every name that isn't a proxy goes to $FWD_NAME as <name>.$FWD_TLD."
+    echo
+    return 0
+  fi
   while IFS='|' read -r name path kind; do
     [ -n "$name" ] || continue
     path="$(printf '%s' "$path" | sed "s#^$VHOSTY_HOME_DIR/#~/#")"
@@ -476,25 +615,39 @@ herd_list_sites() {
     if printf '%s' "$name" | grep -qE '^[0-9]+$'; then
       info "$name (a number: https://$name.$VHOSTY_DOMAIN is the port route)"; continue
     fi
+    if [ -f "$(proxy_file "$name")" ]; then
+      info "$name (not reached: https://$name.$VHOSTY_DOMAIN is a proxy)"; continue
+    fi
     any=1
-    note="$kind"; herd_secured "$name" || note="$note, not secured"
+    note="$kind"; forward_secured "$name" || note="$note, not secured"
     printf "  https://%s.%s  %s(%s) %s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$note" "$path" "$N"
   done <<EOF
-$(herd_sites)
+$(forward_sites)
 EOF
-  [ "$any" = "1" ] || info "No Herd sites yet. Add some with: herd park <folder>, or herd link"
+  [ "$any" = "1" ] || info "No sites on $FWD_NAME yet$([ -z "$FWD_CLI" ] || printf '. Add some with: %s park <folder>, or %s link' "$FWD_CLI" "$FWD_CLI")"
   echo
 }
 
-herd_checks() {
-  local code n
-  if herd_installed; then ok "Herd's config: $(herd_valet)"
-  else bad "Herd isn't set up ($(herd_valet)/config.json not found). Install Herd, or open it once"; fi
-  code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 "http://$HERD_HTTP/" 2>/dev/null || true)"
-  if [ -n "$code" ] && [ "$code" != "000" ]; then ok "Herd's web server answers on $HERD_HTTP"
-  else bad "Herd's web server isn't answering on $HERD_HTTP. Open Herd, or run: herd restart"; fi
-  n="$(herd_sites | grep -c . || true)"
-  ok "$n Herd site$([ "$n" = 1 ] || echo s), as <name>.$(herd_tld) (vhosty sites lists them)"
+forward_checks() {
+  local code n addr="$FWD_HTTP" scheme=http
+  forward_load
+  if [ -n "$FWD_VALET" ]; then
+    if [ -f "$FWD_VALET/config.json" ]; then ok "$FWD_NAME's config: $FWD_VALET"
+    else bad "$FWD_NAME isn't set up here ($FWD_VALET/config.json not found). Install it, or open it once"; fi
+  fi
+  if [ "$FWD_TLS" = "always" ]; then addr="$FWD_HTTPS"; scheme=https; fi
+  code="$(curl -sk -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 "$scheme://$addr/" 2>/dev/null || true)"
+  if [ -n "$code" ] && [ "$code" != "000" ]; then ok "$FWD_NAME answers on $addr"
+  else bad "$FWD_NAME isn't answering on $addr$([ -z "$FWD_CLI" ] || printf '. Start it, or run: %s restart' "$FWD_CLI")"; fi
+  if [ "$FWD_TLS" = "auto" ] && [ ! -d "$FWD_CERTS" ]; then
+    warn "no certificate folder at $FWD_CERTS, so every site goes over http. Set VHOSTY_FORWARD_CERTS, or VHOSTY_FORWARD_TLS"
+  fi
+  if [ -n "$FWD_VALET" ]; then
+    n="$(forward_sites | grep -c . || true)"
+    ok "$n site$([ "$n" = 1 ] || echo s) on $FWD_NAME, as <name>.$FWD_TLD (vhosty sites lists them)"
+  else
+    ok "names go to $FWD_NAME as <name>.$FWD_TLD (https: $FWD_TLS)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1606,6 +1759,10 @@ EOF
   done <<EOF
 $(parked_list)
 EOF
+  caddy_nosite
+}
+
+caddy_nosite() {
   cat <<EOF
 
 	handle {
@@ -1647,17 +1804,18 @@ write_caddyfile() {
   mkdir -p "$RUN_DIR"   # for the admin socket
   depth="$(domain_depth)"
   v="$(php_default)"
-  # Configured sites whose folder exists, for the "no site found" page
-  if ! herd_mode; then
+  # Configured sites whose folder exists, and proxies, for the "no site found" page
+  if sites_on; then
     cased="$(case_sites)"   # once: it globs every parked folder
     for name in $(site_names) $cased; do
       dir="$(site_dir "$name" || true)"
       [ -z "$dir" ] || [ ! -d "$dir" ] || sites="$sites $name"
     done
-    for name in $(proxy_names); do
-      [ -z "$(proxy_port "$name")" ] || sites="$sites $name"
-    done
   fi
+  for name in $(proxy_names); do
+    [ -z "$(proxy_port "$name")" ] || sites="$sites $name"
+  done
+  ! forward_mode || forward_check
   {
     cat <<EOF
 # Generated by vhosty. Don't edit: change ~/.vhosty/config, then run \`vhosty rebuild\`.
@@ -1741,13 +1899,16 @@ EOF
 		error "vhosty: port not open to the tailnet" 403
 	}
 EOF
-    if herd_mode; then
-      herd_routes "$depth"
-    else
-      caddy_proxies
-      caddy_sites "$cased"
-      caddy_parked "$v" "$depth"
-    fi
+    # Names in this order: ports (above), proxies, then whoever gets the rest.
+    # Apps, processes vhosty runs itself, will go between the two (#35).
+    caddy_proxies
+    case "$(fallback_mode)" in
+      sites)
+        caddy_sites "$cased"
+        caddy_parked "$v" "$depth" ;;
+      forward) forward_routes "$depth" ;;
+      none) caddy_nosite ;;
+    esac
     cat <<EOF
 
 	# vhosty's own error pages: no site, and PHP or a dev server not answering.
@@ -1757,9 +1918,10 @@ EOF
 		handle @vhosty {
 			vars {
 				vhosty_home "$VHOSTY_HOME_DIR"
-				vhosty_parked "$VHOSTY_PARKED"
+				vhosty_mode $(fallback_mode)
+				vhosty_parked "$(! sites_on || printf '%s' "$VHOSTY_PARKED")"
 				vhosty_sites "${sites# }"
-				vhosty_php_on "$VHOSTY_PHP"
+				vhosty_php_on "$(php_enabled && echo on || echo off)"
 				vhosty_ports "$VHOSTY_PORTS"
 			}
 			header Cache-Control no-store
@@ -1841,6 +2003,7 @@ error_page_html() {
 {{- $sites := compact (splitList " " (placeholder "http.vars.vhosty_sites")) -}}
 {{- $parked := compact (splitList ":" (placeholder "http.vars.vhosty_parked")) -}}
 {{- $phpOn := eq (placeholder "http.vars.vhosty_php_on") "on" -}}
+{{- $mode := placeholder "http.vars.vhosty_mode" -}}
 {{- $found := "" -}}
 {{- $cased := "" -}}
 {{- if $nosite -}}
@@ -1925,7 +2088,11 @@ summary { cursor: pointer; }
 {{- end}}
 </ul>
 {{- end}}
+{{- if eq $mode "sites"}}
 <p class="muted">To serve a folder from somewhere else: <code>vhosty link ~/path/to/app --name {{html $label}}</code></p>
+{{- else}}
+<p class="muted">To send it to something running on this machine: <code>vhosty proxy {{html $label}} &lt;port&gt;</code></p>
+{{- end}}
 {{- else if eq $kind "port_closed"}}
 <h1>Port {{html $label}} isn't open to your tailnet</h1>
 <p class="muted">vhosty only forwards the ports in <code>VHOSTY_PORTS</code> (<code>{{html (placeholder "http.vars.vhosty_ports")}}</code>), so anything else listening on this machine's <code>localhost</code>, like a mail catcher or an admin console, stays private to it.</p>
@@ -1935,11 +2102,17 @@ summary { cursor: pointer; }
 <h1>Nothing is running on port {{html $label}}</h1>
 <p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $label}}</code>, but nothing answered there.</p>
 <p>Start the dev server for port {{html $label}}. It has to listen on <code>localhost</code>, which Vite, Next.js and <code>artisan serve</code> do by default.</p>
-{{- else if and (eq $kind "herd") (ne $status "504")}}
-<h1>Herd isn't answering</h1>
-<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to Herd on this machine, as <code>{{html $label}}.{{html (placeholder "http.vars.vhosty_herd_tld")}}</code>, but Herd's web server didn't answer.</p>
-<p>Open Herd, or restart it:</p>
-<pre>herd restart</pre>
+{{- else if and (eq $kind "forward") (ne $status "504")}}
+{{- $fname := placeholder "http.vars.vhosty_forward_name"}}
+{{- $fcli := placeholder "http.vars.vhosty_forward_cli"}}
+<h1>{{html (upper (substr 0 1 $fname))}}{{html (substr 1 (len $fname) $fname)}} isn't answering</h1>
+<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to {{html $fname}}, as <code>{{html $label}}.{{html (placeholder "http.vars.vhosty_forward_tld")}}</code>, but nothing answered.</p>
+{{- if $fcli}}
+<p>Start {{html $fname}}, or restart it:</p>
+<pre>{{html $fcli}} restart</pre>
+{{- else}}
+<p>Start it, then check where vhosty sends names: <code>vhosty doctor</code></p>
+{{- end}}
 {{- else if and (eq $kind "octane") (ne $status "504")}}
 <h1>Octane isn't answering</h1>
 <p class="muted">Caddy couldn't reach Laravel Octane for <strong>{{html .Host}}</strong>. It may still be starting.</p>
@@ -2515,24 +2688,51 @@ config_applied() { [ -f "$APPLIED_STAMP" ] && [ "$(cat "$APPLIED_STAMP")" = "$(g
 # ---------------------------------------------------------------------------
 # Commands: setup
 # ---------------------------------------------------------------------------
+# One of --sites, --forward, --gateway: two different ones don't make sense
+setup_mode() {
+  [ -z "$mode" ] || [ "$mode" = "$1" ] || die "Pick one of --sites (or --park), --forward and --gateway"
+  mode="$1"
+}
+
+SETUP_USAGE="Usage: vhosty setup [--domain D] [--dns PROVIDER] [--sites [--park DIR].. [--no-php] | --forward PRESET|TLD | --gateway] [--services [--only a,b | --dir DIR]] [--ports SPEC] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T, or it's asked for)"
+
 cmd_setup() {
-  local domain="" token="" park="" php="" dns="" backend="" yes=0 ip o p v
+  local domain="" token="" dns="" php="" mode="" fwd="" parks="" ports="" ports_set="" services=""
+  local svc_only="" svc_dir="" yes=0 fresh=0 ip o p v
   while [ $# -gt 0 ]; do
     case "$1" in
-      --domain) domain="$2"; shift 2 ;;
-      --token)  token="$2"; shift 2 ;;
-      --park)   park="$2"; shift 2 ;;
-      --dns)    dns="$2"; shift 2 ;;
-      --no-php) php="off"; shift ;;
-      --php)    php="on"; shift ;;
-      --herd)   backend="herd"; shift ;;
-      --no-herd) backend="vhosty"; shift ;;
-      -y|--yes) yes=1; shift ;;
+      --domain)  domain="${2:-}"; shift 2 ;;
+      --token)   token="${2:-}"; shift 2 ;;
+      --dns)     dns="${2:-}"; shift 2 ;;
+      --sites)   setup_mode sites; shift ;;
+      --park)    [ -n "${2:-}" ] || die "--park needs a folder"
+                 check_folder "$2" parked   # before it goes in a list of lines
+                 parks="$parks$2
+"; shift 2 ;;
+      --php)     php="on"; shift ;;
+      --no-php)  php="off"; shift ;;
+      --forward) [ -n "${2:-}" ] || die "--forward needs a preset ($FORWARD_PRESETS) or a TLD, like test"
+                 setup_mode forward; fwd="$2"; shift 2 ;;
+      --herd)    setup_mode forward; fwd="herd"; shift ;;   # before --forward
+      --no-herd) setup_mode sites; shift ;;
+      --gateway|--no-sites) setup_mode none; shift ;;
+      --ports)   [ $# -ge 2 ] || die "--ports needs ports, like \"3000-5999 8000-8099\" (or \"\" for none)"
+                 ports="$2"; ports_set=1; shift 2 ;;
+      --services) services=1; shift ;;
+      --only)    [ -n "${2:-}" ] || die "--only needs services, like mysql,valkey"; svc_only="$2"; services=1; shift 2 ;;
+      --dir)     [ -n "${2:-}" ] || die "--dir needs the folder with your compose.yaml"; svc_dir="$2"; services=1; shift 2 ;;
+      -y|--yes)  yes=1; shift ;;
       --overwrite-dns) export VHOSTY_OVERWRITE_DNS=1; shift ;;
-      *) die "Unknown option '$1'. Usage: vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--herd|--no-herd] [--yes] [--overwrite-dns] (the token: CF_API_TOKEN=... or --token T)" ;;
+      -h|--help) echo "$SETUP_USAGE"; return 0 ;;
+      *) die "Unknown option '$1'. $SETUP_USAGE" ;;
     esac
   done
+  if [ -n "$parks" ]; then
+    [ -n "$mode" ] || mode="sites"
+    [ "$mode" = "sites" ] || die "--park is for sites, so it can't go with --forward or --gateway"
+  fi
   [ "$yes" = "1" ] && export VHOSTY_YES=1
+  [ -f "$CONFIG_FILE" ] || fresh=1
 
   load_config
 
@@ -2546,21 +2746,9 @@ cmd_setup() {
     command -v jq >/dev/null 2>&1 || die "vhosty needs jq: sudo apt install jq"
     command -v systemctl >/dev/null 2>&1 || die "vhosty on Linux needs systemd"
   fi
-  if [ -n "$backend" ]; then
-    VHOSTY_BACKEND="$backend"
-  elif is_macos && herd_installed && ! herd_mode; then
-    info "Laravel Herd is installed. vhosty can stay out of its way: Herd keeps serving"
-    info "your sites, and vhosty makes each one https://<name>.<domain> on your tailnet."
-    info "(The alternative: vhosty serves your folders itself, with PHP from Homebrew.)"
-    if confirm "Use Herd for the sites?" Y; then VHOSTY_BACKEND="herd"; else VHOSTY_BACKEND="vhosty"; fi
-  fi
-  if herd_mode; then
-    is_macos || die "--herd is for macOS, where Laravel Herd runs"
-    herd_installed || die "Herd isn't set up here ($(herd_valet)/config.json not found). Install Herd and open it once: https://herd.laravel.com"
-    ok "Herd: sites are <name>.$(herd_tld) (Caddy forwards <name>.<domain> to them)"
-  fi
+  [ -z "$services" ] || need_docker
   # The ports Caddy needs: localhost's high ports behind Tailscale Serve, so
-  # Herd, Valet, nginx or Apache can keep 80 and 443
+  # Herd, Valet, Lerd, nginx or Apache can keep 80 and 443
   for p in $VHOSTY_SERVE_PORT $VHOSTY_SERVE_HTTP_PORT; do
     v="$(port_owner "$p")"
     if [ -n "$v" ] && [ "$v" != "caddy" ]; then
@@ -2571,6 +2759,44 @@ cmd_setup() {
   done
   migrate_config
   migrate_php_fpm
+
+  # Who answers the names that aren't a port or a proxy. Setup run again keeps
+  # what's there; a new machine asks, or with --yes is the gateway only.
+  if [ -z "$mode" ]; then
+    if [ "$fresh" = "0" ]; then mode="$(fallback_mode)"
+    elif [ "${VHOSTY_YES:-}" != "1" ] && has_tty; then
+      setup_ask_mode; mode="$SETUP_MODE"; fwd="$SETUP_FWD"
+    else mode="none"; fi
+  fi
+  step "Names"
+  info "https://<name>.<domain>: a port (https://5173.<domain>), a proxy (vhosty proxy <name> <port>), or else:"
+  case "$mode" in
+    sites)
+      VHOSTY_SITES="on"; VHOSTY_FORWARD=""
+      ok "a folder vhosty serves (parked or linked)" ;;
+    forward)
+      if [ -n "$fwd" ] && [ "$fwd" != "$VHOSTY_FORWARD" ]; then
+        # Another server: the last one's overrides don't apply to it
+        VHOSTY_FORWARD="$fwd"; VHOSTY_FORWARD_TLD=""; VHOSTY_FORWARD_HTTP=""
+        VHOSTY_FORWARD_HTTPS=""; VHOSTY_FORWARD_TLS=""; VHOSTY_FORWARD_CERTS=""
+      fi
+      VHOSTY_SITES="off"
+      forward_check
+      forward_ready
+      ok "$FWD_NAME's site <name>.$FWD_TLD" ;;
+    none)
+      VHOSTY_SITES="off"; VHOSTY_FORWARD=""
+      ok "nothing (vhosty enable sites, or forward, can change that later)" ;;
+  esac
+  if [ -n "$ports_set" ]; then
+    VHOSTY_PORTS="$ports"
+    check_ports
+  elif [ "$fresh" = "1" ] && [ "$mode" = "none" ]; then
+    # A machine that only proxies opens no ports to the tailnet unless asked
+    VHOSTY_PORTS=""
+  fi
+  if [ -n "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ]; then ok "ports open as https://<port>.<domain>: $VHOSTY_PORTS"
+  else ok "no port routes (vhosty enable ports opens dev servers' ports)"; fi
 
   step "DNS provider"
   info "Where the domain's DNS is: cloudflare (vhosty manages the record), digitalocean,"
@@ -2608,48 +2834,7 @@ cmd_setup() {
     dns_credentials
   fi
 
-  # With Herd, Herd has the folders and PHP
-  if ! herd_mode; then
-    step "Parked folders"
-    info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
-    [ -n "$park" ] || park="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
-    park="$(expand_tilde "$park")"
-    check_folder "$park" parked
-    [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
-    park="$(cd "$park" && pwd)"
-    case ":$VHOSTY_PARKED:" in
-      *":$park:"*) ;;
-      *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
-    esac
-    parked_list | while IFS= read -r o; do ok "parked $o"; done
-
-    step "PHP"
-    if [ -z "$php" ]; then
-      if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
-    fi
-    VHOSTY_PHP="$php"
-    if php_enabled; then
-      v="$(php_default)"
-      [ -n "$v" ] || v="$(php_cli_minor)"
-      if is_macos; then
-        info "PHP comes from Homebrew ($BREW_PHP_TAP), one version per site if you like."
-        need_brew
-        # Older vhosty's static builds: move the ones in use to Homebrew
-        for o in $( { echo "${v:-8.5}"; php_versions_in_use; } | awk '!seen[$0]++'); do
-          if php_is_static "$o" || ! php_is_installed "$o"; then install_php_fpm "$o"; fi
-        done
-        brew_link_clis
-      else
-        php_is_installed "${v:-none}" || install_php_fpm "$v"
-      fi
-      v="$(php_default)"
-      [ -n "$v" ] || die "No PHP-FPM found"
-      VHOSTY_PHP_DEFAULT="$v"
-      ok "default PHP: $v ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') installed)"
-      write_default_php_ini
-      info "PHP settings for every site: $PHP_INI"
-    fi
-  fi
+  [ "$mode" != "sites" ] || setup_sites "$parks" "$php"
   save_config
 
   step "Caddy"
@@ -2696,14 +2881,263 @@ cmd_setup() {
   done
   [ $n -lt 45 ] || warn "no certificate yet. Check: vhosty logs caddy"
 
-  if herd_mode; then
-    printf "\n%sDone.%s Herd's sites are live at https://<name>.%s (see: vhosty sites)\n" "$G" "$N" "$VHOSTY_DOMAIN"
-    printf "For links, redirects and the client address (\$request->ip()), Laravel has to trust the proxy (see the README).\n"
-  else
-    printf "\n%sDone.%s Folders in %s are live at https://<folder>.%s\n" "$G" "$N" "$park" "$VHOSTY_DOMAIN"
+  if [ -n "$services" ]; then
+    step "Docker services"
+    setup_services "$svc_dir" "$svc_only"
   fi
-  printf "Dev servers on a port are at https://<port>.%s (e.g. 5173 for Vite).\n" "$VHOSTY_DOMAIN"
+
+  printf "\n%sDone.%s " "$G" "$N"
+  case "$mode" in
+    sites) printf "Folders in %s are live at https://<folder>.%s\n" "$(parked_list | sed "s#^$VHOSTY_HOME_DIR/#~/#" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')" "$VHOSTY_DOMAIN" ;;
+    forward) printf "%s's sites are live at https://<name>.%s (see: vhosty sites)\n" "$FWD_NAME" "$VHOSTY_DOMAIN"
+             printf "For links, redirects and the client address (\$request->ip()), Laravel has to trust the proxy (see the README).\n" ;;
+    none) printf "Give something on this machine a name: vhosty proxy <name> <port>\n" ;;
+  esac
+  if [ -n "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ]; then
+    printf "Dev servers on a port are at https://<port>.%s (e.g. 5173 for Vite).\n" "$VHOSTY_DOMAIN"
+  fi
   printf "Run %svhosty doctor%s any time to check everything.\n" "$B" "$N"
+}
+
+# A new machine, at a terminal: offer a server that's already here, then sites
+setup_ask_mode() {
+  local c
+  SETUP_MODE="none"; SETUP_FWD=""
+  for c in $(forward_found); do
+    VHOSTY_FORWARD="$c"; forward_load; VHOSTY_FORWARD=""
+    info "$FWD_NAME is installed. vhosty can leave it serving your sites, and make each"
+    info "<name>.$FWD_TLD reachable as https://<name>.<domain> on your tailnet."
+    if confirm "Send names to $FWD_NAME?" Y; then SETUP_MODE="forward"; SETUP_FWD="$c"; return 0; fi
+  done
+  info "vhosty can serve folders itself: each folder in a parked folder becomes"
+  info "https://<folder>.<domain>, PHP included. Without that, vhosty only gives names to"
+  info "ports (vhosty proxy <name> <port>)."
+  if confirm "Serve folders as sites?" N; then SETUP_MODE="sites"; fi
+}
+
+# Forward presets with a server on this machine, most specific first
+forward_found() {
+  if is_macos && [ -f "$HERD_DIR/config/valet/config.json" ]; then echo herd; fi
+  if [ -f "$(valet_dir)/config.json" ]; then echo valet; fi
+  if command -v lerd >/dev/null 2>&1; then echo lerd; fi
+}
+
+# A preset whose server keeps a config has to be set up first
+forward_ready() {
+  if [ -n "$FWD_VALET" ] && [ ! -f "$FWD_VALET/config.json" ]; then
+    die "$FWD_NAME isn't set up here ($FWD_VALET/config.json not found). Install it and open it once, then run this again"
+  fi
+  if [ -n "$FWD_CLI" ] && [ -z "$FWD_VALET" ] && ! command -v "$FWD_CLI" >/dev/null 2>&1; then
+    warn "$FWD_CLI isn't on the PATH here. vhosty forwards to $FWD_HTTP all the same"
+  fi
+}
+
+# Parked folders and PHP, for setup and vhosty enable sites. PARKS: one per line
+setup_sites() { # setup_sites PARKS PHP(on|off|empty: ask)
+  local parks="$1" php="$2" park o v
+  step "Parked folders"
+  info "Each folder inside becomes https://<folder>.$VHOSTY_DOMAIN"
+  if [ -z "$parks" ] && [ -z "$VHOSTY_PARKED" ]; then
+    parks="$(ask "Folder to park" "$(parked_list | head -1 | grep . || echo "$VHOSTY_HOME_DIR/Sites")")"
+  fi
+  while IFS= read -r park; do
+    [ -n "$park" ] || continue
+    park="$(expand_tilde "$park")"
+    check_folder "$park" parked
+    [ -d "$park" ] || { mkdir -p "$park"; ok "created $park"; }
+    park="$(cd "$park" && pwd)"
+    # A relative folder (.) is checked again by its full path
+    check_folder "$park" parked
+    case ":$VHOSTY_PARKED:" in
+      *":$park:"*) ;;
+      *) VHOSTY_PARKED="${VHOSTY_PARKED:+$VHOSTY_PARKED:}$park" ;;
+    esac
+  done <<EOF
+$parks
+EOF
+  parked_list | while IFS= read -r o; do ok "parked $o"; done
+
+  step "PHP"
+  if [ -z "$php" ]; then
+    if confirm "Serve PHP sites (Laravel etc.) with PHP-FPM?" Y; then php="on"; else php="off"; fi
+  fi
+  VHOSTY_PHP="$php"
+  if php_enabled; then
+    v="$(php_default)"
+    [ -n "$v" ] || v="$(php_cli_minor)"
+    if is_macos; then
+      info "PHP comes from Homebrew ($BREW_PHP_TAP), one version per site if you like."
+      need_brew
+      # Older vhosty's static builds: move the ones in use to Homebrew
+      for o in $( { echo "${v:-8.5}"; php_versions_in_use; } | awk '!seen[$0]++'); do
+        if php_is_static "$o" || ! php_is_installed "$o"; then install_php_fpm "$o"; fi
+      done
+      brew_link_clis
+    else
+      php_is_installed "${v:-none}" || install_php_fpm "$v"
+    fi
+    v="$(php_default)"
+    [ -n "$v" ] || die "No PHP-FPM found"
+    VHOSTY_PHP_DEFAULT="$v"
+    ok "default PHP: $v ($(php_installed_versions | tr '\n' ' ' | sed 's/ $//') installed)"
+    write_default_php_ini
+    info "PHP settings for every site: $PHP_INI"
+  else
+    ok "static folders only (index.html); vhosty enable sites --php adds PHP"
+  fi
+}
+
+# Docker services, for setup and vhosty enable services: a compose.yaml that's
+# already there is used as it is; otherwise vhosty writes one
+setup_services() { # setup_services [DIR] [ONLY]
+  local dir="${1:-${VHOSTY_SERVICES_DIR:-$VHOSTY_DIR/services}}" only="${2:-}"
+  dir="$(expand_tilde "$dir")"
+  if [ -f "$dir/compose.yaml" ] || [ -f "$dir/docker-compose.yml" ] || [ -f "$dir/compose.yml" ] || [ -f "$dir/docker-compose.yaml" ]; then
+    [ -z "$only" ] || warn "$dir already has a compose file, so --only is ignored: vhosty uses the file as it is"
+    cmd_services dir "$dir"
+    cmd_services up
+  else
+    # init checks the ports and asks before starting them
+    if [ -n "$only" ]; then cmd_services init "$dir" --only "$only"; else cmd_services init "$dir"; fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Commands: enable, disable. What answers names (sites or forward), the Docker
+# services and the port routes, after setup. Turning one off keeps its
+# settings and data: parked folders, links, pins, compose.yaml, volumes.
+# ---------------------------------------------------------------------------
+ENABLE_USAGE="Usage: vhosty enable sites [--park DIR].. [--php|--no-php]
+       vhosty enable forward <${FORWARD_PRESETS// /|}|TLD> [--tld T] [--http ADDR] [--https ADDR] [--tls auto|always|never] [--certs DIR]
+       vhosty enable services [--only a,b | --dir DIR]
+       vhosty enable ports [\"$DEFAULT_PORTS\"]"
+
+cmd_enable() {
+  need_config
+  local what="${1:-}"
+  [ $# -eq 0 ] || shift
+  case "$what" in
+    sites) enable_sites "$@" ;;
+    forward) enable_forward "$@" ;;
+    services|svc) enable_services "$@" ;;
+    ports) enable_ports "$@" ;;
+    -h|--help) echo "$ENABLE_USAGE" ;;
+    *) die "$ENABLE_USAGE" ;;
+  esac
+}
+
+enable_sites() {
+  local parks="" php=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --park) [ -n "${2:-}" ] || die "--park needs a folder"; check_folder "$2" parked; parks="$parks$2
+"; shift 2 ;;
+      --php) php="on"; shift ;;
+      --no-php) php="off"; shift ;;
+      *) die "$ENABLE_USAGE" ;;
+    esac
+  done
+  if forward_mode; then
+    forward_load
+    info "Forwarding to $FWD_NAME stops: it and vhosty's sites would both answer every name"
+    VHOSTY_FORWARD=""
+  fi
+  VHOSTY_SITES="on"
+  # Turning sites back on keeps what PHP was, unless told
+  if [ -z "$php" ] && [ -n "$VHOSTY_PARKED$(site_names)" ]; then php="$VHOSTY_PHP"; fi
+  setup_sites "$parks" "$php"
+  save_config
+  cmd_rebuild
+  ok "sites on: folders in $(parked_list | sed "s#^$VHOSTY_HOME_DIR/#~/#" | tr '\n' ' ' | sed 's/ $//; s/ /, /g') are https://<folder>.$VHOSTY_DOMAIN"
+}
+
+enable_forward() {
+  local target="${1:-}" tld="" http="" https="" tls="" certs=""
+  [ -n "$target" ] || die "$ENABLE_USAGE"
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tld) tld="${2:-}"; shift 2 ;;
+      --http) http="${2:-}"; shift 2 ;;
+      --https) https="${2:-}"; shift 2 ;;
+      --tls) tls="${2:-}"; shift 2 ;;
+      --certs) certs="${2:-}"; shift 2 ;;
+      *) die "$ENABLE_USAGE" ;;
+    esac
+  done
+  # The command says all of it: what an earlier one set doesn't carry over
+  VHOSTY_FORWARD="$target"; VHOSTY_FORWARD_TLD="$tld"; VHOSTY_FORWARD_HTTP="$http"
+  VHOSTY_FORWARD_HTTPS="$https"; VHOSTY_FORWARD_TLS="$tls"; VHOSTY_FORWARD_CERTS="$certs"
+  forward_check
+  forward_ready
+  if [ "$VHOSTY_SITES" = "on" ]; then
+    info "vhosty's own sites stop (their folders and settings stay: vhosty enable sites brings them back)"
+    VHOSTY_SITES="off"
+  fi
+  save_config
+  cmd_rebuild
+  ok "names that aren't a port or a proxy go to $FWD_NAME, as <name>.$FWD_TLD (https: $FWD_TLS)"
+}
+
+enable_services() {
+  local only="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --only) [ -n "${2:-}" ] || die "$ENABLE_USAGE"; only="$2"; shift 2 ;;
+      --dir) [ -n "${2:-}" ] || die "$ENABLE_USAGE"; dir="$2"; shift 2 ;;
+      *) die "$ENABLE_USAGE" ;;
+    esac
+  done
+  need_docker
+  setup_services "$dir" "$only"
+}
+
+enable_ports() {
+  [ $# -le 1 ] || die "$ENABLE_USAGE"
+  VHOSTY_PORTS="${1-$DEFAULT_PORTS}"
+  check_ports
+  [ -n "$(printf '%s' "$VHOSTY_PORTS" | tr -d ' ')" ] || die "No ports given. To close them all: vhosty disable ports"
+  save_config
+  cmd_rebuild
+  ok "open as https://<port>.$VHOSTY_DOMAIN: $VHOSTY_PORTS"
+}
+
+cmd_disable() {
+  need_config
+  case "${1:-}" in
+    sites)
+      # Already off: rebuild anyway, so a retry after a failed rebuild finishes the job
+      if sites_on; then VHOSTY_SITES="off"; save_config; else info "vhosty isn't serving sites here"; fi
+      cmd_rebuild
+      ok "sites off: PHP-FPM and Octane stopped. Parked folders, links and settings stay, for: vhosty enable sites" ;;
+    forward)
+      if ! forward_mode; then
+        info "vhosty isn't forwarding names here"
+        cmd_rebuild
+        return 0
+      fi
+      forward_load
+      VHOSTY_FORWARD=""
+      save_config
+      cmd_rebuild
+      ok "names no longer go to $FWD_NAME" ;;
+    services|svc)
+      [ -n "$VHOSTY_SERVICES_DIR" ] || { info "No Docker services set up"; return 0; }
+      if ( need_docker ) 2>/dev/null; then
+        cmd_services down || warn "Couldn't stop them. By hand: docker compose --project-directory $VHOSTY_SERVICES_DIR down"
+      else
+        warn "Docker isn't running, so nothing was stopped"
+      fi
+      ok "vhosty no longer manages $VHOSTY_SERVICES_DIR (compose.yaml and the data volumes stay: vhosty enable services --dir $VHOSTY_SERVICES_DIR)"
+      VHOSTY_SERVICES_DIR=""
+      save_config ;;
+    ports)
+      VHOSTY_PORTS=""
+      save_config
+      cmd_rebuild
+      ok "no ports open as https://<port>.$VHOSTY_DOMAIN (proxies still work)" ;;
+    *) die "Usage: vhosty disable sites | forward | services | ports" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -2972,6 +3406,7 @@ cmd_status() {
   local ip s st p o v
   ip="$(ts_ip)"
   printf "%svhosty%s  *.%s  →  %s\n" "$B" "$N" "$VHOSTY_DOMAIN" "${ip:-tailscale not running}"
+  printf "  %s\n" "$(mode_line)"
   head_ "Services"
   for s in $(svc_all); do
     st="$(svc_state "$s")"
@@ -4384,7 +4819,6 @@ mail_service() {
 
 # Is mail.<domain> this Mailpit's page?
 mail_proxied() { # mail_proxied WEB_PORT
-  if herd_mode; then return 1; fi
   [ -f "$(proxy_file mail)" ] && [ "$(proxy_port mail)" = "$1" ]
 }
 
@@ -4408,7 +4842,7 @@ EOF
 # the port out means someone closed that page, so this doesn't open it again.
 mail_domain() { # mail_domain WEB_PORT
   local web="$1" why="" url
-  if herd_mode || [ -z "$web" ] || ! mail_port_open "$web"; then return 0; fi
+  if [ -z "$web" ] || ! mail_port_open "$web"; then return 0; fi
   url="https://$web.$VHOSTY_DOMAIN"
   if [ -f "$(proxy_file mail)" ]; then
     mail_proxied "$web" || warn "The proxy 'mail' goes to port $(proxy_port mail), not Mailpit's, so vhosty left it alone. Mailpit's page stays at $url"
@@ -4416,7 +4850,7 @@ mail_domain() { # mail_domain WEB_PORT
   fi
   if why="$(mail_folder_parked)"; then
     why="$why already exists"
-  elif why="$(proxy_site_clash mail)"; then
+  elif why="$(fallback_owner mail)"; then
     why="there's already a site called mail ($why)"
   else
     cmd_proxy mail "$web"
@@ -4781,8 +5215,8 @@ log_arg_is_site() {
 # valid_name also keeps a name with a slash away from site_load's path.
 site_log_known() {
   local name
-  # Herd keeps its own list of sites, so only services here
-  if herd_mode; then return 1; fi
+  # Only vhosty's own sites have logs it knows; otherwise only services
+  sites_on || return 1
   name="$(lower "$1")"
   valid_name "$name" || return 1
   [ -f "$(site_file "$name")" ] || parked_dir_for "$name" >/dev/null
@@ -4904,10 +5338,19 @@ site_tail() {
 # ---------------------------------------------------------------------------
 cmd_sites() {
   need_config
-  if herd_mode; then herd_list_sites; return 0; fi
   local dir p name lname note linked proxied
-  linked="$(cmd_links 2>/dev/null | grep https || true)"
   proxied="$(proxy_rows)"
+  case "$(fallback_mode)" in
+    forward)
+      if [ -n "$proxied" ]; then head_ "Proxies"; printf '%s\n' "$proxied"; fi
+      forward_list_sites
+      return 0 ;;
+    none)
+      [ -n "$proxied" ] || die "Nothing here yet. Send a name to a port on this machine: vhosty proxy <name> <port>"
+      head_ "Proxies"; printf '%s\n' "$proxied"; echo
+      return 0 ;;
+  esac
+  linked="$(cmd_links 2>/dev/null | grep https || true)"
   [ -n "$VHOSTY_PARKED" ] || [ -n "$linked" ] || [ -n "$proxied" ] || die "No sites. Run: vhosty park <folder>, or vhosty link"
   if [ -n "$linked" ]; then head_ "Linked"; printf '%s\n' "$linked"; fi
   if [ -n "$proxied" ]; then head_ "Proxies"; printf '%s\n' "$proxied"; fi
@@ -4948,8 +5391,11 @@ site_url() { # site_url [site|port]: with none, the site of the current folder
   need_config
   local name
   if [ -n "${1:-}" ]; then name="$(lower "$1")"
-  elif herd_mode; then name="$(herd_site_from_dir "$PWD")" || die "$PWD isn't inside a Herd site. Pass a site name or a port."
-  else name="$(site_from_dir "$PWD")" || die "$PWD isn't inside a site. Pass a site name or a port."; fi
+  elif forward_mode; then
+    forward_load
+    name="$(forward_site_from_dir "$PWD")" || die "$PWD isn't inside a site on $FWD_NAME that vhosty can see. Pass a name or a port."
+  elif sites_on; then name="$(site_from_dir "$PWD")" || die "$PWD isn't inside a site. Pass a site name or a port."
+  else die "Pass a proxy's name or a port."; fi
   echo "https://$name.$VHOSTY_DOMAIN"
 }
 
@@ -5015,11 +5461,31 @@ proxy_port() {
   if proxy_port_ok "$p"; then echo "$p"; fi
 }
 
-# Says how NAME is a site already; fails if it isn't. A parked folder with
-# nothing to serve isn't one: that's what a Node app in ~/Sites looks like, and
-# what it runs on a port can have the folder's name.
-proxy_site_clash() {
+# Who answers https://NAME.domain: says "port", "proxy", or "site (how)", and
+# fails if nobody does. The Caddyfile tries names in the same order: ports,
+# proxies, (apps, #35), then the fallback.
+name_owner() {
+  local why
+  case "$1" in ''|*[!0123456789]*) ;; *) echo "port"; return 0 ;; esac
+  if [ -f "$(proxy_file "$1")" ]; then echo "proxy"; return 0; fi
+  if why="$(fallback_owner "$1")"; then echo "site ($why)"; return 0; fi
+  return 1
+}
+
+# Says how the fallback serves NAME as a site; fails if it doesn't. With sites
+# on, a parked folder with nothing to serve isn't one: that's what a Node app in
+# ~/Sites looks like, and what it runs on a port can have the folder's name.
+# Forwarded, it's a site the other server lists (Herd and Valet do).
+fallback_owner() {
   local p f base
+  if forward_mode; then
+    forward_load
+    p="$(forward_sites | awk -F'|' -v n="$1" '$1 == n {print $3 " in " $2; exit}' | sed "s#$VHOSTY_HOME_DIR/#~/#")"
+    [ -n "$p" ] || return 1
+    echo "on $FWD_NAME, $p"
+    return 0
+  fi
+  sites_on || return 1
   if [ -f "$(site_file "$1")" ]; then
     site_load "$1"
     if [ "$SITE_LINKED" = "yes" ]; then echo "linked to $SITE_PATH"
@@ -5088,7 +5554,6 @@ EOF
 # warning; a file that can't be routed is a failure.
 proxy_checks() {
   local name port owner why
-  if herd_mode; then return 0; fi
   for name in $(proxy_names); do
     port="$(proxy_port "$name")"
     if [ -z "$port" ]; then
@@ -5098,7 +5563,7 @@ proxy_checks() {
     owner="$(proxy_owner "$port")"
     if [ -n "$owner" ]; then ok "proxy $name → localhost:$port ($owner)"
     else warn "proxy $name: nothing is listening on port $port. It works once something does."; fi
-    if why="$(proxy_site_clash "$name")"; then
+    if why="$(fallback_owner "$name")"; then
       warn "proxy $name hides a site of the same name ($why). Rename one, or remove the proxy: vhosty unproxy $name"
     fi
   done
@@ -5153,7 +5618,7 @@ cmd_proxy() {
   proxy_port_ok "$port" || die "'$port' isn't a port (1 to 65535)"
   if proxy_port_is_caddy "$port"; then die "Port $port is Caddy's own, so a proxy to it would only come back to Caddy"; fi
   # An existing proxy can always be moved or repaired, whatever appeared since
-  if [ ! -f "$(proxy_file "$name")" ] && why="$(proxy_site_clash "$name")"; then
+  if [ ! -f "$(proxy_file "$name")" ] && why="$(fallback_owner "$name")"; then
     die "'$name' is already a site ($why). Pick another name for the proxy"
   fi
   mkdir -p "$PROXIES_DIR"
@@ -5176,7 +5641,7 @@ cmd_unproxy() {
   { proxy_name_ok "$name" && [ -f "$(proxy_file "$name")" ]; } || die "'$name' isn't a proxy. Run: vhosty proxies"
   rm -f "$(proxy_file "$name")"
   ok "removed proxy $name"
-  if why="$(proxy_site_clash "$name")"; then info "https://$name.$VHOSTY_DOMAIN goes back to the site it was hiding ($why)"; fi
+  if why="$(fallback_owner "$name")"; then info "https://$name.$VHOSTY_DOMAIN goes back to the site it was hiding ($why)"; fi
   cmd_rebuild
 }
 
@@ -5224,7 +5689,7 @@ cmd_edit() {
   need_config
   case "${1:-config}" in
     config) ${EDITOR:-nano} "$CONFIG_FILE"; load_config; cmd_rebuild ;;
-    php|ini|php.ini) herd_refuse ini; cmd_ini_edit --global ;;
+    php|ini|php.ini) mode_refuse ini; cmd_ini_edit --global ;;
     env|token) ${EDITOR:-nano} "$SECRETS_FILE"; chmod 600 "$SECRETS_FILE"; svc_restart caddy; ok "restarted caddy" ;;
     *) die "Unknown file '$1' (use config, php, or env)" ;;
   esac
@@ -5417,7 +5882,7 @@ cmd_update() {
     caddy) need_config; install_caddy ;;
     php|php-fpm)
       need_config
-      ! herd_mode || die "Herd manages PHP here. Update it in Herd."
+      mode_refuse php
       php_enabled || die "PHP is turned off"
       if [ -n "${1:-}" ]; then valid_version "$1"; update_php "$1"
       else for v in $(php_versions_in_use); do update_php "$v"; done; fi ;;
@@ -7373,9 +7838,10 @@ doctor_checks() {
   cmd_validate caddy || true
   cmd_cert || true
 
-  if herd_mode; then
-    head_ "Herd"
-    herd_checks
+  if forward_mode; then
+    forward_load
+    head_ "Forward to $FWD_NAME"
+    forward_checks
   fi
 
   if php_enabled; then
@@ -7393,7 +7859,8 @@ doctor_checks() {
   else bad "$(drift_reason). Run: vhosty rebuild"; fi
   if config_applied; then ok "services are running the current config"
   elif svc_installed; then bad "services haven't loaded the current config. Run: vhosty rebuild"; fi
-  for name in $(site_names); do
+  # Sites turned off keep their settings for later; they're not checked meanwhile
+  for name in $(! sites_on || site_names); do
     site_load "$name"
     dir="$(site_dir "$name" || true)"
     if [ -n "$SITE_WT_KIND" ] && [ ! -d "$SITE_PATH" ]; then
@@ -7417,7 +7884,7 @@ doctor_checks() {
     octane_checks
   fi
 
-  if ! herd_mode && [ -n "$(proxy_names)" ]; then
+  if [ -n "$(proxy_names)" ]; then
     head_ "Proxies"
     proxy_checks
   fi
@@ -7520,30 +7987,44 @@ cmd_uninstall() {
 # ---------------------------------------------------------------------------
 usage() {
   cat <<EOF
-${B}vhosty${N} $VHOSTY_VERSION: Herd for your tailnet
+${B}vhosty${N} $VHOSTY_VERSION: private HTTPS names for everything on this machine, over Tailscale
+
+Every https://<name>.domain is, in this order: a port (https://5173.domain), a proxy,
+or else what the machine is set up for: vhosty's own sites, another web server
+(forward), or nothing.
 
 ${B}Setup${N}
-  vhosty setup [--domain D] [--dns PROVIDER] [--park DIR] [--no-php] [--herd] [--yes] [--overwrite-dns]
-                                     PROVIDER: cloudflare (default), digitalocean, porkbun, route53,
-                                     custom. Credentials from the environment (CF_API_TOKEN=...),
-                                     saved, or asked for. --herd (macOS): keep Laravel Herd serving
-                                     the sites, and forward <name>.domain to <name>.test
+  vhosty setup [--domain D] [--dns PROVIDER] [--yes] [--overwrite-dns]
+               [--sites [--park DIR].. [--no-php] | --forward PRESET|TLD | --gateway]
+               [--services [--only a,b | --dir DIR]] [--ports SPEC]
+                                     The gateway: certificate, DNS, Caddy, Tailscale Serve; then what
+                                     answers other names. PROVIDER: cloudflare (default), digitalocean,
+                                     porkbun, route53, custom. Credentials from the environment
+                                     (CF_API_TOKEN=...), saved, or asked for
+  vhosty enable sites [--park DIR].. [--php|--no-php]   Serve folders (and PHP) as sites
+  vhosty enable forward <herd|valet|lerd|TLD> [--tld T] [--http ADDR] [--https ADDR]
+                [--tls auto|always|never] [--certs DIR]  Send other names to <name>.TLD on another server
+  vhosty enable services [--only a,b | --dir DIR]   Docker databases and Mailpit
+  vhosty enable ports ["SPEC"]       Open dev servers' ports as https://<port>.domain (default: $DEFAULT_PORTS)
+  vhosty disable sites|forward|services|ports      Stop it; settings, folders and data stay
   vhosty uninstall                   Remove the services (keeps your files)
 
-${B}Sites${N}
+${B}Names${N}
+  vhosty proxy <name> <port>         Send name.domain to a port on this machine (Jellyfin, Grafana, a Node app)
+  vhosty unproxy <name>              Remove a proxy
+  vhosty proxies                     List proxies
+  vhosty sites                       Every name: proxies and sites, and their URLs
+  vhosty open [name|port]            Open in the browser (default: current folder)
+  vhosty url  [name|port]            Print the URL and copy it
+
+${B}Sites${N} ${D}(vhosty enable sites)${N}
   vhosty park [dir]                  Serve every folder in dir (default: current)
   vhosty unpark [dir]                Stop serving a parked folder
   vhosty parked                      List parked folders
   vhosty link [dir] [--name N]       Serve one folder, anywhere, as N.domain (default: current)
   vhosty unlink [name]               Remove a link
   vhosty links                       List links
-  vhosty proxy <name> <port>         Send name.domain to a port on this machine (a Node app, Grafana, anything)
-  vhosty unproxy <name>              Remove a proxy
-  vhosty proxies                     List proxies
-  vhosty sites                       List sites and their URLs
   vhosty site [name]                 Everything about one site (default: current folder)
-  vhosty open [site|proxy|port]      Open in the browser (default: current folder)
-  vhosty url  [site|proxy|port]      Print the URL and copy it
 
 ${B}Git worktrees${N} ${D}(each its own <branch>--<site>.domain, .env and database)${N}
   vhosty worktree [list]             List worktree sites
@@ -7637,10 +8118,12 @@ main() {
   local cmd="${1:-help}"
   if [ $# -gt 0 ]; then shift; fi
   load_config
-  if herd_mode; then herd_refuse "$cmd"; fi
+  mode_refuse "$cmd"
 
   case "$cmd" in
     setup)              cmd_setup "$@" ;;
+    enable)             cmd_enable "$@" ;;
+    disable)            cmd_disable "$@" ;;
     park)               cmd_park "${1:-}" ;;
     unpark)             cmd_unpark "${1:-}" ;;
     link)               cmd_link "$@" ;;

@@ -585,24 +585,23 @@ SH
 
 # --- Herd ---------------------------------------------------------------------
 
-@test "with Herd, the commands point at the port route" {
-  write_config 'VHOSTY_BACKEND="herd"'
-  for args in "proxy app 3001" "unproxy app" "proxies"; do
-    # shellcheck disable=SC2086
-    run vh main $args
-    [ "$status" -ne 0 ]
-    assert_contains "$output" "https://<port>.<domain>"
-  done
-  [ ! -d "$VHOSTY_DIR/proxies" ]
+@test "forwarding, the proxy commands work as anywhere" {
+  write_config 'VHOSTY_FORWARD="test"'
+  run vh main proxy app 3001
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run vh main proxies
+  assert_contains "$output" "https://app.test.example"
+  run vh main unproxy app
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
 }
 
-@test "with Herd, a proxy from before isn't routed or checked" {
+@test "forwarding, a proxy from before is routed and checked" {
   proxy_conf grafana 3001
-  write_config 'VHOSTY_BACKEND="herd"'
+  write_config 'VHOSTY_FORWARD="test"'
   vh write_configs
-  refute_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "@proxy_"
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "@proxy_grafana"
   run linux proxy_checks
-  [ -z "$output" ]
+  assert_contains "$output" "proxy grafana"
 }
 
 # --- Through a real Caddy -----------------------------------------------------

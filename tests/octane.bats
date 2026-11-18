@@ -503,11 +503,12 @@ SITE_OCTANE=21000"
   assert_contains "$(cat "$HOME/php.log")" "php artisan octane:reload (in $PARKED/escrow)"
 }
 
-@test "with Herd, Octane points at the port route" {
-  write_config 'VHOSTY_BACKEND="herd"'
+@test "forwarding to Herd, Octane points at the port route and proxies" {
+  write_config 'VHOSTY_FORWARD="herd"'
   run vh main octane on
   [ "$status" -ne 0 ]
   assert_contains "$output" "octane:start"
+  assert_contains "$output" "vhosty proxy <name> 8001"
 }
 
 @test "the site's details say it's on Octane, and what FrankenPHP means" {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
-# VHOSTY_BACKEND=herd: Caddy on the Tailscale address forwards <name>.domain to
-# Herd's nginx as <name>.test. A fake Herd folder stands in for Herd's config,
-# and small Python servers stand in for its nginx.
+# VHOSTY_FORWARD: Caddy forwards <name>.domain to another web server on this
+# machine as <name>.<tld>. Herd is the preset most tested here: a fake Herd
+# folder stands in for its config, and small Python servers for its nginx.
 
 load helpers
 
@@ -15,16 +15,23 @@ CADDY="${VHOSTY_TEST_CADDY:-$HOME/.vhosty/bin/caddy}"
 setup() {
   vhosty_setup
   export VHOSTY_HERD_DIR="$HOME/Library/Application Support/Herd"
-  export VHOSTY_HERD_HTTP="127.0.0.1:$HTTP_PORT" VHOSTY_HERD_HTTPS="127.0.0.1:$HTTPS_PORT"
   VALET="$VHOSTY_HERD_DIR/config/valet"
   mkdir -p "$VALET/Sites" "$VALET/Certificates" "$HOME/Herd"
   herd_config test
-  write_config 'VHOSTY_BACKEND="herd"'
+  forward_config herd
 }
 
 teardown() {
   local p
   for p in ${CADDY_PID:-} ${HTTP_PID:-} ${HTTPS_PID:-}; do kill "$p" 2>/dev/null || true; done
+}
+
+# forward_config TARGET [extra lines]: forwarding to the fake servers
+forward_config() {
+  write_config "VHOSTY_FORWARD=\"$1\"
+VHOSTY_FORWARD_HTTP=\"127.0.0.1:$HTTP_PORT\"
+VHOSTY_FORWARD_HTTPS=\"127.0.0.1:$HTTPS_PORT\"
+${2:-}"
 }
 
 # herd_config TLD: Herd's config.json, parking ~/Herd
@@ -35,7 +42,7 @@ herd_config() {
 herd_site() { mkdir -p "$HOME/Herd/$1"; }
 secure() { touch "$VALET/Certificates/$1.test.crt"; }
 
-@test "with Herd, Caddy listens on localhost's ports 48443 and 48080, not 80 or 443" {
+@test "forwarding, Caddy listens on localhost's ports 48443 and 48080, not 80 or 443" {
   vh write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   run grep -E '^\s*default_bind' "$VHOSTY_DIR/Caddyfile"
@@ -45,13 +52,14 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$caddyfile" "auto_https disable_redirects"
 }
 
-@test "with Herd, sites go to Herd as <name>.test, and nothing is served by vhosty" {
+@test "forwarded to Herd, names go to it as <name>.test, and nothing is served by vhosty" {
   php_site escrow   # a folder in vhosty's parked dir: ignored with Herd
   vh write_configs
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
   assert_contains "$caddyfile" "header_up Host {labels.2}.test"
   assert_contains "$caddyfile" "reverse_proxy http://127.0.0.1:$HTTP_PORT"
   assert_contains "$caddyfile" "try_files {labels.2}.test.crt"
+  assert_contains "$caddyfile" "vhosty_kind forward"
   refute_contains "$caddyfile" "php_fastcgi"
   refute_contains "$caddyfile" "vhosty_kind nosite"
   # the port route stays
@@ -64,7 +72,7 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "header_up Host {labels.2}.herd"
 }
 
-@test "with Herd, the Caddyfile doesn't depend on the Tailscale address" {
+@test "forwarding, the Caddyfile doesn't depend on the Tailscale address" {
   vh write_configs
   before="$(cat "$VHOSTY_DIR/Caddyfile")"
   stub tailscale 'exit 1'
@@ -72,7 +80,7 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   [ "$(cat "$VHOSTY_DIR/Caddyfile")" = "$before" ]
 }
 
-@test "with Herd, there's no PHP-FPM and no php shim" {
+@test "forwarding, there's no PHP-FPM and no php shim" {
   run vh svc_all
   [ "$output" = "caddy" ]
   vh write_configs
@@ -85,7 +93,7 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   mkdir -p "$HOME/Projects/escrow-v2" "$HOME/Projects/api"
   ln -s "$HOME/Projects/escrow-v2" "$VALET/Sites/escrow"
   ln -s "$HOME/Projects/api" "$VALET/Sites/api"
-  run vh herd_sites
+  run vh forward_sites
   [ "$status" -eq 0 ]
   assert_contains "$output" "escrow|$(cd "$HOME/Projects/escrow-v2" && pwd -P)|linked"
   assert_contains "$output" "api|"
@@ -100,7 +108,7 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   for t in bash env sed tr cat uname id awk grep sort head cut mktemp rm; do
     ln -s "$(command -v "$t")" "$HOME/nojq/$t"
   done
-  PATH="$HOME/nojq" run vh herd_paths
+  PATH="$HOME/nojq" run vh valet_paths
   [ "$output" = "$(printf '%s\n/opt/sites' "$HOME/Herd")" ]
 }
 
@@ -123,27 +131,113 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$output" "(parked, not secured)"
 }
 
-@test "commands that are Herd's job say what to use instead" {
+@test "commands for vhosty's own sites say Herd serves them" {
   run vh main park
   [ "$status" -ne 0 ]
-  assert_contains "$output" "herd park"
+  assert_contains "$output" "Herd serves the sites on this machine (VHOSTY_FORWARD=herd)"
+  assert_contains "$output" "(herd)"
   run vh main isolate 8.4
-  assert_contains "$output" "herd isolate"
+  assert_contains "$output" "Herd serves the sites"
   run vh main ini set memory_limit 1G
-  assert_contains "$output" "Herd's PHP settings"
+  assert_contains "$output" "Herd serves the sites"
   run vh main edit php
-  assert_contains "$output" "Herd's PHP settings"
+  assert_contains "$output" "Herd serves the sites"
 }
 
-@test "without VHOSTY_BACKEND, vhosty serves the folders itself" {
-  write_config
-  linux write_configs
+@test "proxies work while forwarding, and come before Herd's sites" {
+  run vh main proxy vite 5173
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
-  refute_contains "$caddyfile" "Herd"
-  assert_contains "$caddyfile" "php_fastcgi"
+  proxy="$(printf '%s\n' "$caddyfile" | grep -n '@proxy_vite host' | cut -d: -f1)"
+  forward="$(printf '%s\n' "$caddyfile" | grep -n '# Forward:' | cut -d: -f1)"
+  [ "$proxy" -lt "$forward" ]
 }
 
-@test "with Herd, the drift check doesn't look for the Tailscale address" {
+@test "a proxy can't take the name of a Herd site, and doctor says when one hides it" {
+  herd_site escrow
+  run vh main proxy escrow 3000
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "'escrow' is already a site (on Herd, parked in ~/Herd/escrow)"
+  mkdir -p "$VHOSTY_DIR/proxies"
+  printf 'PROXY_PORT=3000\n' >"$VHOSTY_DIR/proxies/escrow.conf"
+  run vh proxy_checks
+  assert_contains "$output" "proxy escrow hides a site of the same name (on Herd"
+  run vh cmd_sites
+  assert_contains "$output" "escrow (not reached: https://escrow.test.example is a proxy)"
+}
+
+@test "the old VHOSTY_BACKEND=herd is read as VHOSTY_FORWARD=herd" {
+  write_config "VHOSTY_BACKEND=\"herd\""
+  run vh fallback_mode
+  [ "$output" = forward ]
+  vh save_config
+  run cat "$VHOSTY_DIR/config"
+  assert_contains "$output" "VHOSTY_FORWARD=herd"
+  assert_contains "$output" "VHOSTY_SITES=off"
+  refute_contains "$output" "VHOSTY_BACKEND"
+}
+
+@test "a TLD forwards to any server, over http unless told" {
+  forward_config test
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "header_up Host {labels.2}.test"
+  assert_contains "$caddyfile" "reverse_proxy http://127.0.0.1:$HTTP_PORT"
+  refute_contains "$caddyfile" "forward_secured"
+  refute_contains "$caddyfile" "reverse_proxy https://"
+  assert_contains "$caddyfile" 'vhosty_forward_name "the web server on this machine"'
+}
+
+@test "VHOSTY_FORWARD_TLS=always sends every name over https" {
+  forward_config test 'VHOSTY_FORWARD_TLS="always"'
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "reverse_proxy https://127.0.0.1:$HTTPS_PORT"
+  refute_contains "$caddyfile" "reverse_proxy http://"
+}
+
+@test "VHOSTY_FORWARD_TLS=auto needs a certificate folder, and uses the one given" {
+  forward_config test 'VHOSTY_FORWARD_TLS="auto"'
+  run vh write_configs
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "VHOSTY_FORWARD_TLS=auto needs VHOSTY_FORWARD_CERTS"
+  forward_config dev "VHOSTY_FORWARD_CERTS=\"~/certs\""
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "root \"$HOME/certs\""
+  assert_contains "$caddyfile" "try_files {labels.2}.dev.crt"
+}
+
+@test "forward settings that would break the Caddyfile are refused" {
+  for bad in 'VHOSTY_FORWARD="Not A TLD"' 'VHOSTY_FORWARD="test"
+VHOSTY_FORWARD_TLD="te st"' 'VHOSTY_FORWARD="test"
+VHOSTY_FORWARD_HTTP="127.0.0.1:80 {"' 'VHOSTY_FORWARD="test"
+VHOSTY_FORWARD_TLS="sometimes"' 'VHOSTY_FORWARD="test"
+VHOSTY_FORWARD_TLS="auto"
+VHOSTY_FORWARD_CERTS="/tmp/a\"b"' 'VHOSTY_FORWARD="test"
+VHOSTY_FORWARD_HTTP="127.0.0.1:99999"' "VHOSTY_FORWARD=\"test\"
+VHOSTY_FORWARD_HTTP=\$'127.0.0.1:80 {\\n127.0.0.1:80'" "VHOSTY_FORWARD=\$'test\\nNot A TLD'"; do
+    write_config "$bad"
+    run vh write_configs
+    [ "$status" -ne 0 ] || { echo "accepted: $bad" >&2; false; }
+  done
+}
+
+@test "Valet's folder: ~/.config/valet, else ~/.valet; its TLD comes from its config" {
+  forward_config valet
+  run vh valet_dir
+  [ "$output" = "$HOME/.valet" ]
+  mkdir -p "$HOME/.config/valet/Certificates"
+  printf '{"tld":"localhost","paths":[]}' >"$HOME/.config/valet/config.json"
+  run vh valet_dir
+  [ "$output" = "$HOME/.config/valet" ]
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "header_up Host {labels.2}.localhost"
+  assert_contains "$caddyfile" "root \"$HOME/.config/valet/Certificates\""
+}
+
+@test "forwarding, the drift check doesn't look for the Tailscale address" {
   vh write_configs
   run vh drift_reason
   [ "$output" = "settings changed since the last rebuild" ]
@@ -217,11 +311,14 @@ start_caddy() {
 
 get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1:$PORT${2:-/}"; }
 
-@test "the Herd Caddyfile is valid" {
+@test "the forward Caddyfile is valid, in each https mode" {
   [ -x "$CADDY" ] || skip "no Caddy with the Cloudflare plugin (set VHOSTY_TEST_CADDY)"
-  vh write_configs
-  CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
-  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  for tls in auto always never; do
+    forward_config herd "VHOSTY_FORWARD_TLS=\"$tls\""
+    vh write_configs
+    CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
+    [ "$status" -eq 0 ] || { echo "$tls: $output" >&2; false; }
+  done
 }
 
 @test "an unsecured Herd site is reached over http, as <name>.test, with the real host forwarded" {
@@ -248,7 +345,7 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   assert_contains "$output" "sni=escrow.test"
 }
 
-@test "Herd not answering gets vhosty's 502 page" {
+@test "a server not answering gets vhosty's 502 page, naming it" {
   need_caddy
   herd_site escrow
   start_caddy
@@ -256,19 +353,40 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   [ "$(echo "$output" | tail -1)" = 502 ]
   assert_contains "$output" "Herd isn't answering"
   assert_contains "$output" "<code>escrow.test</code>"
+  assert_contains "$output" "herd restart"
+  kill "$CADDY_PID"; wait "$CADDY_PID" 2>/dev/null || true
+  forward_config test
+  start_caddy
+  run get escrow
+  assert_contains "$output" "The web server on this machine isn't answering"
+  refute_contains "$output" " restart</pre>"
 }
 
-@test "with Herd, port sites still go to localhost" {
+@test "forwarding, port sites still go to localhost" {
   need_caddy
   start_herd
   start_caddy
   run get "$HTTP_PORT"
   [ "$(echo "$output" | tail -1)" = 403 ]   # not in VHOSTY_PORTS
-  write_config "VHOSTY_BACKEND=\"herd\"
-VHOSTY_PORTS=\"$HTTP_PORT\""
+  forward_config herd "VHOSTY_PORTS=\"$HTTP_PORT\""
   kill "$CADDY_PID"; wait "$CADDY_PID" 2>/dev/null || true
   start_caddy
   run get "$HTTP_PORT"
   [ "$(echo "$output" | tail -1)" = 200 ]
   assert_contains "$output" "host=$HTTP_PORT.test.example"
+}
+
+@test "Lerd: its TLD from config.yaml, its certificates from its data folder" {
+  forward_config lerd
+  mkdir -p "$XDG_CONFIG_HOME/lerd" "$XDG_DATA_HOME/lerd/certs/sites"
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "header_up Host {labels.2}.test"
+  assert_contains "$caddyfile" "root \"$XDG_DATA_HOME/lerd/certs/sites\""
+  assert_contains "$caddyfile" "try_files {labels.2}.test.crt"
+  printf 'dns:\n  enabled: true\n  tld: "lerd"\nnginx:\n  http_port: 80\n  tld: other\n' >"$XDG_CONFIG_HOME/lerd/config.yaml"
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "header_up Host {labels.2}.lerd"
+  assert_contains "$caddyfile" "try_files {labels.2}.lerd.crt"
 }

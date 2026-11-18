@@ -884,11 +884,19 @@ mail_config() { # mail_config [SMTP] [WEB]: the file exists, and compose reports
   [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
 }
 
-@test "under Herd, no proxy: that route is Herd's" {
+@test "forwarding to Herd, Mailpit gets mail.<domain> unless Herd has a site called mail" {
   mail_config
-  echo 'VHOSTY_BACKEND="herd"' >>"$VHOSTY_DIR/config"
+  export VHOSTY_HERD_DIR="$HOME/Herd.app"
+  mkdir -p "$VHOSTY_HERD_DIR/config/valet/Sites" "$HOME/Herd/mail"
+  printf '{"tld":"test","paths":["%s"]}' "$HOME/Herd" >"$VHOSTY_HERD_DIR/config/valet/config.json"
+  echo 'VHOSTY_FORWARD="herd"' >>"$VHOSTY_DIR/config"
   run vh mail_domain 8025
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   [ ! -e "$VHOSTY_DIR/proxies/mail.conf" ]
+  assert_contains "$output" "there's already a site called mail (on Herd, parked in ~/Herd/mail)"
+  rmdir "$HOME/Herd/mail"
+  run vh mail_domain 8025
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ -f "$VHOSTY_DIR/proxies/mail.conf" ]
 }
 

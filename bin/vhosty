@@ -414,6 +414,8 @@ forward_load() {
     if [ -f "$FWD_VALET/config.json" ]; then
       # json_get dies without jq or plutil, which would end vhosty here
       FWD_TLD="$(json_get tld <"$FWD_VALET/config.json" 2>/dev/null)" || FWD_TLD=""
+      # Valet for Linux (valet-linux-plus) keeps it under the older name
+      [ -n "$FWD_TLD" ] || { FWD_TLD="$(json_get domain <"$FWD_VALET/config.json" 2>/dev/null)" || FWD_TLD=""; }
     fi
   fi
   FWD_TLD="${VHOSTY_FORWARD_TLD:-${FWD_TLD:-test}}"

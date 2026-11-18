@@ -231,6 +231,7 @@ _vhosty() {
       if (( CURRENT == 3 )); then _values 'action' status add; fi ;;
     doctor|dr)     _values 'option' --fix --yes ;;
     prune)         _values 'option' --yes ;;
+    uninstall)     _arguments '--yes[Don'"'"'t ask first]' ;;
     setup)         _arguments '--domain[Domain]:domain:' '--token[Cloudflare token (CF_API_TOKEN is safer)]:token:' '--dns[DNS provider]:provider:(cloudflare digitalocean porkbun route53 custom)' '--sites[Serve folders as sites]' '*--park[Folder to park]:folder:_files -/' '--no-php[Static folders only]' '--forward[Send other names to another web server]:preset or TLD:(herd valet lerd test)' '--gateway[Only proxies and ports]' '--services[Docker databases and Mailpit]' '--only[Services, comma-separated]:services:_sequence compadd - mysql postgres valkey meilisearch typesense rustfs mailpit' '--dir[Folder with your compose.yaml]:folder:_files -/' '--ports[Ports to open, like "3000-5999 8000-8099"]:ports:' '--yes[Accept defaults]' '--overwrite-dns[Replace a *.domain record that is not vhosty'"'"'s]' ;;
     enable)
       if (( CURRENT == 3 )); then

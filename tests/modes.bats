@@ -15,6 +15,11 @@ proxy_to() { mkdir -p "$VHOSTY_DIR/proxies"; printf 'PROXY_PORT=%s\n' "$2" >"$VH
   [ "$output" = sites ]
   vh write_configs
   assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "php_fastcgi"
+  run vh main rebuild
+  assert_contains "$output" "added VHOSTY_SITES=on"
+  assert_contains "$(cat "$VHOSTY_DIR/config")" "VHOSTY_SITES=on"
+  run vh main rebuild
+  refute_contains "$output" "VHOSTY_SITES"
 }
 
 @test "a new machine, with no config yet, starts as the gateway only" {

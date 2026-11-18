@@ -99,6 +99,7 @@ VHOSTY_FORWARD_HTTPS=""   # and for https; default 127.0.0.1:443
 VHOSTY_FORWARD_TLS=""     # auto (https for names with a certificate in VHOSTY_FORWARD_CERTS) | always | never
 VHOSTY_FORWARD_CERTS=""   # the folder of <name>.<tld>.crt files; default: the preset's
 VHOSTY_BACKEND=""         # old setting: herd became VHOSTY_FORWARD=herd
+CONFIG_OLD=""              # what load_config changed from a config older than 0.9, for rebuild to save
 # Caddy's ports on localhost; Tailscale Serve passes the tailnet's 443 and 80 to them
 VHOSTY_SERVE_PORT="${VHOSTY_SERVE_PORT:-${VHOSTY_HERD_PORT:-48443}}"
 VHOSTY_SERVE_HTTP_PORT="${VHOSTY_SERVE_HTTP_PORT:-48080}"
@@ -190,10 +191,13 @@ load_config() {
   fi
   # Before VHOSTY_SITES: every machine served folders, unless Herd did
   # (VHOSTY_BACKEND=herd). A new machine starts with neither.
+  # vhosty rebuild writes the new settings to the file (CONFIG_OLD).
   if [ -z "$VHOSTY_SITES" ]; then
     if [ "$VHOSTY_BACKEND" = "herd" ]; then
       VHOSTY_SITES="off"; VHOSTY_FORWARD="${VHOSTY_FORWARD:-herd}"
-    elif [ -f "$CONFIG_FILE" ]; then VHOSTY_SITES="on"
+      CONFIG_OLD="VHOSTY_BACKEND=herd is now VHOSTY_FORWARD=herd, VHOSTY_SITES=off"
+    elif [ -f "$CONFIG_FILE" ]; then
+      VHOSTY_SITES="on"; CONFIG_OLD="added VHOSTY_SITES=on"
     else VHOSTY_SITES="off"; fi
   fi
   VHOSTY_BACKEND=""
@@ -3355,6 +3359,11 @@ cmd_site() {
 
 cmd_rebuild() {
   need_config
+  if [ -n "$CONFIG_OLD" ]; then
+    save_config
+    info "$CONFIG_FILE: $CONFIG_OLD"
+    CONFIG_OLD=""
+  fi
   rm -f "$SERVE_FALLBACK"   # tries Serve again
   ! php_enabled || brew_link_clis
   write_configs
@@ -5640,6 +5649,7 @@ cmd_unproxy() {
   # Checked first: the name becomes a path, and rm follows it
   { proxy_name_ok "$name" && [ -f "$(proxy_file "$name")" ]; } || die "'$name' isn't a proxy. Run: vhosty proxies"
   rm -f "$(proxy_file "$name")"
+  rmdir "$VHOSTY_DIR/proxies" 2>/dev/null || true
   ok "removed proxy $name"
   if why="$(fallback_owner "$name")"; then info "https://$name.$VHOSTY_DOMAIN goes back to the site it was hiding ($why)"; fi
   cmd_rebuild

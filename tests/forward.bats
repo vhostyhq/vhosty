@@ -166,11 +166,13 @@ secure() { touch "$VALET/Certificates/$1.test.crt"; }
   assert_contains "$output" "escrow (not reached: https://escrow.test.example is a proxy)"
 }
 
-@test "the old VHOSTY_BACKEND=herd is read as VHOSTY_FORWARD=herd" {
+@test "the old VHOSTY_BACKEND=herd is read as VHOSTY_FORWARD=herd, and rebuild writes it so" {
   write_config "VHOSTY_BACKEND=\"herd\""
   run vh fallback_mode
   [ "$output" = forward ]
-  vh save_config
+  run vh main rebuild
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "VHOSTY_BACKEND=herd is now VHOSTY_FORWARD=herd"
   run cat "$VHOSTY_DIR/config"
   assert_contains "$output" "VHOSTY_FORWARD=herd"
   assert_contains "$output" "VHOSTY_SITES=off"

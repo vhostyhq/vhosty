@@ -1,5 +1,10 @@
 # vhosty in front of Herd: design sketch
 
+> **Superseded in vhosty 0.9.** Herd mode is now one preset of
+> [forward](../README.md#forward) (`VHOSTY_FORWARD=herd`), next to Valet, Lerd and any
+> TLD. A config with `VHOSTY_BACKEND=herd` is read as that. The notes below are kept for
+> the reasoning behind the Serve listener and secured sites, which forward still uses.
+
 Status: implemented (`VHOSTY_BACKEND=herd`, `vhosty setup --herd`), tested against stand-ins for
 Herd's nginx (`tests/herd.bats`), and tried on a Mac with Herd. Three changes from the sketch below:
 

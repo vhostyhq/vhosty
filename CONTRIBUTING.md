@@ -2,14 +2,19 @@
 
 ## What vhosty is for
 
-vhosty makes folders into private HTTPS sites on your tailnet, with the PHP
-versions and settings they need, on a machine that's always on. That's the line
-for what goes in.
+vhosty gives what runs on a machine private HTTPS names on your tailnet: ports
+and named proxies everywhere, and for names nothing else claims, either folders
+it serves itself (PHP included) or another web server it forwards to. That's the
+line for what goes in.
 
 **The core**, `bin/vhosty`:
-- folders to sites: parking, links, the generated Caddyfile, the certificate and
-  DNS record, the port route for dev servers
-- PHP: versions, per-site pins and settings, extensions, the `php` command
+- names: the generated Caddyfile, the certificate and DNS record, Tailscale Serve,
+  port routes and named proxies
+- sites: parking, links, PHP versions, per-site pins and settings, extensions,
+  Octane, worktrees, the `php` command
+- forward: sending names to another local server (Herd, Valet, Lerd, any TLD).
+  Presets hold data only (a TLD, addresses, a certificate folder), never commands
+  that drive the other tool
 - what keeps that working: `doctor`, `update`, logs, `prune`, error pages
 - Docker services, as a thin layer over `docker compose` (start, status, backup
   and restore), not a container platform

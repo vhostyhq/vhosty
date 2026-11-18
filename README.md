@@ -4,59 +4,78 @@
 
 # vhosty cli
 
-**Herd for your tailnet.** Every folder becomes a private HTTPS site on your own
-domain, reachable from your phone, laptop, or any device on your
-[Tailscale](https://tailscale.com) network.
+**Private HTTPS names for everything on your machine.** vhosty gives the apps,
+dev servers and sites on a machine their own `https://<name>.yourdomain.dev`,
+reachable from your phone, laptop, or any device on your
+[Tailscale](https://tailscale.com) network, and nowhere else.
 
 ```
-~/Sites/myspace    →  https://myspace.yourdomain.dev
-~/Sites/geocities  →  https://geocities.yourdomain.dev
-localhost:5173     →  https://5173.yourdomain.dev
-localhost:3001     →  https://grafana.yourdomain.dev
+localhost:8096     →  https://jellyfin.yourdomain.dev     a self-hosted app (vhosty proxy)
+localhost:5173     →  https://5173.yourdomain.dev         a dev server, by its port
+~/Sites/myspace    →  https://myspace.yourdomain.dev      a folder: PHP or static (vhosty's sites)
+myspace.test       →  https://myspace.yourdomain.dev      a site on Herd, Valet or Lerd (forward)
 ```
 
 - Real HTTPS: a trusted Let's Encrypt wildcard certificate, with no browser warnings and no local CA to install.
-- Private: the sites are reachable only from your tailnet. Nothing is exposed to the internet, and no router ports are opened.
-- No per-site setup: drop a folder in, and it's live.
-- Several PHP versions side by side, pinned per site, with per-site PHP settings. The `php` command follows the site you're in.
-- Built for an always-on dev box, like an old iMac running Linux and your coding agents, that you check from anywhere.
+- Private: everything is reachable only from your tailnet. Nothing is exposed to the internet, and no router ports are opened.
+- One command per name, or none: give a port a name, or drop a folder in and it's live.
+- Optionally a full PHP web server: several PHP versions side by side, pinned per site, with per-site settings, Laravel Octane and git worktrees.
+- Or HTTPS in front of the PHP server you already use.
+- Built for an always-on machine, like an old iMac running Linux and your coding agents, that you reach from anywhere.
 
 Runs on **Linux** (systemd) and **macOS** (launchd).
 
 ## How it works
 
 ```
-your phone ──tailnet──▶ dev box (100.x.y.z)
+your phone ──tailnet──▶ your machine (100.x.y.z)
                          └─ Tailscale Serve :443 ─▶ Caddy 127.0.0.1:48443   *.yourdomain.dev, wildcard cert
-                              ├─ <port>.yourdomain.dev  → localhost:<port>
-                              ├─ <name>.yourdomain.dev  → localhost:<port> (vhosty proxy)
-                              ├─ <site>.yourdomain.dev  → PHP-FPM <version> (site/public/index.php)
-                              ├─ <site>.yourdomain.dev  → Laravel Octane on a local port (vhosty octane on)
-                              └─ <site>.yourdomain.dev  → static (site/index.html)
+                              ├─ 1. <port>.yourdomain.dev → localhost:<port>        (VHOSTY_PORTS)
+                              ├─ 2. <name>.yourdomain.dev → localhost:<port>        (vhosty proxy)
+                              └─ 3. anything else, one of:
+                                      sites    → a folder: PHP-FPM, Octane, or static files
+                                      forward  → <name>.test on Herd, Valet, Lerd, nginx…
+                                      nothing  → vhosty's "no site" page
 ```
 
 1. **DNS:** one wildcard record, `*.yourdomain.dev`, points at the machine's Tailscale IP. The name is public, but the IP is only reachable from your tailnet.
 2. **Certificates:** Caddy proves it owns the domain with a DNS challenge through your DNS provider's API, so Let's Encrypt never needs to reach the machine.
-3. **Routing:** Caddy reads the hostname and serves the matching folder (PHP through PHP-FPM, or static files) or proxies a port. It listens on localhost only, and [Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports 443 and 80 to it, so nothing is open to your LAN. See [Tailscale Serve](#tailscale-serve).
-4. **Services:** Caddy, one PHP-FPM per PHP version in use, and one service for each [Octane](#laravel-octane) site. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
+3. **Routing:** Caddy reads the hostname and tries a port, then a proxy, then whatever the machine is set up for. It listens on localhost only, and [Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports 443 and 80 to it, so nothing is open to your LAN. See [Tailscale Serve](#tailscale-serve).
+4. **Services:** Caddy, and with sites, one PHP-FPM per PHP version in use and one service for each [Octane](#laravel-octane) site. On Linux they're systemd user services (no sudo to manage them); on macOS, launchd daemons. They start at boot and restart if they crash.
+
+## Three ways to set up a machine
+
+What answers the names that aren't a port or a proxy is the one choice to make.
+Proxies and ports work the same in all three, and [Docker services](#docker-services)
+can be added to any of them.
+
+| | **Gateway** | **Sites** | **Forward** |
+|---|---|---|---|
+| For | Self-hosted apps: Jellyfin, Home Assistant, Grafana | A full PHP web server for your projects | HTTPS names for a PHP server you already use |
+| Other names go to | vhosty's "no site" page | Folders in your parked directories | `<name>.test` on Herd, Valet, Lerd or any web server |
+| Setup | `vhosty setup` | `vhosty setup --sites --park ~/Sites` | `vhosty setup --forward herd` |
+| Runs | Caddy | Caddy, PHP-FPM, Octane | Caddy |
+| Port routes | off unless `--ports` | on | on |
+
+Change it later with `vhosty enable` and `vhosty disable` (see [Switching](#switching)).
 
 ## Requirements
 
 - **[Tailscale](https://tailscale.com/download)** on this machine and on every device you'll browse from.
 - **A domain whose DNS is on [Cloudflare](https://cloudflare.com)**, or on another provider vhosty supports (see [DNS providers](#dns-providers)). It can be one you own or a new one, and it doesn't have to be dedicated to vhosty: if its `*` record is already used (say, by staging sites), use a subdomain like `box.example.com`.
 - **An API token for it.** For Cloudflare: *Zone → Read* and *DNS → Edit* for that domain, created at dash.cloudflare.com → My Profile → API Tokens with the "Edit zone DNS" template.
-- **[Tailscale Serve](https://tailscale.com/kb/1312/serve) enabled on your tailnet.** Setup prints Tailscale's link to enable it if it isn't. Ports 80 and 443 on the machine itself can stay in use (nginx, Apache, Herd, Valet): vhosty doesn't need them. On macOS it can also put Laravel Herd's sites on your tailnet instead (see [With Laravel Herd](#with-laravel-herd-macos)).
+- **[Tailscale Serve](https://tailscale.com/kb/1312/serve) enabled on your tailnet.** Setup prints Tailscale's link to enable it if it isn't. Ports 80 and 443 on the machine itself can stay in use (nginx, Apache, Herd, Valet, Lerd): vhosty doesn't need them.
 
-**Linux** (tested on Ubuntu 26.04): systemd, `curl`, `jq`, and PHP from apt. Ubuntu
-ships one PHP version; for several side by side, add Ondřej Surý's repo
+**Linux** (tested on Ubuntu 26.04): systemd, `curl` and `jq`; for sites, PHP from apt.
+Ubuntu ships one PHP version; for several side by side, add Ondřej Surý's repo
 ([packages.sury.org/php](https://packages.sury.org/php/README.txt)), then
 `vhosty php install 8.4`. Setup asks for your password twice, once each to let
 your services run at boot (`loginctl enable-linger`) and to let your account
 manage Tailscale Serve (`tailscale set --operator`). Nothing else needs root.
 
-**macOS** 13 (Ventura) or newer, Intel or Apple Silicon, with
-[Homebrew](https://brew.sh) for PHP (not needed with `--no-php` or `--herd`).
-Starting and stopping services asks for your password (launchd daemons).
+**macOS** 13 (Ventura) or newer, Intel or Apple Silicon. For sites with PHP,
+[Homebrew](https://brew.sh). Starting and stopping services asks for your
+password (launchd daemons).
 
 vhosty downloads its own Caddy, with your DNS provider's plugin built in.
 
@@ -110,91 +129,166 @@ For another, set `VHOSTY_REF` to its tag, or to `main` for changes that aren't r
 (`git checkout v0.3.0` first for a release).
 
 **On a cloud VM:** one command creates an [InstaBox](https://instabox.sh) machine and
-sets it up as a vhosty box, with Tailscale, PHP and Docker services. On any fresh Debian or
+sets it up with vhosty, Tailscale, PHP and Docker services. On any fresh Debian or
 Ubuntu VM (a droplet, a Hetzner server), `scripts/box-setup.sh` does the same setup. See
 [docs/instabox.md](docs/instabox.md).
 
-`vhosty setup` asks for your domain, token, and the folder to park, then:
+`vhosty setup` asks for your domain and token. On a new machine it also asks what
+answers names that aren't a port or a proxy: if it finds Herd, Valet or Lerd it
+offers to [forward](#forward) to it, and otherwise offers to [serve folders](#sites).
+Say no to both for a [gateway](#names-ports-and-proxies). Then it:
 
-- downloads Caddy into `~/.vhosty/bin` (and on macOS installs PHP with Homebrew),
+- downloads Caddy into `~/.vhosty/bin` (and for sites with PHP on macOS, installs PHP with Homebrew),
 - creates or fixes the `*.domain` DNS record on Cloudflare (DNS only, not proxied), or shows the record to create on other providers,
-- generates the Caddyfile and PHP-FPM configs,
+- generates the Caddyfile (and for sites, the PHP-FPM configs),
 - installs and starts the services, and
 - waits for the wildcard certificate.
 
-To run it without prompts:
+To run it without prompts, pick the setup with a flag:
 
 ```bash
-CF_API_TOKEN=... vhosty setup --domain box.example.com --park ~/Sites --yes
+export CF_API_TOKEN=...
+vhosty setup --domain box.example.com --yes                          # gateway: ports off until you name them
+vhosty setup --domain box.example.com --ports "3000-5999 8000-8099" --yes   # gateway with port routes
+vhosty setup --domain box.example.com --park ~/Sites --yes          # sites, with PHP
+vhosty setup --domain box.example.com --park ~/Sites --no-php --yes # sites, static only
+vhosty setup --domain box.example.com --forward herd --yes          # forward: herd, valet, lerd, or a TLD
+vhosty setup --domain box.example.com --park ~/Sites --services --only mysql,valkey --yes
 ```
+
+| Flag | What it does |
+|---|---|
+| `--domain D`, `--dns PROVIDER` | The domain, and its DNS provider (`cloudflare` by default) |
+| `--token T` | The DNS token, instead of `CF_API_TOKEN` or the prompt |
+| `--sites`, `--park DIR` | Serve folders. `--park` can be given more than once, and implies `--sites` |
+| `--php`, `--no-php` | With sites: PHP-FPM, or static files only |
+| `--forward PRESET\|TLD` | Send other names to `herd`, `valet`, `lerd`, or a server answering `<name>.<TLD>` |
+| `--gateway` | Neither: only ports and proxies |
+| `--ports SPEC` | The port routes, like `"3000-5999 8000-8099"`, or `""` for none |
+| `--services`, `--only a,b`, `--dir DIR` | Docker services: the standard set, a few of them, or your own `compose.yaml` |
+| `--yes`, `--overwrite-dns` | No questions; and replace a `*.domain` record that points somewhere else |
+
+Run `vhosty setup` again any time: it keeps what's set up and fixes what's
+missing. To change the setup itself, use [`vhosty enable` and `disable`](#switching).
 
 The token can also be given with `--token`, but then it's in your shell history and,
 while setup runs, visible to other users of the machine. `--yes` won't replace a
 `*.domain` record that points somewhere other than a Tailscale address (a staging
 server, say); add `--overwrite-dns` if that's what you want.
 
-Add `~/.vhosty/bin` to the front of your `PATH` so `php` follows the site you're
-in (see [PHP versions](#php-versions)), and turn on tab completion (zsh):
+Turn on tab completion (zsh), and with sites, add `~/.vhosty/bin` to the front of
+your `PATH` so `php` follows the site you're in (see [PHP versions](#php-versions)):
 
 ```bash
 export PATH="$HOME/.vhosty/bin:$PATH"
 fpath=(~/.vhosty/completions $fpath)   # before compinit
 ```
 
-## Tailscale Serve
+## Names: ports and proxies
 
-Caddy listens on `127.0.0.1:48443` and `:48080` only, and
-[Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports
-443 and 80 to them (`tailscale serve status` shows it). It works the same on Linux
-and macOS:
+These work the same in every setup, and win over sites and forwarding.
 
-- The connection stays encrypted end to end with vhosty's certificate; Serve only
-  forwards it, and port 80 only redirects to `https://`.
-- Serve tells Caddy which device is asking (a PROXY protocol header), so PHP sees
-  the device's tailnet address in `REMOTE_ADDR`, not 127.0.0.1. Laravel needs no
-  `trustProxies` for that, or for https links: PHP-FPM gets both from Caddy
-  directly. (With [Herd](#with-laravel-herd-macos), or a dev server on a port, it does.)
-- Ports 80 and 443 on the machine itself stay free for nginx, Apache, Herd, Valet
-  or anything else. (macOS wouldn't let Caddy have the tailnet's 443 anyway: it
-  keeps ports below 1024 on one address for root.)
-- With 443 and 80 vhosty's in Serve's config, other tools that publish through
-  Serve find them taken instead of quietly taking them over. T3 Code's pairing,
-  for one, uses 443 by default; with vhosty there, it stops and asks for another
-  port (`--tailscale-serve-port 8443`).
+**Ports.** A dev server is reachable by its port: `https://3000.yourdomain.dev`
+(Next.js, Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
+(`artisan serve`). Only the ports in `VHOSTY_PORTS` are routed, so other things
+listening on the machine's localhost, like an admin console or a database, stay
+private to it. Sites and forwarding route `3000-5999 6006 8000-8099 8888` by default;
+a gateway set up from scratch routes none until you say so:
 
-Setup turns this on, so Serve has to be enabled on your tailnet: if it isn't,
-setup prints Tailscale's link to enable it. Anything you had on Serve's ports 443
-or 80 is replaced, after asking. If something takes them later, `vhosty doctor`
-says what and how to move it, and `vhosty rebuild` takes them back. To move
-Caddy's own ports, set `VHOSTY_SERVE_PORT` and `VHOSTY_SERVE_HTTP_PORT` in
-`~/.vhosty/config`, then run `vhosty rebuild`.
+```bash
+vhosty enable ports                       # the default ranges
+vhosty enable ports "3000-5999 9001"      # your own
+vhosty disable ports                      # none
+```
 
-Older vhosty on Linux had Caddy listen on the Tailscale address's 443 itself.
-`vhosty rebuild` (which `vhosty update self` runs) moves it behind Serve.
+**Proxies.** For an address that stays the same, give a port a name. It's for
+anything that speaks HTTP on this machine: a self-hosted app, a Node app, Grafana.
 
-## macOS
+```bash
+vhosty proxy jellyfin 8096      # https://jellyfin.yourdomain.dev → localhost:8096
+vhosty proxy grafana 3001
+vhosty proxies                  # vhosty sites lists them too
+vhosty open jellyfin
+vhosty unproxy grafana
+```
 
-PHP comes from Homebrew, through [shivammathur/php](https://github.com/shivammathur/homebrew-php),
-which has every version side by side, as Ondřej Surý's repo does for apt.
-`vhosty php install 8.4` runs `brew install shivammathur/php/php@8.4`, plus
-`redis` and `igbinary` from [shivammathur/extensions](https://github.com/shivammathur/homebrew-extensions)
-(the rest of what apt's packages have, like `pdo_pgsql`, `intl` and `gd`, is built in).
-vhosty still runs the PHP-FPMs itself, with its own pools and settings; it doesn't
-use `brew services`. Each version's CLI is linked as `~/.vhosty/bin/php-8.4`.
-Homebrew's newest stable PHP is the plain `php` formula (`php@8.5` is another name
-for it), so when the next version comes out, `brew upgrade` moves it on: run
-`vhosty php install 8.5` then to keep 8.5.
+- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to every device
+  on your tailnet, with no login from vhosty. Think twice about admin consoles.
+- Websockets and server-sent events work. A `vhosty rebuild` drops open websockets,
+  so they have to reconnect. The app sees its real `Host`, plus
+  `X-Forwarded-Host`, `-Proto` and `-For`, so one that checks the host (Vite's
+  `server.allowedHosts`) or builds links from it may need telling.
+- Caddy sets those `X-Forwarded-*` headers itself, and removes `Forwarded`, `X-Real-IP`,
+  `Tailscale-*` and `X-Webauth-*` from requests. Other headers pass through, so don't
+  point an app's login at a header a client could send.
+- A name that's only numbers is refused (it's a port). With sites, so is one that's
+  already a site (parked with PHP or a plain `index.html`, linked or on Octane). A
+  folder with a `package.json` doesn't count as a site, so a Node or Vite app in
+  `~/Sites/shop` can run its server as `vhosty proxy shop 3000`. If a parked folder,
+  or a site on the server vhosty forwards to, later takes the same name, the proxy
+  keeps it and `vhosty sites` and `doctor` say so.
+- Nothing listening is normal for a dev server: `doctor` warns rather than fails, and
+  the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
+  stop the app.
+- Run it again with another port to move it.
 
-Older vhosty downloaded static PHP-FPM builds, which can't add extensions. They
-keep working until moved: `vhosty setup`, or `vhosty php install <version>` per
-version, installs it from Homebrew and removes the old build. `vhosty doctor`
-lists any that are left.
+When something isn't there, vhosty says what and why instead of showing a blank
+page: a name nobody answers lists what it checked; a port or proxy with nothing
+listening, or a server that's down, shows what to run and reloads every 2 seconds
+until it comes up. Errors from your app itself pass through untouched.
 
-Caddy listens behind Tailscale Serve, as on Linux (see
-[Tailscale Serve](#tailscale-serve)), so ports 80 and 443 on the Mac itself stay
-free for Herd, Valet or anything else.
+**Vite:** add [@vhosty/vite-plugin](https://github.com/vhostyhq/vite-plugin)
+(`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
+with no config. Laravel setup and mixed-content fixes are in
+[docs/laravel-vite.md](docs/laravel-vite.md).
 
-## Laravel Octane
+### Self-hosted apps
+
+Most apps work behind a proxy as they are. Some want to be told the proxy is
+there, so they see the device's address rather than 127.0.0.1, or so they accept
+the new host name:
+
+- **Jellyfin:** works as is. For the device's address in its logs and sessions, add
+  `127.0.0.1` under Dashboard → Networking → Known proxies.
+- **Home Assistant:** answers `400: Bad Request` until it trusts the proxy. In its
+  `http` settings, set `use_x_forwarded_for: true` and `trusted_proxies` to
+  `127.0.0.1` and `::1`. Recent versions keep these in `.storage/http` once they've
+  started, and ignore `configuration.yaml`'s `http:` after that, so stop Home
+  Assistant and edit them there.
+- **Homepage:** add the name to `HOMEPAGE_ALLOWED_HOSTS`, like
+  `homepage.yourdomain.dev`.
+- **Apps in Docker:** publish the port on localhost (`127.0.0.1:8096:8096`), so the
+  only way in from other devices is the HTTPS name. Docker's published ports skip
+  the firewall. An app on the host network (Home Assistant often is) listens on
+  every interface, so firewall its port if you only want it reached through vhosty.
+
+## Sites
+
+With sites on (`vhosty setup --park ~/Sites`, or `vhosty enable sites` later),
+vhosty is a web server too: every folder in a parked folder is a site, with PHP
+through PHP-FPM, or static files.
+
+For a folder `~/Sites/escrow`:
+
+- If it has `public/index.php`, vhosty serves it with PHP (Laravel, Symfony, etc.).
+- If it has `index.html`, vhosty serves it as a static site.
+- Folder names become hostnames, so stick to letters, numbers, and dashes.
+  Hostnames are lowercase: `MyApp` is served at `myapp.yourdomain.dev`. A new
+  folder with capitals needs a `vhosty rebuild` first; `vhosty sites` says when.
+
+```bash
+vhosty park ~/Sites             # every folder inside; park as many as you like
+vhosty link ~/Projects/My\ App  # one folder, from anywhere: https://my-app.yourdomain.dev
+vhosty sites                    # every site and proxy, and folders that won't work
+vhosty site escrow              # folder, PHP version, settings
+```
+
+A link wins over a parked folder with the same name (pick another with `--name`).
+Several PHP versions run side by side, each site pinned to one if you like, with
+its own settings and extensions. `vhosty enable sites --no-php` serves static
+folders only, with no PHP installed.
+
+### Laravel Octane
 
 A site can run on [Laravel Octane](https://laravel.com/docs/octane) instead of
 PHP-FPM, at the same address:
@@ -240,88 +334,23 @@ vhosty logs octane-myapp
   after updating Octane. `doctor` checks the port isn't open on the tailnet address.
 - A `vhosty rebuild` restarts the Octane services, so a new pin or setting applies.
 
-## With Laravel Herd (macOS)
+### PHP on macOS
 
-If you use [Laravel Herd](https://herd.laravel.com), vhosty can leave it in charge.
-Herd keeps serving your sites (its PHP versions, extensions, parked folders and
-links, `herd secure`), and vhosty makes each one reachable on your tailnet:
+PHP comes from Homebrew, through [shivammathur/php](https://github.com/shivammathur/homebrew-php),
+which has every version side by side, as Ondřej Surý's repo does for apt.
+`vhosty php install 8.4` runs `brew install shivammathur/php/php@8.4`, plus
+`redis` and `igbinary` from [shivammathur/extensions](https://github.com/shivammathur/homebrew-extensions)
+(the rest of what apt's packages have, like `pdo_pgsql`, `intl` and `gd`, is built in).
+vhosty still runs the PHP-FPMs itself, with its own pools and settings; it doesn't
+use `brew services`. Each version's CLI is linked as `~/.vhosty/bin/php-8.4`.
+Homebrew's newest stable PHP is the plain `php` formula (`php@8.5` is another name
+for it), so when the next version comes out, `brew upgrade` moves it on: run
+`vhosty php install 8.5` then to keep 8.5.
 
-```
-escrow.test (Herd, on the Mac)  →  https://escrow.yourdomain.dev (any tailnet device)
-```
-
-```bash
-vhosty setup --herd
-```
-
-Setup offers this on its own when it finds Herd. Caddy forwards
-`<name>.yourdomain.dev` to Herd as `<name>.test` (Herd's TLD, read from its config).
-A site you add in Herd works right away; `vhosty sites` lists them.
-
-Herd keeps its ports 80 and 443; Caddy listens behind
-[Tailscale Serve](#tailscale-serve), as everywhere.
-
-Herd's nginx stands between Caddy and PHP, so out of the box Laravel sees
-`escrow.test` as the host (for links and redirects) and 127.0.0.1 as the client
-(`$request->ip()`). Trust the proxy, and it reads what Caddy sends instead:
-`X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` with the device's
-tailnet address. In `bootstrap/app.php`:
-
-```php
-->withMiddleware(function (Middleware $middleware) {
-    $middleware->trustProxies(at: ['127.0.0.1', '::1']);
-})
-```
-
-Port sites (`https://5173.yourdomain.dev`) and `vhosty services` work as usual.
-The PHP commands (`php`, `isolate`, `ini`, `ext`) and `park`/`link` point you to
-Herd's own. `vhosty doctor` checks that Herd is answering and that Serve forwards
-to Caddy; `vhosty uninstall` removes the Serve forwards too.
-
-## Updating
-
-```bash
-vhosty update self        # vhosty itself: the latest release, then vhosty rebuild
-vhosty update             # vhosty, Caddy, and the PHP versions in use (apt or Homebrew)
-```
-
-`update self` replaces `~/.vhosty/bin/vhosty` (and the zsh completion), then
-runs `vhosty rebuild` with the new version so its changes take effect. Your
-settings, sites and services stay as they are. `--ref main` installs changes that
-aren't released yet, and `--ref v0.3.0` a particular release. It won't install an
-older version over a newer one without `--force`. Installed from a clone? Update
-with `git pull && ./install.sh` instead, then `vhosty rebuild`.
-
-`vhosty doctor` tells you when there's a new release. It asks GitHub once per run;
-set `VHOSTY_UPDATE_CHECK=0` to turn that off.
-
-## Usage
-
-| Command | What it does |
-|---|---|
-| `vhosty park [dir]` / `unpark [dir]` | Serve, or stop serving, every folder inside `dir`. Park as many as you like |
-| `vhosty link [dir] [--name N]` / `unlink [name]` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
-| `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
-| `vhosty sites` / `links` | List every site and its URL, and flag folders that won't work |
-| `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
-| `vhosty worktree [add\|link\|remove\|list]` | A git worktree as a site of its own, with its own URL, `.env` and database. See [Git worktrees](#git-worktrees) |
-| `vhosty open [site\|proxy\|port]` / `url` | Open a site, or print its URL. With no argument, the current folder's site |
-| `vhosty php [list\|install\|default\|which]` | PHP versions |
-| `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
-| `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
-| `vhosty ext [require\|install\|check]` | PHP extensions each site needs |
-| `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
-| `vhosty mail [status\|add]` | Catch outgoing mail with Mailpit: its address and the lines for an app's `.env` |
-| `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
-| `vhosty status` | Service state, process IDs, and sockets |
-| `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
-| `vhosty logs <site> [N]` / `vhosty tail <site>` | A Laravel app's own log, from its `storage/logs`. See [Site logs](#site-logs) |
-| `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, sites, extensions, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
-| `vhosty prune` | Remove configs for sites whose folder is gone or no longer parked, and generated files nothing uses |
-| `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
-| `vhosty update [self\|caddy\|php [version]]` | Update vhosty to the latest release, re-download Caddy, and upgrade PHP (apt on Linux, Homebrew on macOS). See [Updating](#updating) |
-| `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
-| `vhosty rebuild` | Regenerate the config and reload the services |
+Older vhosty downloaded static PHP-FPM builds, which can't add extensions. They
+keep working until moved: `vhosty setup`, or `vhosty php install <version>` per
+version, installs it from Homebrew and removes the old build. `vhosty doctor`
+lists any that are left.
 
 ### Site logs
 
@@ -346,71 +375,8 @@ vhosty logs myapp | grep ERROR
 - **A service wins when a site has the same name**: `caddy`, `php`, `all`, an installed
   PHP version, and so on, and `rotate` for `vhosty logs`. To read such a site's log, use
   plain `tail` on its `storage/logs` (`vhosty site <name>` shows the folder).
-- **With [Herd](#with-laravel-herd-macos)**, this doesn't look up Herd's sites, so
-  `vhosty logs` and `vhosty tail` only cover services. Use plain `tail` for an app's log.
-
-### What gets served
-
-For a folder `~/Sites/escrow`:
-
-- If it has `public/index.php`, vhosty serves it with PHP (Laravel, Symfony, etc.).
-- If it has `index.html`, vhosty serves it as a static site.
-- Folder names become hostnames, so stick to letters, numbers, and dashes.
-  Hostnames are lowercase: `MyApp` is served at `myapp.yourdomain.dev`. A new
-  folder with capitals needs a `vhosty rebuild` first; `vhosty sites` says when.
-
-Folders outside a parked directory can be linked one at a time:
-`vhosty link ~/Projects/My\ App` serves it at `https://my-app.yourdomain.dev`
-(pick another name with `--name`). A link wins over a parked folder with the same name.
-
-Any dev server works through its port: `https://3000.yourdomain.dev` (Next.js,
-Rails), `https://5173.yourdomain.dev` (Vite), `https://8000.yourdomain.dev`
-(`artisan serve`). Only the ports in `VHOSTY_PORTS` are forwarded (by default
-`3000-5999 6006 8000-8099 8888`), so other things listening on the machine's
-localhost, like an admin console or a search engine, stay private to it. To open
-another, add it in `~/.vhosty/config` (`VHOSTY_PORTS="3000-5999 6006 8000-8099 8888 9001"`)
-and run `vhosty rebuild`.
-
-For an address that stays the same, give a port a name. It's for what isn't a PHP
-site: a Node app, Grafana, anything that speaks plain HTTP on this machine.
-
-```bash
-vhosty proxy grafana 3001       # https://grafana.yourdomain.dev → localhost:3001
-vhosty proxies                  # vhosty sites lists them too
-vhosty unproxy grafana
-```
-
-- The port doesn't have to be in `VHOSTY_PORTS`: naming it opens it to every device
-  on your tailnet, with no login from vhosty. Think twice about admin consoles.
-- Websockets and server-sent events work. A `vhosty rebuild` drops open websockets,
-  so they have to reconnect. The app sees its real `Host`, plus
-  `X-Forwarded-Host`, `-Proto` and `-For`, so one that checks the host (Vite's
-  `server.allowedHosts`) or builds links from it may need telling.
-- Caddy sets those `X-Forwarded-*` headers itself, and removes `Forwarded`, `X-Real-IP`,
-  `Tailscale-*` and `X-Webauth-*` from requests. Other headers pass through, so don't
-  point an app's login at a header a client could send.
-- A name that's already a site (parked with PHP or a plain `index.html`, linked or on
-  Octane) is refused, as is one that's only numbers. A folder with a `package.json`
-  doesn't count as a site, so a Node or Vite app in `~/Sites/shop` can run its server as
-  `vhosty proxy shop 3000`. If a parked folder later becomes a site under the same name,
-  the proxy keeps the name and `vhosty sites` and `doctor` say so. `octane on`, `isolate`
-  and `ini --site` refuse a proxy's name.
-- Nothing listening is normal for a dev server: `doctor` warns rather than fails, and
-  the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
-  stop the app.
-- Run it again with another port to move it. With [Herd](#with-laravel-herd-macos),
-  use the port route instead.
-
-When something isn't there, vhosty says what and why instead of showing a blank
-page: a name with no site lists the paths it checked and links to your sites; a
-port or proxy with nothing listening, or a PHP version that's down, shows what to run and
-reloads every 2 seconds until it comes up. Errors from your app itself (Laravel's
-500s, missing assets) pass through untouched.
-
-**Vite:** add [@vhosty/vite-plugin](https://github.com/vhostyhq/vite-plugin)
-(`npm i -D @vhosty/vite-plugin`) for HTTPS and hot reload at `https://<port>.<domain>`,
-with no config. Laravel setup and mixed-content fixes are in
-[docs/laravel-vite.md](docs/laravel-vite.md).
+- **Without sites** (a gateway, or [forwarding](#forward)), `vhosty logs` and `vhosty tail`
+  only cover services. Use plain `tail` for an app's log.
 
 ### Git worktrees
 
@@ -545,8 +511,8 @@ their own folder, URL, `.env` and database; vhosty says which ones. `vhosty unli
 refuses a worktree site: use `vhosty worktree remove`.
 
 Worktree databases are throwaway, so `vhosty services backup` skips exactly the ones
-current worktree sites record, and says which. With [Herd](#with-laravel-herd-macos) serving the sites, these
-commands are off.
+current worktree sites record, and says which. Without sites, these
+commands are off; with [forwarding](#forward), use `git worktree add` and the server's own `link`.
 
 ### PHP versions
 
@@ -613,7 +579,97 @@ and `vhosty php install` installs every declared extension along with the
 version. If a site can't work at all without an extension, declare it in the
 project's `composer.json` (`"ext-name": "*"`) instead, so it travels with the code.
 
-### Docker services
+## Forward
+
+If another web server already serves your sites on this machine as
+`<name>.test` (Herd, Valet, Lerd, or nginx or Apache set up that way), vhosty can
+leave it in charge and make each site reachable on your tailnet:
+
+```
+myapp.test (on this machine)  →  https://myapp.yourdomain.dev (any tailnet device)
+```
+
+```bash
+vhosty setup --forward herd        # or valet, lerd
+vhosty setup --forward test        # any server answering <name>.test on ports 80 and 443
+vhosty enable forward lerd         # switch an existing setup
+```
+
+Caddy sends `<name>.yourdomain.dev` to the server as `<name>.<tld>`. Its sites, PHP
+versions, extensions and `secure` settings stay its own, and a site you add there
+works right away. `vhosty sites` lists them for Herd and Valet (their parked
+folders and links); for others it lists your proxies. The server keeps ports 80
+and 443; Caddy listens behind [Tailscale Serve](#tailscale-serve), as everywhere.
+
+The presets only fill in where things are:
+
+| | TLD | Certificates (for https sites) |
+|---|---|---|
+| `herd` (macOS) | from Herd's config | `~/Library/Application Support/Herd/config/valet/Certificates` |
+| `valet` | from Valet's config | `~/.config/valet/Certificates` |
+| `lerd` | from Lerd's `config.yaml` | `~/.local/share/lerd/certs/sites` |
+| a TLD | that one | none |
+
+**HTTP or HTTPS.** A site the server secures redirects its http to
+`https://<name>.test`, which other devices can't open, so Caddy talks https to
+those. By default (`auto`) it does that for each site with a certificate
+(`<name>.<tld>.crt`) in the folder above, and http for the rest. The https hop
+stays on this machine, so the server's own certificate isn't checked.
+`--tls always` or `--tls never` sets one for every site.
+
+Every setting can be changed, with a preset or without one:
+
+```bash
+vhosty enable forward test --http 127.0.0.1:8080 --https 127.0.0.1:8443 --tls never
+vhosty enable forward valet --tld localhost
+vhosty enable forward test --certs ~/certs --tls auto
+```
+
+These end up in `~/.vhosty/config` as `VHOSTY_FORWARD`, `VHOSTY_FORWARD_TLD`,
+`VHOSTY_FORWARD_HTTP`, `VHOSTY_FORWARD_HTTPS`, `VHOSTY_FORWARD_TLS` and
+`VHOSTY_FORWARD_CERTS`.
+
+**Laravel behind it.** The other server stands between Caddy and PHP, so out of the
+box Laravel sees `myapp.test` as the host (for links and redirects) and 127.0.0.1
+as the client (`$request->ip()`). Trust the proxy, and it reads what Caddy sends
+instead: `X-Forwarded-Host`, `X-Forwarded-Proto`, and `X-Forwarded-For` with the
+device's tailnet address. In `bootstrap/app.php`:
+
+```php
+->withMiddleware(function (Middleware $middleware) {
+    $middleware->trustProxies(at: ['127.0.0.1', '::1']);
+})
+```
+
+Ports, proxies and [Docker services](#docker-services) work as usual. The site and
+PHP commands (`park`, `link`, `isolate`, `php`, `ini`, `ext`, `octane`, `worktree`)
+point you to the server's own. `vhosty doctor` checks that the server is answering
+and that Serve forwards to Caddy.
+
+## Switching
+
+`vhosty enable` and `vhosty disable` change a machine's setup after `vhosty setup`,
+and apply it right away:
+
+```bash
+vhosty enable sites --park ~/Sites [--no-php]   # serve folders (turns forwarding off)
+vhosty enable forward herd                      # forward instead (turns sites off)
+vhosty disable sites                            # back to a gateway
+vhosty disable forward
+vhosty enable services --only mysql,valkey      # Docker services
+vhosty disable services                         # stops them; compose.yaml and data stay
+vhosty enable ports ["3000-5999 8000-8099"]     # port routes
+vhosty disable ports
+```
+
+Turning something off keeps its settings and data, so turning it back on picks up
+where it left off: parked folders, links, PHP pins and settings, `compose.yaml`
+and its volumes. `vhosty status` shows the current setup on its first line.
+
+Upgrading from vhosty 0.8 or older changes nothing: a machine that served
+folders keeps its sites, and one set up with `--herd` forwards to Herd.
+
+## Docker services
 
 Databases, caches, search, S3 and a mail catcher run in Docker, managed with `docker compose`.
 Start with the standard set, or point vhosty at a `compose.yaml` you already have:
@@ -640,7 +696,7 @@ Docker bypasses the firewall for published ports, so publish them on localhost
 (`"127.0.0.1:3306:3306"`). `vhosty services` and `vhosty doctor` flag any port
 that isn't.
 
-#### Catching mail
+### Catching mail
 
 [Mailpit](https://mailpit.axllent.org) catches what your apps send, so you can
 test password resets from any device on your tailnet without a message going out.
@@ -682,7 +738,7 @@ lists which sites send to it.
 any real addresses your test data holds, the same as the sites themselves. See
 [Security](#security).
 
-#### Backups
+### Backups
 
 ```bash
 vhosty services backup                  # into ~/.vhosty/backups/services-<date>
@@ -717,11 +773,95 @@ replaces the data in those services, so it asks first (`--yes` skips the questio
 For nightly backups, run it from cron or a systemd timer:
 `vhosty services backup --to <folder your backup tool picks up>`.
 
+## Tailscale Serve
+
+Caddy listens on `127.0.0.1:48443` and `:48080` only, and
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) passes the tailnet's ports
+443 and 80 to them (`tailscale serve status` shows it). It works the same on Linux
+and macOS:
+
+- The connection stays encrypted end to end with vhosty's certificate; Serve only
+  forwards it, and port 80 only redirects to `https://`.
+- Serve tells Caddy which device is asking (a PROXY protocol header), so PHP sees
+  the device's tailnet address in `REMOTE_ADDR`, not 127.0.0.1. Laravel needs no
+  `trustProxies` for that, or for https links: PHP-FPM gets both from Caddy
+  directly. (When vhosty [forwards](#forward) to another server, or proxies a port, the app does.)
+- Ports 80 and 443 on the machine itself stay free for nginx, Apache, Herd, Valet,
+  Lerd or anything else. (macOS wouldn't let Caddy have the tailnet's 443 anyway: it
+  keeps ports below 1024 on one address for root.)
+- With 443 and 80 vhosty's in Serve's config, other tools that publish through
+  Serve find them taken instead of quietly taking them over. T3 Code's pairing,
+  for one, uses 443 by default; with vhosty there, it stops and asks for another
+  port (`--tailscale-serve-port 8443`).
+
+Setup turns this on, so Serve has to be enabled on your tailnet: if it isn't,
+setup prints Tailscale's link to enable it. Anything you had on Serve's ports 443
+or 80 is replaced, after asking. If something takes them later, `vhosty doctor`
+says what and how to move it, and `vhosty rebuild` takes them back. To move
+Caddy's own ports, set `VHOSTY_SERVE_PORT` and `VHOSTY_SERVE_HTTP_PORT` in
+`~/.vhosty/config`, then run `vhosty rebuild`.
+
+Older vhosty on Linux had Caddy listen on the Tailscale address's 443 itself.
+`vhosty rebuild` (which `vhosty update self` runs) moves it behind Serve.
+
+## Updating
+
+```bash
+vhosty update self        # vhosty itself: the latest release, then vhosty rebuild
+vhosty update             # vhosty, Caddy, and the PHP versions in use (apt or Homebrew)
+```
+
+`update self` replaces `~/.vhosty/bin/vhosty` (and the zsh completion), then
+runs `vhosty rebuild` with the new version so its changes take effect. Your
+settings, sites and services stay as they are. `--ref main` installs changes that
+aren't released yet, and `--ref v0.3.0` a particular release. It won't install an
+older version over a newer one without `--force`. Installed from a clone? Update
+with `git pull && ./install.sh` instead, then `vhosty rebuild`.
+
+`vhosty doctor` tells you when there's a new release. It asks GitHub once per run;
+set `VHOSTY_UPDATE_CHECK=0` to turn that off.
+
+## Usage
+
+| Command | What it does |
+|---|---|
+| `vhosty setup` | Set up the machine, or fix it. See [Install](#install) |
+| `vhosty enable\|disable [sites\|forward\|services\|ports]` | Change the setup. See [Switching](#switching) |
+| `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
+| `vhosty sites` | List every name and its URL: proxies, and sites (vhosty's, or the server's it forwards to) |
+| `vhosty open [name\|port]` / `url` | Open a name, or print its URL. With no argument, the current folder's site |
+| `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
+| `vhosty mail [status\|add]` | Catch outgoing mail with Mailpit: its address and the lines for an app's `.env` |
+| `vhosty start\|stop\|restart [caddy\|php\|php-8.x]` | Control Caddy and PHP-FPM. `restart` validates the config first |
+| `vhosty status` | The setup, service state, process IDs, and sockets |
+| `vhosty logs` / `vhosty tail` | Recent logs, or follow them live. `vhosty logs rotate` compresses big ones |
+| `vhosty doctor [--fix]` | Check Tailscale, DNS, the certificate, config, proxies, sites or the server forwarded to, services, and a live HTTPS request. `--fix` repairs what it can, asking first |
+| `vhosty dns sync` | Re-point `*.domain` at this machine, for when its Tailscale IP changes |
+| `vhosty update [self\|caddy\|php [version]]` | Update vhosty to the latest release, re-download Caddy, and upgrade PHP (apt on Linux, Homebrew on macOS). See [Updating](#updating) |
+| `vhosty edit [config\|php\|env]` | Edit the settings, PHP settings, or the token, then apply them |
+| `vhosty rebuild` | Regenerate the config and reload the services |
+
+With [sites](#sites):
+
+| Command | What it does |
+|---|---|
+| `vhosty park [dir]` / `unpark [dir]` / `parked` | Serve, or stop serving, every folder inside `dir`. Park as many as you like |
+| `vhosty link [dir] [--name N]` / `unlink [name]` / `links` | Serve one folder, from anywhere, as `N.yourdomain.dev` |
+| `vhosty site [name]` | Everything about one site: folder, PHP version, settings |
+| `vhosty worktree [add\|link\|remove\|list]` | A git worktree as a site of its own, with its own URL, `.env` and database. See [Git worktrees](#git-worktrees) |
+| `vhosty octane [on\|off\|reload]` | Run a site on Laravel Octane. See [Laravel Octane](#laravel-octane) |
+| `vhosty php [list\|install\|default\|which]` | PHP versions |
+| `vhosty isolate <version>` / `unisolate` / `isolated` | Pin a site to a PHP version |
+| `vhosty ini [set\|unset\|edit]` | PHP settings, for every site or one |
+| `vhosty ext [require\|install\|check]` | PHP extensions each site needs |
+| `vhosty logs <site> [N]` / `vhosty tail <site>` | A Laravel app's own log, from its `storage/logs`. See [Site logs](#site-logs) |
+| `vhosty prune` | Remove configs for sites whose folder is gone or no longer parked, and generated files nothing uses |
+
 ## Files
 
 ```
 ~/.vhosty/
-├── config                 domain, parked folders, default PHP, services folder
+├── config                 the setup: domain, sites or forward, parked folders, PHP, ports, services folder
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
 ├── worktrees/<site>/      git worktrees from `vhosty worktree add`
@@ -742,7 +882,17 @@ Services: `~/.config/systemd/user/vhosty-caddy.service`, `vhosty-php@.service` a
 `vhosty-logs.timer` on Linux; `/Library/LaunchDaemons/link.vhosty.*.plist` on macOS
 (`caddy`, `php-<version>`, and `logs`).
 
-Edit `config` or `php.ini` by hand if you like, then run `vhosty rebuild`.
+Edit `config` or `php.ini` by hand if you like, then run `vhosty rebuild`. The
+setup is in these keys:
+
+| Key | What it is |
+|---|---|
+| `VHOSTY_SITES` | `on` to serve parked and linked folders, `off` not to |
+| `VHOSTY_PHP` | With sites: `on` for PHP-FPM, `off` for static folders only |
+| `VHOSTY_FORWARD` | `herd`, `valet`, `lerd` or a TLD to [forward](#forward) to; wins over sites. Empty for none |
+| `VHOSTY_FORWARD_TLD`, `_HTTP`, `_HTTPS`, `_TLS`, `_CERTS` | Overrides for the forward preset |
+| `VHOSTY_PORTS` | The [port routes](#names-ports-and-proxies), like `3000-5999 8000-8099`. Empty for none |
+| `VHOSTY_SERVICES_DIR` | The `compose.yaml` folder for [Docker services](#docker-services) |
 
 Logs are rotated once they pass `VHOSTY_LOG_MAX_MB` (default 10): the current
 file is compressed to `<name>.log.1.gz` and the newest `VHOSTY_LOG_KEEP` (default
@@ -776,20 +926,23 @@ extensions), in case the folder comes back. `vhosty prune` lists and removes the
 | 525 errors, or CORS errors on every asset | The DNS record is proxied (orange cloud). Run `vhosty dns sync`; it sets the record to DNS only. |
 | Site can't be reached | The device you're browsing from isn't on Tailscale, or the machine is asleep. |
 | Works on one network but not another | Some routers and DNS filters (Pi-hole, NextDNS) block public names that resolve to private IPs. Allowlist your domain there. |
-| "No site called …" (404) | The folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
+| "No site called …" (404) | Nothing answers that name. With sites: the folder doesn't exist in a parked directory, or it has no `public/index.php` or `index.html`. Run `vhosty sites`. |
 | 502 on a folder site | PHP-FPM is down. Run `vhosty logs php`, then `vhosty restart php`. |
 | 502 on a port site or a proxy | Nothing is listening on that port, or it only listens on another interface. |
+| 502 when forwarding | The server vhosty forwards to isn't answering on the address in `vhosty doctor`. Start or restart it (`herd restart`, `valet restart`, or its own command). |
+| Forwarded site redirects to `<name>.test`, or links point there | The app doesn't trust the proxy. See [Laravel behind it](#forward). A secured site needs its certificate in the folder `vhosty doctor` names, or `vhosty enable forward <preset> --tls always`. |
+| 400 Bad Request from a self-hosted app | It doesn't trust the proxy, or the host name. See [Self-hosted apps](#self-hosted-apps). |
 | A change didn't take effect | `vhosty doctor` says whether the config needs a rebuild. Run `vhosty rebuild`. |
 | Sites stopped working after pairing an app over Tailscale (T3 Code, say) | It published itself on Tailscale Serve's port 443, vhosty's. `vhosty doctor` says what it is and how to move it to another port (`tailscale serve --bg --https=8443 …`); then `vhosty rebuild`. |
 | Site can't be reached from other devices | Tailscale Serve isn't forwarding to Caddy. `vhosty doctor` checks it; `vhosty rebuild` sets it up again. |
 
 ## Security
 
-- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every site. Use Tailscale's access controls to restrict that (below).
+- Only devices on your tailnet can connect. Anyone who joins your tailnet, or that you share the machine with, can reach every name: proxies and ports included. Use Tailscale's access controls to restrict that (below).
 - [Mailpit](#catching-mail)'s page has no login: anyone who can reach your sites can read the mail it caught.
 - Laravel's debug pages (`APP_DEBUG=true`) show environment details, such as database passwords and API keys, to anyone who can load them. That's fine when only you can reach the machine; if others can, limit access (below) or turn debug off.
 
-To let only yourself reach the box's sites, tag the machine and grant HTTPS to it
+To let only yourself reach the machine, tag the machine and grant HTTPS to it
 in your [tailnet policy](https://tailscale.com/kb/1324/grants). Tag it with
 `sudo tailscale up --advertise-tags=tag:devbox` (or in the admin console), then:
 
@@ -797,7 +950,7 @@ in your [tailnet policy](https://tailscale.com/kb/1324/grants). Tag it with
 {
   "tagOwners": { "tag:devbox": ["autogroup:admin"] },
   "grants": [
-    // you, from any of your devices, to the box's sites
+    // you, from any of your devices, to the machine
     { "src": ["you@example.com"], "dst": ["tag:devbox"], "ip": ["tcp:443"] }
     // ...your other grants. Tailscale's default policy allows everything to
     // everyone; a box is only private once that default is narrowed.

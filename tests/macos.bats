@@ -198,3 +198,24 @@ static_build() { # an old vhosty's static PHP-FPM in ~/.vhosty/bin
   touch "$VHOSTY_DAEMON_DIR/link.vhosty.php-7.4.plist"
   [ "$(mac launchd_stale)" = "php-7.4" ]
 }
+
+@test "a daemon's state is read without asking for a password" {
+  stub launchctl 'case "$*" in "print system/link.vhosty.caddy") printf "\tstate = running\n\tpid = 4242\n" ;; *) exit 113 ;; esac'
+  stub sudo 'echo "sudo $*" >>"$HOME/sudo.log"; exit 1'
+  [ "$(mac svc_state caddy)" = running ]
+  [ "$(mac svc_pid caddy)" = 4242 ]
+  [ ! -f "$HOME/sudo.log" ]
+  # Not loaded: sudo is only tried without a prompt (-n)
+  [ "$(mac svc_state php-8.4)" = stopped ]
+  assert_contains "$(cat "$HOME/sudo.log")" "sudo -n launchctl print system/link.vhosty.php-8.4"
+  refute_contains "$(cat "$HOME/sudo.log")" "sudo -v"
+}
+
+@test "uninstall takes --yes, and nothing else" {
+  run vh main uninstall --nope
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "Usage: vhosty uninstall [--yes]"
+  run vh main uninstall
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "Cancelled"
+}

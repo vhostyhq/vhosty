@@ -2431,10 +2431,15 @@ ensure_linger() {
 # --- macOS: launchd ---------------------------------------------------------
 label_of() { echo "$LABEL_PREFIX.$1"; }
 plist_for() { echo "$DAEMON_DIR/$(label_of "$1").plist"; }
-is_loaded() { sudo launchctl print "system/$(label_of "$1")" >/dev/null 2>&1; }
+# Reading a system daemon's state needs no root; sudo -n only if it ever does,
+# and only when sudo already has the password, so status and doctor don't ask
+launchd_print() {
+  launchctl print "system/$(label_of "$1")" 2>/dev/null || sudo -n launchctl print "system/$(label_of "$1")" 2>/dev/null
+}
+is_loaded() { launchd_print "$1" >/dev/null; }
 
 launchd_field() {
-  sudo launchctl print "system/$(label_of "$1")" 2>/dev/null \
+  launchd_print "$1" \
     | awk -F'= ' -v key="$2" '$0 ~ "^\t" key " = " {print $2; exit}' || true
 }
 
@@ -3336,7 +3341,6 @@ cmd_site() {
   if php_enabled; then
     printf "  %-10s %s\n" "PHP" "$v" "Settings" "$settings"
     if [ -n "$SITE_OCTANE" ]; then
-      if is_macos; then sudo -v; fi
       printf "  %-10s %s\n" "Octane" "$(octane_server "$dir"), port $SITE_OCTANE, ${SITE_OCTANE_WORKERS:-$OCTANE_WORKERS} workers, $(svc_state "octane-$name")"
       if [ "$(octane_server "$dir")" = "frankenphp" ]; then
         printf "  %-10s %s\n" "" "FrankenPHP has its own PHP: the version and extensions above are for the CLI only; the settings apply"
@@ -3411,7 +3415,6 @@ cmd_restart() {
 
 cmd_status() {
   need_config
-  is_macos && sudo -v
   local ip s st p o v
   ip="$(ts_ip)"
   printf "%svhosty%s  *.%s  →  %s\n" "$B" "$N" "$VHOSTY_DOMAIN" "${ip:-tailscale not running}"
@@ -3458,7 +3461,6 @@ cmd_octane() {
 
 cmd_octane_list() {
   need_config
-  is_macos && sudo -v
   local name dir any=0
   for name in $(octane_sites); do
     any=1
@@ -7819,7 +7821,6 @@ cmd_doctor() {
 doctor_checks() {
   need_config
   FAILED=0
-  is_macos && sudo -v
   local ip probe resolved s st code o p v name dir latest missing
   ip="$(ts_ip)"
   probe="vhosty-doctor.$VHOSTY_DOMAIN"
@@ -7969,6 +7970,11 @@ doctor_checks() {
 # ---------------------------------------------------------------------------
 cmd_uninstall() {
   local s
+  case "${1:-}" in
+    "") ;;
+    -y|--yes) export VHOSTY_YES=1 ;;
+    *) die "Usage: vhosty uninstall [--yes]" ;;
+  esac
   confirm "Stop and remove the vhosty services? (~/.vhosty and your DNS record stay)" N || { info "Cancelled."; return 0; }
   if is_linux; then
     for s in $(sd list-unit-files 'vhosty-*' --plain --no-legend 2>/dev/null | awk '{print $1}'; sd list-units 'vhosty-php@*' --all --plain --no-legend 2>/dev/null | awk '{print $1}'); do
@@ -8017,7 +8023,7 @@ ${B}Setup${N}
   vhosty enable services [--only a,b | --dir DIR]   Docker databases and Mailpit
   vhosty enable ports ["SPEC"]       Open dev servers' ports as https://<port>.domain (default: $DEFAULT_PORTS)
   vhosty disable sites|forward|services|ports      Stop it; settings, folders and data stay
-  vhosty uninstall                   Remove the services (keeps your files)
+  vhosty uninstall [--yes]           Remove the services (keeps your files)
 
 ${B}Names${N}
   vhosty proxy <name> <port>         Send name.domain to a port on this machine (Jellyfin, Grafana, a Node app)
@@ -8174,7 +8180,7 @@ main() {
     ip)                 local ip; ip="$(ts_ip)"; [ -n "$ip" ] || die "Tailscale isn't running"; echo "$ip" ;;
     domain)             need_config; echo "$VHOSTY_DOMAIN" ;;
     paths)              cmd_paths ;;
-    uninstall)          cmd_uninstall ;;
+    uninstall)          cmd_uninstall "$@" ;;
     version|-v|--version) echo "vhosty $VHOSTY_VERSION" ;;
     help|-h|--help)     usage ;;
     *) die "Unknown command '$cmd'. Run: vhosty help" ;;

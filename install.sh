@@ -93,6 +93,15 @@ else
 fi
 if [ "$linked" = "1" ]; then
   ok "linked $LINK"
+  # vh, the short name, beside it: never over something else called vh
+  VH="$(dirname "$LINK")/vh"
+  other="$(command -v vh 2>/dev/null || true)"
+  if [ -n "$other" ] && ! [ "$other" -ef "$VHOSTY_DIR/bin/vhosty" ]; then
+    printf "  vh is already %s, so there's no vh for vhosty\n" "$other"
+  elif [ ! -e "$VH" ] && [ ! -L "$VH" ]; then
+    if [ -w "$(dirname "$VH")" ]; then ln -s "$VHOSTY_DIR/bin/vhosty" "$VH"; else sudo ln -s "$VHOSTY_DIR/bin/vhosty" "$VH"; fi \
+      && ok "linked $VH (vh is short for vhosty)"
+  fi
 else
   printf "  Couldn't link %s. Add this to your shell profile instead:\n    export PATH=\"%s/bin:\$PATH\"\n" "$LINK" "$VHOSTY_DIR"
 fi

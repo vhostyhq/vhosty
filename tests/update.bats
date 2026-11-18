@@ -74,3 +74,17 @@ installed_version() { sed -n 's/^VHOSTY_VERSION="\(.*\)"$/\1/p' "$VHOSTY_DIR/bin
   vh latest_release_cached >/dev/null
   [ "$(wc -l <"$HOME/curl.calls" | tr -d ' ')" = 2 ]
 }
+
+@test "vh is short for vhosty: linked in its bin and beside its PATH link, never over another vh" {
+  touch "$VHOSTY_DIR/bin/vhosty"; chmod +x "$VHOSTY_DIR/bin/vhosty"
+  mkdir -p "$HOME/.local/bin"
+  ln -s "$VHOSTY_DIR/bin/vhosty" "$HOME/.local/bin/vhosty"
+  vh link_vh
+  [ "$(readlink "$VHOSTY_DIR/bin/vh")" = vhosty ]
+  [ "$HOME/.local/bin/vh" -ef "$VHOSTY_DIR/bin/vhosty" ]
+  # Something else called vh: left alone, and no new links
+  rm "$VHOSTY_DIR/bin/vh" "$HOME/.local/bin/vh"
+  stub vh 'echo other'
+  vh link_vh
+  [ ! -e "$VHOSTY_DIR/bin/vh" ] && [ ! -e "$HOME/.local/bin/vh" ]
+}

@@ -1,4 +1,4 @@
-#compdef vhosty
+#compdef vhosty vh
 #
 # zsh completion for vhosty. Add the folder to fpath before compinit:
 #   fpath=(~/.vhosty/completions $fpath)

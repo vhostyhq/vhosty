@@ -2863,6 +2863,7 @@ cmd_setup() {
 
   step "Config"
   write_configs
+  link_vh
   cmd_validate >/dev/null || { cmd_validate || true; die "Generated config didn't validate"; }
   ok "wrote $CADDYFILE"
 
@@ -3366,6 +3367,19 @@ cmd_site() {
   [ ! -f "$(site_file "$name")" ] || printf "  %-10s %s\n" "Config" "$(site_file "$name")"
 }
 
+# vh, the short name: a link to vhosty in ~/.vhosty/bin and beside the link
+# install.sh made on the PATH. Never over something else called vh.
+link_vh() {
+  local other d
+  other="$(command -v vh 2>/dev/null || true)"
+  if [ -n "$other" ] && ! [ "$other" -ef "$BIN_DIR/vhosty" ]; then return 0; fi
+  [ -e "$BIN_DIR/vh" ] || [ -L "$BIN_DIR/vh" ] || ln -s vhosty "$BIN_DIR/vh" 2>/dev/null || true
+  for d in "$VHOSTY_HOME_DIR/.local/bin" /usr/local/bin; do
+    [ -L "$d/vhosty" ] && [ "$d/vhosty" -ef "$BIN_DIR/vhosty" ] || continue
+    [ -e "$d/vh" ] || [ -L "$d/vh" ] || [ ! -w "$d" ] || ln -s "$BIN_DIR/vhosty" "$d/vh" 2>/dev/null || true
+  done
+}
+
 cmd_rebuild() {
   need_config
   if [ -n "$CONFIG_OLD" ]; then
@@ -3375,6 +3389,7 @@ cmd_rebuild() {
   fi
   rm -f "$SERVE_FALLBACK"   # tries Serve again
   ! php_enabled || brew_link_clis
+  link_vh
   write_configs
   ok "regenerated config"
   if svc_installed; then
@@ -8009,6 +8024,7 @@ cmd_uninstall() {
 usage() {
   cat <<EOF
 ${B}vhosty${N} $VHOSTY_VERSION: private HTTPS names for everything on this machine, over Tailscale
+(vh is short for vhosty: vh proxy, vh sites, vh doctor)
 
 Every https://<name>.domain is, in this order: a port (https://5173.domain), a proxy,
 or else what the machine is set up for: vhosty's own sites, another web server

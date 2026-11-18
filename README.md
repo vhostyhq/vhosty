@@ -982,7 +982,7 @@ it's skipped, as it never pulls one. CI runs everything on Ubuntu and on macOS's
 ```bash
 vhosty uninstall          # removes the services
 rm -rf ~/.vhosty          # removes everything else
-rm ~/.local/bin/vhosty    # or: sudo rm /usr/local/bin/vhosty
+rm ~/.local/bin/vhosty ~/.local/bin/vh    # or: sudo rm /usr/local/bin/vhosty /usr/local/bin/vh
 ```
 
 Then delete the `*.domain` record at your DNS provider.

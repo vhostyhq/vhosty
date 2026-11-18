@@ -820,7 +820,7 @@ PY
   local host="${1:-127.0.0.1}"
   case "$host" in *:*) host="[$host]" ;; esac
   for _ in $(seq 1 50); do
-    curl -s -o /dev/null "http://$host:$APP_PORT/" && return 0
+    curl -s -o /dev/null --max-time 2 "http://$host:$APP_PORT/" && return 0
     sleep 0.1
   done
   cat "$HOME/app/log" >&2
@@ -870,7 +870,7 @@ start_caddy() {
 need_caddy() { [ -x "$CADDY" ] || skip "no Caddy with the Cloudflare plugin (set VHOSTY_TEST_CADDY)"; }
 need_python() { command -v python3 >/dev/null || skip "no python3 for the fake app"; }
 
-get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1:$PORT${2:-/}"; }
+get() { curl -s --max-time 20 -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1:$PORT${2:-/}"; }
 
 @test "the generated Caddyfile is one Caddy accepts" {
   need_caddy
@@ -893,10 +893,12 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
 }
 
+# A host written by hand takes the other-machine path, even when it's this one:
+# 127.0.0.2 would do on Linux, but macOS has no such address and a connection hangs
 @test "a request reaches an app on another address, with the real host" {
   need_caddy; need_python
-  start_app 127.0.0.2 || skip "no 127.0.0.2 on this machine"
-  proxy_conf pi "$APP_PORT"; echo 'PROXY_HOST=127.0.0.2' >>"$VHOSTY_DIR/proxies/pi.conf"
+  start_app
+  proxy_conf pi "$APP_PORT"; echo 'PROXY_HOST=127.0.0.1' >>"$VHOSTY_DIR/proxies/pi.conf"
   start_caddy
   run get pi
   [ "$(echo "$output" | tail -1)" = 200 ]
@@ -923,7 +925,7 @@ s.serve_forever()
 PY
   python3 -I "$HOME/tls/server.py" "$APP_PORT" "$HOME/tls/cert.pem" "$HOME/tls/key.pem" >"$HOME/tls/log" 2>&1 &
   APP_PID=$!
-  for _ in $(seq 1 50); do curl -sk -o /dev/null "https://127.0.0.1:$APP_PORT/" && break; sleep 0.1; done
+  for _ in $(seq 1 50); do curl -sk -o /dev/null --max-time 2 "https://127.0.0.1:$APP_PORT/" && break; sleep 0.1; done
   proxy_conf nas "$APP_PORT"; printf 'PROXY_HOST=127.0.0.1\nPROXY_SCHEME=https\nPROXY_INSECURE=yes\n' >>"$VHOSTY_DIR/proxies/nas.conf"
   proxy_conf strict "$APP_PORT"; printf 'PROXY_HOST=127.0.0.1\nPROXY_SCHEME=https\n' >>"$VHOSTY_DIR/proxies/strict.conf"
   start_caddy
@@ -937,12 +939,12 @@ PY
 
 @test "another machine that doesn't answer gets a page that names it" {
   need_caddy
-  proxy_conf pi 1; echo 'PROXY_HOST=127.0.0.2' >>"$VHOSTY_DIR/proxies/pi.conf"
+  proxy_conf pi 1; echo 'PROXY_HOST=127.0.0.1' >>"$VHOSTY_DIR/proxies/pi.conf"
   proxy_conf grafana 1
   start_caddy
   run get pi
   [ "$(echo "$output" | tail -1)" = 502 ]
-  assert_contains "$output" "127.0.0.2:1 isn't answering"
+  assert_contains "$output" "127.0.0.1:1 isn't answering"
   refute_contains "$output" "listen on"
   run get grafana
   assert_contains "$output" "Nothing is answering on port 1"

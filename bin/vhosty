@@ -598,6 +598,9 @@ mode_refuse() {
     esac
     die "$FWD_NAME serves the sites on this machine (VHOSTY_FORWARD=$VHOSTY_FORWARD), so that's done there$([ -z "$FWD_CLI" ] || printf ' (%s)' "$FWD_CLI"). vhosty sends https://<name>.$VHOSTY_DOMAIN to it as <name>.$FWD_TLD.$hint"
   fi
+  # Not set up yet: nothing to refuse, so PHP can be installed before setup
+  # (as box-setup.sh does); the commands that need a config say so themselves
+  [ -f "$CONFIG_FILE" ] || return 0
   sites_on || die "vhosty isn't serving sites on this machine, only proxies and ports. To serve folders and PHP: vhosty enable sites"
 }
 

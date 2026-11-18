@@ -68,6 +68,14 @@ VHOSTY_FORWARD="test"'
   assert_contains "$output" "https://jellyfin.test.example"
 }
 
+@test "before setup, the site and PHP commands aren't refused (PHP can be installed first)" {
+  rm "$VHOSTY_DIR/config"
+  run vh mode_refuse php
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run vh mode_refuse park
+  [ "$status" -eq 0 ]
+}
+
 @test "the gateway only: vhosty sites with nothing yet says how to add a name" {
   gateway
   run vh main sites

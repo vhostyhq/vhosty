@@ -239,6 +239,14 @@ VHOSTY_FORWARD_HTTP=\$'127.0.0.1:80 {\\n127.0.0.1:80'" "VHOSTY_FORWARD=\$'test\\
   assert_contains "$caddyfile" "root \"$HOME/.config/valet/Certificates\""
 }
 
+@test "Valet for Linux keeps its TLD as domain, and that's read too" {
+  forward_config valet
+  mkdir -p "$HOME/.config/valet/Certificates"
+  printf '{"domain":"dev.test","paths":[],"port":"80"}' >"$HOME/.config/valet/config.json"
+  vh write_configs
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "header_up Host {labels.2}.dev.test"
+}
+
 @test "forwarding, the drift check doesn't look for the Tailscale address" {
   vh write_configs
   run vh drift_reason

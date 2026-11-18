@@ -414,6 +414,8 @@ forward_load() {
     if [ -f "$FWD_VALET/config.json" ]; then
       # json_get dies without jq or plutil, which would end vhosty here
       FWD_TLD="$(json_get tld <"$FWD_VALET/config.json" 2>/dev/null)" || FWD_TLD=""
+      # Valet for Linux (valet-linux-plus) keeps it under the older name
+      [ -n "$FWD_TLD" ] || { FWD_TLD="$(json_get domain <"$FWD_VALET/config.json" 2>/dev/null)" || FWD_TLD=""; }
     fi
   fi
   FWD_TLD="${VHOSTY_FORWARD_TLD:-${FWD_TLD:-test}}"
@@ -598,6 +600,9 @@ mode_refuse() {
     esac
     die "$FWD_NAME serves the sites on this machine (VHOSTY_FORWARD=$VHOSTY_FORWARD), so that's done there$([ -z "$FWD_CLI" ] || printf ' (%s)' "$FWD_CLI"). vhosty sends https://<name>.$VHOSTY_DOMAIN to it as <name>.$FWD_TLD.$hint"
   fi
+  # Not set up yet: nothing to refuse, so PHP can be installed before setup
+  # (as box-setup.sh does); the commands that need a config say so themselves
+  [ -f "$CONFIG_FILE" ] || return 0
   sites_on || die "vhosty isn't serving sites on this machine, only proxies and ports. To serve folders and PHP: vhosty enable sites"
 }
 

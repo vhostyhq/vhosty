@@ -202,7 +202,8 @@ vhosty disable ports                      # none
 ```
 
 **Proxies.** For an address that stays the same, give a port a name. It's for
-anything that speaks HTTP on this machine: a self-hosted app, a Node app, Grafana.
+anything that speaks HTTP: a self-hosted app, a Node app, Grafana, here or on another
+machine.
 
 ```bash
 vhosty proxy jellyfin 8096      # https://jellyfin.yourdomain.dev → localhost:8096
@@ -231,6 +232,30 @@ vhosty unproxy grafana
   the page you get reloads every 2 seconds until it's back. vhosty doesn't start or
   stop the app.
 - Run it again with another port to move it.
+
+**On another machine.** A proxy can point at anything this machine can reach: a
+Raspberry Pi on your LAN, a NAS, another machine on your tailnet. It gets a name and
+HTTPS like the rest, and works from every device on your tailnet, even where the LAN
+isn't.
+
+```bash
+vhosty proxy pihole 192.168.1.50:80
+vhosty proxy grafana raspberrypi:3000                     # a LAN name or a tailnet name
+vhosty proxy nas https://192.168.1.20:5001 --insecure     # its own certificate
+```
+
+- Give a host and a port: a name, an IP address, or `[an IPv6 address]`. `https://`
+  without a port means 443.
+- vhosty connects from this machine, so the app sees this machine's address in the
+  connection and the visitor's in `X-Forwarded-For`. An app with an allowlist of
+  proxies (Home Assistant's `trusted_proxies`, for one) needs this machine added.
+- Over `http`, the app sees the vhosty name as its `Host`. Over `https`, it sees its
+  own address, which is what its certificate is for. `X-Forwarded-Host` has the
+  vhosty name either way.
+- `--insecure` skips checking the device's certificate. Most routers, NASes and
+  printers make their own, so they need it. The connection is still encrypted.
+- `doctor`, `vhosty site <name>` and `vhosty proxy` ask whether it answers from here.
+  If it doesn't, the page you get names the device instead of a port.
 
 When something isn't there, vhosty says what and why instead of showing a blank
 page: a name nobody answers lists what it checked; a port or proxy with nothing
@@ -828,6 +853,7 @@ set `VHOSTY_UPDATE_CHECK=0` to turn that off.
 | `vhosty setup` | Set up the machine, or fix it. See [Install](#install) |
 | `vhosty enable\|disable [sites\|forward\|services\|ports]` | Change the setup. See [Switching](#switching) |
 | `vhosty proxy <name> <port>` / `unproxy <name>` / `proxies` | Send `name.yourdomain.dev` to a port on this machine |
+| `vhosty proxy <name> <host:port>` / `https://host[:port] [--insecure]` | ...or to one on another machine |
 | `vhosty sites` | List every name and its URL: proxies, and sites (vhosty's, or the server's it forwards to) |
 | `vhosty open [name\|port]` / `url` | Open a name, or print its URL. With no argument, the current folder's site |
 | `vhosty services [up\|down\|logs\|...]` | Docker services: databases, caches, search, S3 |
@@ -865,7 +891,7 @@ With [sites](#sites):
 ├── php.ini                PHP settings for every site (web and CLI)
 ├── sites/<name>.conf      one per site with a link, pin, settings, or extensions
 ├── worktrees/<site>/      git worktrees from `vhosty worktree add`
-├── proxies/<name>.conf    one per named proxy (vhosty proxy): its port
+├── proxies/<name>.conf    one per named proxy (vhosty proxy): its port, and host if not here
 ├── .env                   DNS provider credentials (mode 600)
 ├── Caddyfile              generated
 ├── error.html             generated: the page for "no site", and PHP or a dev server down

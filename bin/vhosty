@@ -1817,7 +1817,7 @@ write_caddyfile() {
     done
   fi
   for name in $(proxy_names); do
-    [ -z "$(proxy_port "$name")" ] || sites="$sites $name"
+    ! proxy_load "$name" || sites="$sites $name"
   done
   ! forward_mode || forward_check
   {
@@ -2125,10 +2125,19 @@ vhosty restart octane-{{html $label}}
 vhosty logs octane-{{html $label}}</pre>
 {{- else if and (eq $kind "proxy") (ne $status "504")}}
 {{- $port := placeholder "http.vars.vhosty_proxy_port"}}
+{{- $target := placeholder "http.vars.vhosty_proxy_target"}}
+{{- if $target}}
+<h1>{{html $target}} isn't answering</h1>
+<p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>{{html $target}}</code>, but this machine couldn't get an answer from it.</p>
+<p>Check that the device is on and that what runs there is up, then that this machine can reach it. If its address changed:</p>
+<pre>vhosty proxy {{html $label}} &lt;host:port&gt;
+vhosty doctor</pre>
+{{- else}}
 <h1>Nothing is answering on port {{html $port}}</h1>
 <p class="muted">vhosty forwards <strong>{{html .Host}}</strong> to <code>localhost:{{html $port}}</code>, but nothing answered there.</p>
 <p>Start what runs on port {{html $port}}. It has to listen on <code>localhost</code> and speak plain HTTP. If it moved to another port:</p>
 <pre>vhosty proxy {{html $label}} &lt;port&gt;</pre>
+{{- end}}
 {{- else if and (eq $kind "php") (ne $status "504")}}
 <h1>PHP {{html $php}} isn't answering</h1>
 <p class="muted">Caddy couldn't reach PHP-FPM for <strong>{{html .Host}}</strong>.</p>
@@ -4830,7 +4839,7 @@ mail_service() {
 
 # Is mail.<domain> this Mailpit's page?
 mail_proxied() { # mail_proxied WEB_PORT
-  [ -f "$(proxy_file mail)" ] && [ "$(proxy_port mail)" = "$1" ]
+  [ -f "$(proxy_file mail)" ] && [ "$(proxy_port mail)" = "$1" ] && proxy_load mail && [ -z "$PX_HOST" ] && [ "$PX_SCHEME" = "http" ]
 }
 
 # Any folder called mail in a parked folder, a site or not: it may be one tomorrow
@@ -4856,7 +4865,7 @@ mail_domain() { # mail_domain WEB_PORT
   if [ -z "$web" ] || ! mail_port_open "$web"; then return 0; fi
   url="https://$web.$VHOSTY_DOMAIN"
   if [ -f "$(proxy_file mail)" ]; then
-    mail_proxied "$web" || warn "The proxy 'mail' goes to port $(proxy_port mail), not Mailpit's, so vhosty left it alone. Mailpit's page stays at $url"
+    mail_proxied "$web" || warn "The proxy 'mail' goes to $(proxy_load mail || true; echo "${PX_SHOW:-somewhere else}"), not Mailpit's port, so vhosty left it alone. Mailpit's page stays at $url"
     return 0
   fi
   if why="$(mail_folder_parked)"; then
@@ -5424,8 +5433,9 @@ cmd_url() {
 }
 
 # ---------------------------------------------------------------------------
-# Commands: named proxies (app.domain → a port on this machine), for what isn't
-# a PHP site: a Node app, Grafana, anything that speaks HTTP. A proxy has no
+# Commands: named proxies (app.domain → a port on this machine, or on another
+# machine it can reach), for what isn't a PHP site: a Node app, Grafana, a
+# Raspberry Pi, anything that speaks HTTP. A proxy has no
 # folder, so it isn't a site: each is a file in ~/.vhosty/proxies, and what walks
 # site_names (prune, the shim, the FPM pools, doctor's folder check) never sees one.
 # ---------------------------------------------------------------------------
@@ -5470,6 +5480,52 @@ proxy_port() {
   local p
   p="$(sed -n 's/^PROXY_PORT=//p' "$(proxy_file "$1")" 2>/dev/null | tail -1 || true)"
   if proxy_port_ok "$p"; then echo "$p"; fi
+}
+
+# A host for a proxy on another machine: a name (raspberrypi, pi.lan,
+# pi.tailnet.ts.net), an IPv4 address, or an IPv6 one in brackets. Spelled
+# out, as for names: it goes into the Caddyfile.
+proxy_host_ok() {
+  case "$1" in
+    \[*\]) case "${1#[}" in *[!0123456789abcdef:.\]]*|*\]*\]*) return 1 ;; esac; [ ${#1} -gt 3 ] ;;
+    ''|-*|*-|.*|*.|*..*|*.-*|*-.*|*[!abcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;;
+    *) [ ${#1} -le 253 ] ;;
+  esac
+}
+
+# The machine itself: what a proxy has always pointed at
+proxy_host_local() { case "$1" in ''|localhost|127.0.0.1|\[::1\]) return 0 ;; *) return 1 ;; esac; }
+
+# Where a proxy goes, read and checked: sets PX_SCHEME (http|https), PX_HOST
+# (empty: this machine), PX_PORT, PX_INSECURE (yes: don't check its certificate)
+# and PX_SHOW (for people). Fails if the file doesn't hold a valid target.
+proxy_load() {
+  local f
+  f="$(proxy_file "$1")"
+  PX_PORT="$(proxy_port "$1")"
+  PX_HOST="$(sed -n 's/^PROXY_HOST=//p' "$f" 2>/dev/null | tail -1 || true)"
+  PX_SCHEME="$(sed -n 's/^PROXY_SCHEME=//p' "$f" 2>/dev/null | tail -1 || true)"
+  PX_INSECURE="$(sed -n 's/^PROXY_INSECURE=//p' "$f" 2>/dev/null | tail -1 || true)"
+  PX_SCHEME="${PX_SCHEME:-http}"
+  [ "$PX_INSECURE" = "yes" ] || PX_INSECURE=""
+  case "$PX_SCHEME" in http|https) ;; *) PX_SHOW=""; return 1 ;; esac
+  [ -n "$PX_PORT" ] || { PX_SHOW=""; return 1; }
+  if [ -n "$PX_HOST" ] && ! proxy_host_ok "$PX_HOST"; then PX_SHOW=""; return 1; fi
+  if [ -z "$PX_HOST" ] && [ "$PX_SCHEME" = "http" ]; then PX_SHOW="localhost:$PX_PORT"
+  elif [ "$PX_SCHEME" = "http" ]; then PX_SHOW="$PX_HOST:$PX_PORT"
+  else PX_SHOW="https://${PX_HOST:-localhost}:$PX_PORT${PX_INSECURE:+ (certificate not checked)}"; fi
+}
+
+# Is a proxy on another machine answering? Any HTTP response counts. For https
+# with its certificate checked, says "certificate" when that's what fails.
+proxy_remote_answers() { # uses PX_*
+  local url="$PX_SCHEME://${PX_HOST:-localhost}:$PX_PORT/" rc=0
+  if [ "$PX_SCHEME" = "https" ] && [ -z "$PX_INSECURE" ]; then
+    curl -sS -o /dev/null --max-time 4 "$url" 2>/dev/null || rc=$?
+    case "$rc" in 0) return 0 ;; 35|51|58|59|60|77|80|82|83|90|91) echo certificate; return 1 ;; esac
+    return 1
+  fi
+  curl -sSk -o /dev/null --max-time 4 "$url" 2>/dev/null
 }
 
 # Who answers https://NAME.domain: says "port", "proxy", or "site (how)", and
@@ -5534,27 +5590,40 @@ proxy_folder_serves() {
 # Caddy overwrites X-Forwarded-*, and the others are removed because a client could
 # send them: an app used to being private on localhost may believe who they name.
 caddy_proxies() {
-  local name port
+  local name up transport target
   for name in $(proxy_names); do
-    port="$(proxy_port "$name")"
-    if [ -z "$port" ]; then
-      printf '\n\t# Proxy: %s (skipped: no valid port in its file)\n' "$name"
+    if ! proxy_load "$name"; then
+      printf '\n\t# Proxy: %s (skipped: no valid target in its file)\n' "$name"
       continue
+    fi
+    # Another machine (or https): the full address. Over http the app sees the
+    # vhosty name as its Host, as on this machine; over https Caddy sends the
+    # device's own address, which is what its certificate and checks expect.
+    # X-Forwarded-Host has the vhosty name either way.
+    transport=""; target=""
+    if [ -z "$PX_HOST" ] && [ "$PX_SCHEME" = "http" ]; then up="localhost:$PX_PORT"
+    else
+      up="$PX_SCHEME://${PX_HOST:-localhost}:$PX_PORT"; target="$PX_SHOW"
+      [ -z "$PX_INSECURE" ] || transport="
+			transport http {
+				tls_insecure_skip_verify
+			}"
     fi
     cat <<EOF
 
-	# Proxy: $name → localhost:$port
+	# Proxy: $name → $PX_SHOW
 	@proxy_$name host $name.$VHOSTY_DOMAIN
 	handle @proxy_$name {
 		vars {
 			vhosty_kind proxy
-			vhosty_proxy_port $port
+			vhosty_proxy_port $PX_PORT
+			vhosty_proxy_target "$target"
 		}
-		reverse_proxy localhost:$port {
+		reverse_proxy $up {
 			header_up -Forwarded
 			header_up -X-Real-IP
 			header_up -Tailscale-*
-			header_up -X-Webauth-*
+			header_up -X-Webauth-*$transport
 		}
 	}
 EOF
@@ -5566,14 +5635,21 @@ EOF
 proxy_checks() {
   local name port owner why
   for name in $(proxy_names); do
-    port="$(proxy_port "$name")"
-    if [ -z "$port" ]; then
-      bad "proxy $name: no valid port in $(proxy_file "$name"), so it isn't routed. Set one: vhosty proxy $name <port>"
+    if ! proxy_load "$name"; then
+      bad "proxy $name: no valid target in $(proxy_file "$name"), so it isn't routed. Set one: vhosty proxy $name <port or host:port>"
       continue
     fi
-    owner="$(proxy_owner "$port")"
-    if [ -n "$owner" ]; then ok "proxy $name → localhost:$port ($owner)"
-    else warn "proxy $name: nothing is listening on port $port. It works once something does."; fi
+    port="$PX_PORT"
+    if [ -n "$PX_HOST" ] || [ "$PX_SCHEME" = "https" ]; then
+      if why="$(proxy_remote_answers)"; then ok "proxy $name → $PX_SHOW (answering)"
+      elif [ "$why" = "certificate" ]; then
+        bad "proxy $name: $PX_SHOW answers, but its certificate isn't trusted. If it's the device's own (self-signed): vhosty proxy $name https://$PX_HOST:$port --insecure"
+      else warn "proxy $name: $PX_SHOW isn't answering from this machine. It works once it does."; fi
+    else
+      owner="$(proxy_owner "$port")"
+      if [ -n "$owner" ]; then ok "proxy $name → localhost:$port ($owner)"
+      else warn "proxy $name: nothing is listening on port $port. It works once something does."; fi
+    fi
     if why="$(fallback_owner "$name")"; then
       warn "proxy $name hides a site of the same name ($why). Rename one, or remove the proxy: vhosty unproxy $name"
     fi
@@ -5590,44 +5666,85 @@ proxy_owner() {
 
 # One line per proxy, for vhosty proxies and vhosty sites
 proxy_rows() {
-  local name port note
+  local name note
   for name in $(proxy_names); do
-    port="$(proxy_port "$name")"
-    if [ -z "$port" ]; then
-      printf "  https://%s.%s  %s(no valid port: vhosty proxy %s <port>)%s\n" "$name" "$VHOSTY_DOMAIN" "$R" "$name" "$N"
+    if ! proxy_load "$name"; then
+      printf "  https://%s.%s  %s(no valid target: vhosty proxy %s <port or host:port>)%s\n" "$name" "$VHOSTY_DOMAIN" "$R" "$name" "$N"
       continue
     fi
-    note=""; [ -n "$(port_owner "$port")" ] || note="  ${Y}(nothing listening)${N}"
-    printf "  https://%s.%s  %s→ localhost:%s%s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$port" "$N" "$note"
+    # Another machine isn't asked here (doctor does): listing stays quick
+    note=""
+    if [ -z "$PX_HOST" ] && [ "$PX_SCHEME" = "http" ] && [ -z "$(port_owner "$PX_PORT")" ]; then note="  ${Y}(nothing listening)${N}"; fi
+    printf "  https://%s.%s  %s→ %s%s%s\n" "$name" "$VHOSTY_DOMAIN" "$D" "$PX_SHOW" "$N" "$note"
   done
 }
 
 # vhosty site, for a proxy
 proxy_show() {
-  local port owner
-  port="$(proxy_port "$1")"
+  local owner
   printf "%s%s%s  https://%s.%s\n" "$B" "$1" "$N" "$1" "$VHOSTY_DOMAIN"
-  if [ -n "$port" ]; then
-    owner="$(proxy_owner "$port")"
-    printf "  %-10s %s\n" "Proxy" "localhost:$port" "Listening" "${owner:-${Y}nothing${N}}"
+  if ! proxy_load "$1"; then
+    printf "  %-10s %s\n" "Proxy" "${R}no valid target${N} (vhosty proxy $1 <port or host:port>)"
+  elif [ -n "$PX_HOST" ] || [ "$PX_SCHEME" = "https" ]; then
+    if proxy_remote_answers >/dev/null; then owner="yes"; else owner="${Y}no${N}"; fi
+    printf "  %-10s %s\n" "Proxy" "$PX_SHOW" "Answering" "$owner"
   else
-    printf "  %-10s %s\n" "Proxy" "${R}no valid port${N} (vhosty proxy $1 <port>)"
+    owner="$(proxy_owner "$PX_PORT")"
+    printf "  %-10s %s\n" "Proxy" "localhost:$PX_PORT" "Listening" "${owner:-${Y}nothing${N}}"
   fi
   printf "  %-10s %s\n" "Config" "$(proxy_file "$1")"
 }
 
+PROXY_USAGE="Usage: vhosty proxy <name> <port | host:port | https://host[:port] [--insecure]>"
+
 cmd_proxy() {
   need_config
-  [ $# -eq 2 ] || die "Usage: vhosty proxy <name> <port>"
-  local name port why
-  name="$(lower "$1")"; port="$2"
+  local name="" target="" port why scheme="http" host="" insecure="" a n=0
+  for a in "$@"; do
+    case "$a" in
+      --insecure) insecure="yes" ;;
+      -h|--help) echo "$PROXY_USAGE"; return 0 ;;
+      --*) die "Unknown option '$a'. $PROXY_USAGE" ;;
+      *) n=$((n + 1)); case "$n" in 1) name="$a" ;; 2) target="$a" ;; esac ;;
+    esac
+  done
+  [ "$n" -eq 2 ] || die "$PROXY_USAGE"
+  name="$(lower "$name")"
+  # The target: a port here, or host:port, or http(s)://host[:port] on another machine
+  case "$target" in
+    http://*) target="${target#http://}" ;;
+    https://*) scheme="https"; target="${target#https://}" ;;
+    *://*) die "'$target': a proxy speaks http or https. $PROXY_USAGE" ;;
+  esac
+  target="${target%/}"
+  case "$target" in */*|*\?*|*@*) die "'$target': only a host and a port, no path. $PROXY_USAGE" ;; esac
+  case "$target" in
+    *[!0123456789]*)
+      case "$target" in
+        \[*\]:*) host="${target%:*}"; port="${target##*:}" ;;
+        \[*\]) host="$target"; port="" ;;
+        *:*:*) die "'$target': put an IPv6 address in brackets, like [fd7a::1]:8080" ;;
+        *:*) host="${target%:*}"; port="${target##*:}" ;;
+        *) host="$target"; port="" ;;
+      esac
+      host="$(lower "$host")"
+      if [ -z "$port" ]; then
+        [ "$scheme" = "https" ] && port=443
+        [ -n "$port" ] || die "'$target' needs a port: $host:<port>, or https://$host for 443"
+      fi
+      proxy_host_ok "$host" || die "'$host' isn't a host vhosty can use: a name like raspberrypi or pi.lan, an IP address, or [an IPv6 address]" ;;
+    *) port="$target" ;;
+  esac
+  proxy_port_ok "$port" || die "'$port' isn't a port (1 to 65535)"
+  [ -z "$insecure" ] || [ "$scheme" = "https" ] || die "--insecure is for https targets: it stops checking the target's certificate"
+  # This machine over plain http, written as before
+  if [ "$scheme" = "http" ] && proxy_host_local "$host"; then host=""; fi
   case "$name" in
     ''|*[!0123456789]*) ;;
     *) die "'$name' would clash with port URLs (https://<port>.$VHOSTY_DOMAIN). Pick a name that isn't only numbers" ;;
   esac
   proxy_name_ok "$name" || die "'$name' isn't a valid proxy name: letters, numbers and dashes, no dash at either end, up to 63 characters"
-  proxy_port_ok "$port" || die "'$port' isn't a port (1 to 65535)"
-  if proxy_port_is_caddy "$port"; then die "Port $port is Caddy's own, so a proxy to it would only come back to Caddy"; fi
+  if proxy_host_local "$host" && proxy_port_is_caddy "$port"; then die "Port $port is Caddy's own, so a proxy to it would only come back to Caddy"; fi
   # An existing proxy can always be moved or repaired, whatever appeared since
   if [ ! -f "$(proxy_file "$name")" ] && why="$(fallback_owner "$name")"; then
     die "'$name' is already a site ($why). Pick another name for the proxy"
@@ -5636,10 +5753,20 @@ cmd_proxy() {
   {
     echo "# vhosty proxy: https://$name.$VHOSTY_DOMAIN. Change with vhosty proxy, or edit and run: vhosty rebuild"
     printf 'PROXY_PORT=%s\n' "$port"
+    [ -z "$host" ] || printf 'PROXY_HOST=%s\n' "$host"
+    [ "$scheme" = "http" ] || printf 'PROXY_SCHEME=%s\n' "$scheme"
+    [ -z "$insecure" ] || printf 'PROXY_INSECURE=yes\n'
   } >"$(proxy_file "$name")"
-  ok "https://$name.$VHOSTY_DOMAIN → localhost:$port"
+  proxy_load "$name"
+  ok "https://$name.$VHOSTY_DOMAIN → $PX_SHOW"
   info "every device on your tailnet can now reach it, and vhosty adds no login"
-  [ -n "$(port_owner "$port")" ] || warn "nothing is listening on port $port yet"
+  if [ -n "$PX_HOST" ] || [ "$PX_SCHEME" = "https" ]; then
+    if why="$(proxy_remote_answers)"; then :
+    elif [ "$why" = "certificate" ]; then warn "$PX_SHOW answers, but its certificate isn't trusted. If it's the device's own (self-signed), add --insecure"
+    else warn "$PX_SHOW isn't answering from this machine yet"; fi
+  else
+    [ -n "$(port_owner "$port")" ] || warn "nothing is listening on port $port yet"
+  fi
   cmd_rebuild
 }
 
@@ -8027,6 +8154,7 @@ ${B}Setup${N}
 
 ${B}Names${N}
   vhosty proxy <name> <port>         Send name.domain to a port on this machine (Jellyfin, Grafana, a Node app)
+  vhosty proxy <name> <host:port>    ...or on another one: a Raspberry Pi, a NAS (https://host:port [--insecure])
   vhosty unproxy <name>              Remove a proxy
   vhosty proxies                     List proxies
   vhosty sites                       Every name: proxies and sites, and their URLs

@@ -91,7 +91,7 @@ _vhosty() {
     'link:Serve one folder as a site'
     'unlink:Remove a link'
     'links:List links'
-    'proxy:Send a name to a port on this machine'
+    'proxy:Send a name to a port, here or on another machine'
     'unproxy:Remove a proxy'
     'proxies:List proxies'
     'sites:List every name: proxies and sites, and their URLs'
@@ -170,7 +170,8 @@ _vhosty() {
       fi ;;
     proxy)
       if (( CURRENT == 3 )); then _vhosty_proxies
-      elif (( CURRENT == 4 )); then _message 'port'; fi ;;
+      elif (( CURRENT == 4 )); then _message 'port, host:port or https://host:port'
+      else _arguments '--insecure[an https target with its own certificate]'; fi ;;
     unproxy)       _vhosty_proxies ;;
     open|url|site) _alternative 'sites:site:_vhosty_sites' 'proxies:proxy:_vhosty_proxies' ;;
     unisolate)     _vhosty_sites ;;

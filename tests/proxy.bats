@@ -109,7 +109,8 @@ proxy_conf() { printf 'PROXY_PORT=%s\n' "$2" >"$HOME/p.conf"; mkdir -p "$VHOSTY_
   for bad in 0 65536 99999999999999999999 abc 03000 -1 3000.5 '3000 ' '' "$(printf '3000\n3001')"; do
     run linux main proxy grafana "$bad"
     [ "$status" -ne 0 ] || { echo "accepted: $bad" >&2; false; }
-    assert_contains "$output" "isn't a port"
+    # abc and 3000.5 could be hosts, so they're told they need a port
+    assert_contains "$output" "port"
   done
   [ ! -d "$VHOSTY_DIR/proxies" ]
 }
@@ -126,8 +127,156 @@ proxy_conf() { printf 'PROXY_PORT=%s\n' "$2" >"$HOME/p.conf"; mkdir -p "$VHOSTY_
     # shellcheck disable=SC2086
     run linux main proxy $args
     [ "$status" -ne 0 ]
-    assert_contains "$output" "Usage: vhosty proxy <name> <port>"
+    assert_contains "$output" "Usage: vhosty proxy <name> <port"
   done
+}
+
+# --- Another machine ----------------------------------------------------------
+
+@test "proxy: host:port goes to another machine, and says so" {
+  stub curl 'exit 7'
+  run linux main proxy pihole 192.168.1.50:80
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "https://pihole.test.example → 192.168.1.50:80"
+  assert_contains "$output" "192.168.1.50:80 isn't answering from this machine yet"
+  refute_contains "$output" "nothing is listening"
+  grep -q '^PROXY_PORT=80$' "$VHOSTY_DIR/proxies/pihole.conf"
+  grep -q '^PROXY_HOST=192.168.1.50$' "$VHOSTY_DIR/proxies/pihole.conf"
+  ! grep -q PROXY_SCHEME "$VHOSTY_DIR/proxies/pihole.conf"
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "reverse_proxy http://192.168.1.50:80 {"
+  assert_contains "$caddyfile" 'vhosty_proxy_target "192.168.1.50:80"'
+  assert_contains "$caddyfile" "header_up -X-Webauth-*"
+  refute_contains "$caddyfile" "tls_insecure_skip_verify"
+}
+
+@test "proxy: a name, a tailnet name and an IPv6 address are hosts too" {
+  stub curl 'exit 0'
+  run linux main proxy grafana RaspberryPi:3000
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^PROXY_HOST=raspberrypi$' "$VHOSTY_DIR/proxies/grafana.conf"
+  refute_contains "$output" "isn't answering"
+  run linux main proxy pi pi.tail1234.ts.net:8080
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux main proxy six '[fd7a:115c::1]:8080'
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "reverse_proxy http://[fd7a:115c::1]:8080 {"
+  run linux main proxy plain http://pi.lan:8080/
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^PROXY_HOST=pi.lan$' "$VHOSTY_DIR/proxies/plain.conf"
+}
+
+@test "proxy: https, with the device's own certificate when it says --insecure" {
+  stub curl 'exit 0'
+  run linux main proxy nas https://192.168.1.20:5001 --insecure
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "https://nas.test.example → https://192.168.1.20:5001 (certificate not checked)"
+  grep -q '^PROXY_SCHEME=https$' "$VHOSTY_DIR/proxies/nas.conf"
+  grep -q '^PROXY_INSECURE=yes$' "$VHOSTY_DIR/proxies/nas.conf"
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "reverse_proxy https://192.168.1.20:5001 {"
+  assert_contains "$caddyfile" "tls_insecure_skip_verify"
+  # Without a port, https is 443
+  run linux main proxy nas https://nas.lan
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  grep -q '^PROXY_PORT=443$' "$VHOSTY_DIR/proxies/nas.conf"
+  ! grep -q PROXY_INSECURE "$VHOSTY_DIR/proxies/nas.conf"
+  refute_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "tls_insecure_skip_verify"
+}
+
+@test "proxy: an https certificate this machine doesn't trust is named, with the fix" {
+  stub curl 'exit 60'
+  run linux main proxy nas https://192.168.1.20:5001
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  assert_contains "$output" "its certificate isn't trusted"
+  assert_contains "$output" "--insecure"
+}
+
+@test "proxy: this machine, written any way, is a port as before" {
+  for t in localhost:3001 127.0.0.1:3001 '[::1]:3001' http://localhost:3001; do
+    run linux main proxy grafana "$t"
+    [ "$status" -eq 0 ] || { echo "$t: $output" >&2; false; }
+    [ "$(cat "$VHOSTY_DIR/proxies/grafana.conf" | grep -c '^PROXY_')" -eq 1 ]
+    assert_contains "$(cat "$VHOSTY_DIR/Caddyfile")" "reverse_proxy localhost:3001 {"
+  done
+}
+
+@test "proxy: Caddy's own port is fine on another machine" {
+  stub curl 'exit 0'
+  run linux main proxy other 192.168.1.9:48443
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  run linux main proxy loop localhost:48443
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "Caddy's own"
+}
+
+@test "proxy: targets that aren't a host and a port are refused, and nothing's written" {
+  for t in 'pi' 'pi:' 'pi:99999' 'pi:abc' 'fd7a::1:80' 'ftp://pi:21' 'http://pi:80/admin' 'user@pi:80' \
+           '-pi:80' 'pi-:80' 'pi..lan:80' 'pi_lan:80' 'pi lan:80' '[zz::1]:80' '[]:80' "pi;rm:80" 'pi}:80'; do
+    run linux main proxy x "$t"
+    [ "$status" -ne 0 ] || { echo "accepted: $t" >&2; false; }
+    [ ! -f "$VHOSTY_DIR/proxies/x.conf" ]
+  done
+}
+
+@test "proxy: --insecure is only for https, and unknown options are refused" {
+  run linux main proxy pi 192.168.1.5:80 --insecure
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "--insecure is for https"
+  run linux main proxy pi 192.168.1.5:80 --tls
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "Unknown option"
+  [ ! -f "$VHOSTY_DIR/proxies/pi.conf" ]
+}
+
+@test "proxy: moving from another machine back to a port drops the host" {
+  stub curl 'exit 0'
+  linux main proxy grafana https://pi.lan:3000 --insecure
+  run linux main proxy grafana 3001
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+  [ "$(grep -c '^PROXY_' "$VHOSTY_DIR/proxies/grafana.conf")" -eq 1 ]
+}
+
+@test "proxies and site show where another machine's proxy goes" {
+  stub curl 'exit 7'
+  linux main proxy pihole 192.168.1.50:80
+  run linux main proxies
+  assert_contains "$output" "→ 192.168.1.50:80"
+  refute_contains "$output" "nothing listening"
+  run linux main site pihole
+  assert_contains "$output" "192.168.1.50:80"
+  assert_contains "$output" "Answering"
+}
+
+@test "doctor: another machine is asked, not this machine's ports" {
+  proxy_conf pihole 80
+  echo 'PROXY_HOST=192.168.1.50' >>"$VHOSTY_DIR/proxies/pihole.conf"
+  stub curl 'exit 0'
+  run linux proxy_checks
+  assert_contains "$output" "proxy pihole → 192.168.1.50:80 (answering)"
+  stub curl 'exit 28'
+  run linux proxy_checks
+  assert_contains "$output" "192.168.1.50:80 isn't answering from this machine"
+}
+
+@test "a hand-edited host that isn't one never reaches the Caddyfile" {
+  proxy_conf evil 80
+  printf 'PROXY_HOST=pi {\n' >>"$VHOSTY_DIR/proxies/evil.conf"
+  proxy_conf odd 80
+  printf 'PROXY_SCHEME=gopher\n' >>"$VHOSTY_DIR/proxies/odd.conf"
+  vh write_configs
+  caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
+  assert_contains "$caddyfile" "# Proxy: evil (skipped: no valid target in its file)"
+  assert_contains "$caddyfile" "# Proxy: odd (skipped: no valid target in its file)"
+  refute_contains "$caddyfile" "@proxy_evil"
+  refute_contains "$caddyfile" "gopher"
+}
+
+@test "Mailpit leaves a mail proxy to another machine alone" {
+  proxy_conf mail 8025
+  echo 'PROXY_HOST=192.168.1.50' >>"$VHOSTY_DIR/proxies/mail.conf"
+  run linux mail_proxied 8025
+  [ "$status" -ne 0 ]
 }
 
 @test "proxy: Caddy's own ports are refused" {
@@ -503,11 +652,11 @@ SITE_PHP=8.4"
   vh write_configs
   [ ! -e "$HOME/ran" ]
   caddyfile="$(cat "$VHOSTY_DIR/Caddyfile")"
-  assert_contains "$caddyfile" "# Proxy: grafana (skipped: no valid port in its file)"
+  assert_contains "$caddyfile" "# Proxy: grafana (skipped: no valid target in its file)"
   refute_contains "$caddyfile" "@proxy_grafana"
   refute_contains "$caddyfile" "touch"
   run linux main proxies
-  assert_contains "$output" "no valid port"
+  assert_contains "$output" "no valid target"
 }
 
 @test "a file whose name isn't a proxy name is ignored" {
@@ -559,7 +708,7 @@ proxy_checks
 echo "FAILED=$FAILED"
 SH
   run env VHOSTY_SRC="$ROOT/bin/vhosty" bash "$HOME/run.sh"
-  assert_contains "$output" "no valid port"
+  assert_contains "$output" "no valid target"
   assert_contains "$output" "FAILED=1"
 }
 
@@ -731,6 +880,72 @@ get() { curl -s -w '\n%{http_code}' -H "Host: $1.test.example" "http://127.0.0.1
   vh write_configs
   CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "a Caddyfile with proxies to other machines is one Caddy accepts" {
+  need_caddy
+  proxy_conf pihole 80; echo 'PROXY_HOST=192.168.1.50' >>"$VHOSTY_DIR/proxies/pihole.conf"
+  proxy_conf six 8080; echo 'PROXY_HOST=[fd7a:115c::1]' >>"$VHOSTY_DIR/proxies/six.conf"
+  proxy_conf nas 5001; printf 'PROXY_HOST=nas.lan\nPROXY_SCHEME=https\nPROXY_INSECURE=yes\n' >>"$VHOSTY_DIR/proxies/nas.conf"
+  proxy_conf grafana 3001
+  vh write_configs
+  CF_API_TOKEN=0123456789abcdef0123456789abcdef01234567 run "$CADDY" validate --config "$VHOSTY_DIR/Caddyfile" --adapter caddyfile
+  [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
+}
+
+@test "a request reaches an app on another address, with the real host" {
+  need_caddy; need_python
+  start_app 127.0.0.2 || skip "no 127.0.0.2 on this machine"
+  proxy_conf pi "$APP_PORT"; echo 'PROXY_HOST=127.0.0.2' >>"$VHOSTY_DIR/proxies/pi.conf"
+  start_caddy
+  run get pi
+  [ "$(echo "$output" | tail -1)" = 200 ]
+  assert_contains "$output" "host=pi.test.example"
+  assert_contains "$output" "xfh=pi.test.example"
+}
+
+@test "an https app with its own certificate is reached with --insecure, and not without" {
+  need_caddy; need_python
+  command -v openssl >/dev/null || skip "no openssl for the app's certificate"
+  mkdir -p "$HOME/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=device -keyout "$HOME/tls/key.pem" -out "$HOME/tls/cert.pem" >/dev/null 2>&1
+  cat >"$HOME/tls/server.py" <<'PY'
+import http.server, ssl, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ("host=%s\n" % self.headers.get("Host")).encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain(sys.argv[2], sys.argv[3])
+s.socket = c.wrap_socket(s.socket, server_side=True)
+s.serve_forever()
+PY
+  python3 -I "$HOME/tls/server.py" "$APP_PORT" "$HOME/tls/cert.pem" "$HOME/tls/key.pem" >"$HOME/tls/log" 2>&1 &
+  APP_PID=$!
+  for _ in $(seq 1 50); do curl -sk -o /dev/null "https://127.0.0.1:$APP_PORT/" && break; sleep 0.1; done
+  proxy_conf nas "$APP_PORT"; printf 'PROXY_HOST=127.0.0.1\nPROXY_SCHEME=https\nPROXY_INSECURE=yes\n' >>"$VHOSTY_DIR/proxies/nas.conf"
+  proxy_conf strict "$APP_PORT"; printf 'PROXY_HOST=127.0.0.1\nPROXY_SCHEME=https\n' >>"$VHOSTY_DIR/proxies/strict.conf"
+  start_caddy
+  run get nas
+  [ "$(echo "$output" | tail -1)" = 200 ] || { echo "$output" >&2; false; }
+  # Over https, the device's own address, as its certificate expects
+  assert_contains "$output" "host=127.0.0.1:$APP_PORT"
+  run get strict
+  [ "$(echo "$output" | tail -1)" = 502 ] || { echo "$output" >&2; false; }
+}
+
+@test "another machine that doesn't answer gets a page that names it" {
+  need_caddy
+  proxy_conf pi 1; echo 'PROXY_HOST=127.0.0.2' >>"$VHOSTY_DIR/proxies/pi.conf"
+  proxy_conf grafana 1
+  start_caddy
+  run get pi
+  [ "$(echo "$output" | tail -1)" = 502 ]
+  assert_contains "$output" "127.0.0.2:1 isn't answering"
+  refute_contains "$output" "listen on"
+  run get grafana
+  assert_contains "$output" "Nothing is answering on port 1"
 }
 
 @test "a request reaches the app, with the real host and forwarded headers" {

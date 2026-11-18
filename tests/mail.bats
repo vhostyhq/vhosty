@@ -851,7 +851,7 @@ mail_config() { # mail_config [SMTP] [WEB]: the file exists, and compose reports
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
   run linux main mail add
   [ "$status" -eq 0 ] || { echo "$output" >&2; false; }
-  assert_contains "$output" "goes to port 3000"
+  assert_contains "$output" "goes to localhost:3000"
   assert_contains "$output" "Caught mail: https://8025.test.example"
   [ "$(sed -n 's/^PROXY_PORT=//p' "$VHOSTY_DIR/proxies/mail.conf")" = 3000 ]
 }
